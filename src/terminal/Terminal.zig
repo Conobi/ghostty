@@ -3716,7 +3716,16 @@ pub fn eraseDisplay(
             assert(!self.screens.active.cursor.pending_wrap);
         },
 
-        .scrollback => self.screens.active.eraseHistory(null),
+        .scrollback => {
+            if (comptime build_options.kitty_graphics) {
+                self.screens.active.kitty_images.clearHistory(
+                    self.io(),
+                    self.screens.active.alloc,
+                    self,
+                );
+            }
+            self.screens.active.eraseHistory(null);
+        },
     }
 }
 

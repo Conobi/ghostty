@@ -1190,6 +1190,39 @@ pub const ImageStorage = struct {
             self.images.count() != images_before) self.markMutated(io);
     }
 
+    /// Delete the pin placements anchored in scrollback, before the scrollback
+    /// is erased (ED 3). Erasing rows that share a page with the active area
+    /// moves their pins to the top-left of that page, which would otherwise
+    /// redraw the image over the active area. Kitty clears scrollback images
+    /// on ED 3 too.
+    pub fn clearHistory(
+        self: *ImageStorage,
+        io: std.Io,
+        alloc: Allocator,
+        t: *terminal.Terminal,
+    ) void {
+        const placements_before = self.placements.count();
+        const images_before = self.images.count();
+
+        var it = self.placements.iterator();
+        while (it.next()) |entry| {
+            const pin = switch (entry.value_ptr.location) {
+                .pin => |pin| pin,
+                .virtual, .relative => continue,
+            };
+            if (pin.garbage) continue;
+            if (t.screens.active.pages.pointFromPin(.active, pin.*) != null) continue;
+
+            const image_id = entry.key_ptr.image_id;
+            self.removePlacement(t.screens.active, entry);
+            self.deleteIfUnused(alloc, image_id);
+        }
+        _ = self.removeOrphans(t.screens.active, null);
+
+        if (self.placements.count() != placements_before or
+            self.images.count() != images_before) self.markMutated(io);
+    }
+
     /// Delete placements, images.
     pub fn delete(
         self: *ImageStorage,
@@ -3070,6 +3103,56 @@ test "storage: erase display preserves scrollback and reclaims unplaced images" 
     try testing.expect(s.images.contains(1));
     try testing.expect(!s.images.contains(2));
     try testing.expect(!s.images.contains(3));
+}
+
+test "storage: erase scrollback deletes placements anchored in history" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{
+        .rows = 2,
+        .cols = 2,
+        .max_scrollback_bytes = 4096,
+    });
+    defer t.deinit(alloc);
+    t.width_px = 2;
+    t.height_px = 2;
+
+    const s = &t.screens.active.kitty_images;
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try t.scrollUp(1);
+
+    const history_key: ImageStorage.PlacementKey = .{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    };
+    try testing.expect(t.screens.active.pages.pointFromPin(
+        .active,
+        s.placements.get(history_key).?.location.pin.*,
+    ) == null);
+
+    const active_key: ImageStorage.PlacementKey = .{
+        .image_id = 2,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    };
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 2, .width = 1, .height = 1 });
+    try s.addPlacement(io, alloc, t.screens.active, 2, 1, .{
+        .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) },
+    });
+    try s.addImage(io, alloc, t.screens.active, .{ .id = 3, .width = 1, .height = 1 });
+
+    // Erasing the history must not leave its placement behind with a pin
+    // moved into the active area.
+    t.eraseDisplay(.scrollback, false);
+    try testing.expectEqual(@as(usize, 1), s.placements.count());
+    try testing.expect(!s.placements.contains(history_key));
+    try testing.expect(s.placements.contains(active_key));
+    try testing.expect(!s.images.contains(1));
+    try testing.expect(s.images.contains(2));
+    try testing.expect(s.images.contains(3));
 }
 
 test "storage: cell offsets stay within explicit destination rectangle" {
