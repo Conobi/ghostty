@@ -402,12 +402,13 @@ fn display(
                 //
                 // First allow enough calls to reach the bottom of the scroll
                 // region. Each call after that scrolls the region by one row.
-                // Kitty scrolls by the whole image, so limiting the scroll to
-                // one screen would leave the cursor inside an image taller
-                // than the screen, and the next output would be drawn over
-                // it. Bound the scroll by 10,000 rows instead: that covers
-                // any image within the 10,000 pixel loading limit, even with
-                // one-pixel cells, while keeping the amount of work bounded.
+                // Kitty scrolls by the whole image, so the scroll must cover
+                // the tallest image that can be loaded, or the next output
+                // would be drawn over its bottom. Bound it by that image's
+                // height in rows, plus one for the sub-cell vertical offset
+                // or the wrap after a full-width placement. A small command
+                // with a huge r= then costs no more than a legal image does.
+                // With an unknown cell size, fall back to one screen.
                 const region = terminal.scrolling_region;
                 const rows_before_scroll: usize = if (screen.cursor.y >= region.top and
                     screen.cursor.y <= region.bottom and
@@ -416,10 +417,19 @@ fn display(
                     @as(usize, region.bottom - screen.cursor.y)
                 else
                     0;
-                const max_scroll_rows: usize = 10_000;
+                const screen_rows: usize = terminal.rows;
+                const cell_height_px: usize = terminal.height_px / terminal.rows;
+                const max_scroll_rows: usize = if (cell_height_px > 0) @max(
+                    screen_rows,
+                    std.math.divCeil(
+                        usize,
+                        image.max_dimension,
+                        cell_height_px,
+                    ) catch unreachable,
+                ) + 1 else screen_rows;
                 const rows_to_move: usize = @min(
                     requested_rows,
-                    rows_before_scroll +| @max(@as(usize, terminal.rows), max_scroll_rows),
+                    rows_before_scroll +| max_scroll_rows,
                 );
                 for (0..rows_to_move) |_| terminal.index() catch |err| {
                     log.warn("failed to move cursor: {}", .{err});
@@ -1856,6 +1866,9 @@ test "kittygfx placement bounds cursor movement for untrusted dimensions" {
 
     var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
+    // 10x20 pixel cells.
+    t.width_px = 50;
+    t.height_px = 100;
 
     const cmd = try command.Parser.parseString(
         alloc,
@@ -1866,9 +1879,62 @@ test "kittygfx placement bounds cursor movement for untrusted dimensions" {
     const resp = execute(io, alloc, &t, &cmd).?;
     try testing.expect(resp.ok());
     try testing.expectEqual(@as(usize, 1), t.screens.active.kitty_images.placements.count());
-    // Reaching the bottom takes four rows, then scrolling is capped to
-    // 10,000 rows, which covers any image within the loading limit.
-    try testing.expectEqual(@as(usize, 10_005), t.screens.active.pages.scrollbar().total);
+    // Reaching the bottom takes four rows, then the scroll is capped to the
+    // rows of the tallest loadable image plus one.
+    const max_image_rows = try std.math.divCeil(usize, image.max_dimension, 20);
+    try testing.expectEqual(
+        5 + max_image_rows + 1,
+        t.screens.active.pages.scrollbar().total,
+    );
+}
+
+test "kittygfx placement with a huge row count scrolls no more than the tallest image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    // 10x23 pixel cells.
+    t.width_px = 50;
+    t.height_px = 115;
+
+    // A one-pixel image declaring billions of rows.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=1,r=4294967295;////",
+    );
+    defer cmd.deinit(alloc);
+    const resp = execute(io, alloc, &t, &cmd).?;
+    try testing.expect(resp.ok());
+
+    const max_image_rows = try std.math.divCeil(usize, image.max_dimension, 23);
+    try testing.expectEqual(
+        5 + max_image_rows + 1,
+        t.screens.active.pages.scrollbar().total,
+    );
+    try testing.expectEqual(@as(usize, 4), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(usize, 1), t.screens.active.cursor.x);
+}
+
+test "kittygfx placement with an unknown cell size scrolls at most one screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=1,r=4294967295;////",
+    );
+    defer cmd.deinit(alloc);
+    const resp = execute(io, alloc, &t, &cmd).?;
+    try testing.expect(resp.ok());
+
+    // Four rows to the bottom, then one screen of scroll.
+    try testing.expectEqual(@as(usize, 10), t.screens.active.pages.scrollbar().total);
 }
 
 test "kittygfx placement moves cursor past a tall image" {
@@ -1947,6 +2013,9 @@ test "kittygfx placement moves cursor past an image taller than two screens" {
 
     var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
     defer t.deinit(alloc);
+    // 10x20 pixel cells.
+    t.width_px = 50;
+    t.height_px = 100;
 
     // Load a one-pixel RGB image, then place it over the full width and
     // twenty rows: reaching its last row scrolls by more than one screen.
