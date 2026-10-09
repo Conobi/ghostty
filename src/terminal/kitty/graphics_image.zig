@@ -17,7 +17,7 @@ const LimitedAllocator = @import("../../datastruct/main.zig").LimitedAllocator;
 const log = std.log.scoped(.kitty_gfx);
 
 /// Maximum width or height of an image. Taken directly from Kitty.
-const max_dimension = 10000;
+pub const max_dimension = 10000;
 
 /// Maximum size in bytes, taken from Kitty.
 const max_size = 400 * 1024 * 1024; // 400MB
