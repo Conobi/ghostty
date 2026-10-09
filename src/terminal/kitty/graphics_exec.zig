@@ -401,9 +401,13 @@ fn display(
                 // very long time.
                 //
                 // First allow enough calls to reach the bottom of the scroll
-                // region. Each call after that scrolls the region by one row,
-                // so limit those extra calls to one screen. This follows
-                // Kitty's behavior while keeping the amount of work bounded.
+                // region. Each call after that scrolls the region by one row.
+                // Kitty scrolls by the whole image, so limiting the scroll to
+                // one screen would leave the cursor inside an image taller
+                // than the screen, and the next output would be drawn over
+                // it. Bound the scroll by 10,000 rows instead: that covers
+                // any image within the 10,000 pixel loading limit, even with
+                // one-pixel cells, while keeping the amount of work bounded.
                 const region = terminal.scrolling_region;
                 const rows_before_scroll: usize = if (screen.cursor.y >= region.top and
                     screen.cursor.y <= region.bottom and
@@ -412,9 +416,10 @@ fn display(
                     @as(usize, region.bottom - screen.cursor.y)
                 else
                     0;
+                const max_scroll_rows: usize = 10_000;
                 const rows_to_move: usize = @min(
                     requested_rows,
-                    rows_before_scroll +| @as(usize, terminal.rows),
+                    rows_before_scroll +| @max(@as(usize, terminal.rows), max_scroll_rows),
                 );
                 for (0..rows_to_move) |_| terminal.index() catch |err| {
                     log.warn("failed to move cursor: {}", .{err});
@@ -1861,9 +1866,9 @@ test "kittygfx placement bounds cursor movement for untrusted dimensions" {
     const resp = execute(io, alloc, &t, &cmd).?;
     try testing.expect(resp.ok());
     try testing.expectEqual(@as(usize, 1), t.screens.active.kitty_images.placements.count());
-    // Reaching the bottom takes four rows, then scrolling is capped to one
-    // screen (five rows), matching Kitty's bounded screen-scroll behavior.
-    try testing.expectEqual(@as(usize, 10), t.screens.active.pages.scrollbar().total);
+    // Reaching the bottom takes four rows, then scrolling is capped to
+    // 10,000 rows, which covers any image within the loading limit.
+    try testing.expectEqual(@as(usize, 10_005), t.screens.active.pages.scrollbar().total);
 }
 
 test "kittygfx placement moves cursor past a tall image" {
@@ -1875,8 +1880,7 @@ test "kittygfx placement moves cursor past a tall image" {
     defer t.deinit(alloc);
 
     // Load a one-pixel RGB image, then place it over the full width and eight
-    // rows. Eight rows are taller than the screen but still within Kitty's
-    // scroll budget.
+    // rows, taller than the screen.
     {
         const cmd = try command.Parser.parseString(
             alloc,
@@ -1934,6 +1938,75 @@ test "kittygfx placement moves cursor past a tall image" {
         second_pin.*,
     ).?.screen.y;
     try testing.expectEqual(first_y + 8, second_y);
+}
+
+test "kittygfx placement moves cursor past an image taller than two screens" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // Load a one-pixel RGB image, then place it over the full width and
+    // twenty rows: reaching its last row scrolls by more than one screen.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,t=d,f=24,i=1,s=1,v=1;////",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=p,i=1,p=1,c=5,r=20",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+
+    // A subsequent placement begins immediately after the first one instead
+    // of inside it.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=p,i=1,p=2,C=1",
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+
+    const storage = &t.screens.active.kitty_images;
+    const first = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    }).?;
+    const second = storage.placements.get(.{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 2 },
+    }).?;
+    const first_pin = switch (first.location) {
+        .pin => |pin| pin,
+        .virtual, .relative => unreachable,
+    };
+    const second_pin = switch (second.location) {
+        .pin => |pin| pin,
+        .virtual, .relative => unreachable,
+    };
+    const first_y = t.screens.active.pages.pointFromPin(
+        .screen,
+        first_pin.*,
+    ).?.screen.y;
+    const second_y = t.screens.active.pages.pointFromPin(
+        .screen,
+        second_pin.*,
+    ).?.screen.y;
+    try testing.expectEqual(first_y + 20, second_y);
 }
 
 test "kittygfx unknown format responds with EINVAL" {
