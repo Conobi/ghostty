@@ -473,6 +473,7 @@ pub fn gpa(self: *Terminal) Allocator {
 pub fn setScrollbackMaxBytes(self: *Terminal, max: ?usize) void {
     const primary = self.screens.get(.primary).?;
     primary.pages.setMaxBytes(max);
+    primary.clearPrunedSelection();
     primary.no_scrollback = max == 0;
 
     if (primary.no_scrollback) primary.eraseHistory(null);
@@ -485,6 +486,7 @@ pub fn setScrollbackMaxBytes(self: *Terminal, max: ?usize) void {
 pub fn setScrollbackMaxLines(self: *Terminal, max: ?usize) void {
     const primary = self.screens.get(.primary).?;
     primary.pages.setMaxLines(max);
+    primary.clearPrunedSelection();
 }
 
 /// Print UTF-8 encoded string to the terminal.
@@ -16760,4 +16762,49 @@ test "Terminal: eraseDisplay complete ignores stale prompt on recycled row" {
     t.eraseDisplay(.complete, false);
 
     try testing.expectEqual(t.screens.active.pages.rows, t.screens.active.pages.total_rows);
+}
+
+test "Terminal: dropped rows clear the selection when a lower line limit drops them" {
+    const Selection = @import("Selection.zig");
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 3,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = null,
+    });
+    defer t.deinit(testing.allocator);
+    const primary = t.screens.get(.primary).?;
+    const page_rows: usize = primary.pages.pages.first.?.capacity().rows;
+    for (0..4 * page_rows) |_| try t.linefeed();
+
+    // The two oldest rows, on the page the lower limit removes.
+    try primary.select(Selection.init(
+        primary.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+        primary.pages.pin(.{ .screen = .{ .x = 4, .y = 1 } }).?,
+        false,
+    ));
+    t.setScrollbackMaxLines(page_rows);
+    try testing.expect(primary.selection == null);
+}
+
+test "Terminal: dropped rows clear the selection when a lower byte limit drops them" {
+    const Selection = @import("Selection.zig");
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 3,
+        .max_scrollback_bytes = null,
+    });
+    defer t.deinit(testing.allocator);
+    const primary = t.screens.get(.primary).?;
+    const page_rows: usize = primary.pages.pages.first.?.capacity().rows;
+    for (0..4 * page_rows) |_| try t.linefeed();
+
+    try primary.select(Selection.init(
+        primary.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+        primary.pages.pin(.{ .screen = .{ .x = 4, .y = 1 } }).?,
+        false,
+    ));
+    // The smallest non-zero limit prunes (zero erases history instead).
+    t.setScrollbackMaxBytes(1);
+    try testing.expect(primary.selection == null);
 }

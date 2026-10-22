@@ -1001,6 +1001,7 @@ pub fn cursorDownScroll(self: *Screen) !void {
         // Grow our pages by one row. The PageList will handle if we need to
         // allocate, prune scrollback, whatever.
         _ = try self.pages.grow();
+        self.clearPrunedSelection();
 
         const new_pin = new_pin: {
             // Calculate this before cursorChangePin because that function may
@@ -1107,7 +1108,9 @@ pub fn cursorScrollAbove(self: *Screen) !void {
     //  lot cheaper in 99% of cases.
 
     const old_pin = self.cursor.page_pin.*;
-    if (try self.pages.grow()) |new_node| {
+    const grown = try self.pages.grow();
+    self.clearPrunedSelection();
+    if (grown) |new_node| {
         try self.cursorScrollAboveRotate(new_node);
     } else {
         // In this case, it means grow() didn't allocate a new page.
@@ -1673,6 +1676,7 @@ pub inline fn scrollClear(self: *Screen) !void {
     defer self.assertIntegrity();
 
     try self.pages.scrollClear();
+    self.clearPrunedSelection();
     self.cursorReload();
 
     if (comptime build_options.kitty_graphics) {
@@ -2138,6 +2142,7 @@ pub inline fn resize(
     // No more failures are possible after this. Enforced by compiler
     // because we do NO cleanup of the state below.
     errdefer comptime unreachable;
+    self.clearPrunedSelection();
 
     // Resizing moves image placements, so mark their geometry as dirty.
     if (comptime build_options.kitty_graphics) self.kitty_images.dirty = true;
@@ -2949,6 +2954,15 @@ pub fn clearSelection(self: *Screen) void {
         self.dirty.selection = true;
     }
     self.selection = null;
+}
+
+/// Clears the selection once pruning dropped its last row in reading order.
+/// Pruned pins turn garbage and move to the oldest row, and prunes drop only
+/// the oldest rows, so that is when both pins are garbage (after a prune both
+/// may share a cell, so their order can't tell). One garbage pin: kept.
+pub fn clearPrunedSelection(self: *Screen) void {
+    const sel = self.selection orelse return;
+    if (sel.start().garbage and sel.end().garbage) self.clearSelection();
 }
 
 pub const SelectionString = struct {
@@ -12665,4 +12679,175 @@ test "Screen: selectLine does not join lines across a recycled row" {
         defer alloc.free(contents);
         try testing.expectEqualStrings("world", contents);
     }
+}
+
+test "Screen: dropped rows clear the selection after a resize prunes them" {
+    var s = try init(std.testing.io, std.testing.allocator, .{
+        .cols = 80,
+        .rows = 3,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = 2000,
+    });
+    defer s.deinit();
+    // 1500 full-width rows fit the 2000-line limit at 80 columns; at 10
+    // columns each becomes eight rows, far past the limit there.
+    for (0..1500) |_| try s.testWriteString("X" ** 80 ++ "\n");
+    try testSelect(&s, .{ .screen = .{ .x = 0, .y = 0 } }, .{ .screen = .{ .x = 4, .y = 1 } });
+    try s.resize(.{ .cols = 10, .rows = 3 });
+    try std.testing.expect(s.selection == null);
+}
+
+test "Screen: dropped rows keep a selection whose last row survives" {
+    const testing = std.testing;
+    var s = try testInitPruning();
+    defer s.deinit();
+    try testScrollToSecondPage(&s);
+
+    // From the oldest row, which the next prune drops, to the newest row.
+    try testSelect(&s, .{ .screen = .{ .x = 2, .y = 0 } }, .{ .active = .{ .x = 4, .y = 2 } });
+    try testScrollUntilPruned(&s);
+
+    const sel = s.selection orelse return error.TestExpectedSelection;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 0 }, testScreenCoord(&s, sel.start()));
+    try testing.expectEqual(point.Coordinate{ .x = 4, .y = 0 }, testScreenCoord(&s, sel.end()));
+}
+
+test "Screen: dropped rows clear a selection when its last row goes" {
+    var s = try testInitPruning();
+    defer s.deinit();
+    try testSelect(&s, .{ .screen = .{ .x = 0, .y = 0 } }, .{ .screen = .{ .x = 4, .y = 1 } });
+    try testScrollUntilPruned(&s);
+    try std.testing.expect(s.selection == null);
+}
+
+test "Screen: dropped rows keep an upward selection whose bottom survives" {
+    const testing = std.testing;
+    var s = try testInitPruning();
+    defer s.deinit();
+    try testScrollToSecondPage(&s);
+
+    // Dragged up from the newest row's first cell to the oldest row. After
+    // the prune both pins sit on the oldest cell, so their order no longer
+    // tells which one was dropped.
+    try testSelect(&s, .{ .active = .{ .x = 0, .y = 2 } }, .{ .screen = .{ .x = 4, .y = 0 } });
+    try testScrollUntilPruned(&s);
+
+    const sel = s.selection orelse return error.TestExpectedSelection;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 0 }, testScreenCoord(&s, sel.start()));
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 0 }, testScreenCoord(&s, sel.end()));
+}
+
+test "Screen: dropped rows clear an upward selection when its last row goes" {
+    var s = try testInitPruning();
+    defer s.deinit();
+    try testSelect(&s, .{ .screen = .{ .x = 4, .y = 1 } }, .{ .screen = .{ .x = 0, .y = 0 } });
+    try testScrollUntilPruned(&s);
+    try std.testing.expect(s.selection == null);
+}
+
+test "Screen: dropped rows leave a selection outside them" {
+    const testing = std.testing;
+    var s = try testInitPruning();
+    defer s.deinit();
+    // Once a page has been pruned, the next prune drops the oldest page
+    // while the newest rows stay.
+    try testScrollUntilPruned(&s);
+    try s.testWriteString("\nkeep");
+    try testSelect(&s, .{ .active = .{ .x = 0, .y = 2 } }, .{ .active = .{ .x = 3, .y = 2 } });
+    try testScrollUntilPruned(&s);
+
+    const sel = s.selection orelse return error.TestExpectedSelection;
+    const text = try s.selectionString(testing.allocator, .{ .sel = sel });
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("keep", text);
+}
+
+test "Screen: dropped rows clear a clamped selection when its last row goes later" {
+    const testing = std.testing;
+    var s = try testInitPruning();
+    defer s.deinit();
+    try testScrollToSecondPage(&s);
+    try testSelect(&s, .{ .screen = .{ .x = 2, .y = 0 } }, .{ .active = .{ .x = 4, .y = 2 } });
+
+    // The first prune drops only the start, the second the end as well.
+    try testScrollUntilPruned(&s);
+    try testing.expect(s.selection != null);
+    try testScrollUntilPruned(&s);
+    try testing.expect(s.selection == null);
+}
+
+test "Screen: dropped rows clear the selection after scroll clear prunes them" {
+    var s = try testInitPruning();
+    defer s.deinit();
+    try testSelect(&s, .{ .screen = .{ .x = 0, .y = 0 } }, .{ .screen = .{ .x = 4, .y = 1 } });
+
+    // Only scrollClear grows the page list here: one non-empty row per clear.
+    const first = s.pages.pages.first;
+    for (0..100_000) |_| {
+        if (s.pages.pages.first != first) break;
+        s.cursorAbsolute(0, 0);
+        try s.testWriteString("X");
+        try s.scrollClear();
+    } else return error.TestExpectedPrune;
+    try std.testing.expect(s.selection == null);
+}
+
+test "Screen: dropped rows clear the selection after scroll above prunes them" {
+    var s = try testInitPruning();
+    defer s.deinit();
+    // Row 0 is the cursor row, the one cursorScrollAbove sends to history.
+    try testSelect(&s, .{ .screen = .{ .x = 0, .y = 0 } }, .{ .screen = .{ .x = 4, .y = 0 } });
+
+    const first = s.pages.pages.first;
+    for (0..100_000) |_| {
+        if (s.pages.pages.first != first) break;
+        s.cursorAbsolute(0, 0);
+        try s.cursorScrollAbove();
+    } else return error.TestExpectedPrune;
+    try std.testing.expect(s.selection == null);
+}
+
+/// Test helper: an 80x3 screen whose byte limit is the minimum, so the
+/// oldest page is pruned as soon as one more page is needed.
+fn testInitPruning() !Screen {
+    var s = try init(std.testing.io, std.testing.allocator, .{
+        .cols = 80,
+        .rows = 3,
+        .max_scrollback_bytes = 1,
+    });
+    errdefer s.deinit();
+    try s.testWriteString("1ABCD\n2EFGH\n3IJKL");
+    return s;
+}
+
+/// Test helper: selects from `start` to `end` (any order, any tags).
+fn testSelect(s: *Screen, start: point.Point, end: point.Point) !void {
+    try s.select(Selection.init(s.pages.pin(start).?, s.pages.pin(end).?, false));
+}
+
+/// Test helper: a pin's SCREEN coordinate.
+fn testScreenCoord(s: *const Screen, p: Pin) point.Coordinate {
+    return s.pages.pointFromPin(.screen, p).?.screen;
+}
+
+/// Test helper: scrolls (cursor on the last row) until the newest row is on
+/// a second page, so the first page can be pruned without it. Bounded so a
+/// missing page fails instead of hanging the runner.
+fn testScrollToSecondPage(s: *Screen) !void {
+    for (0..100_000) |_| {
+        if (s.pages.pages.first != s.pages.pages.last) return;
+        try s.cursorDownScroll();
+    }
+    return error.TestExpectedSecondPage;
+}
+
+/// Test helper: scrolls (cursor on the last row) until the oldest page is
+/// pruned. Bounded so a missing prune fails instead of hanging the runner.
+fn testScrollUntilPruned(s: *Screen) !void {
+    const first = s.pages.pages.first;
+    for (0..100_000) |_| {
+        if (s.pages.pages.first != first) return;
+        try s.cursorDownScroll();
+    }
+    return error.TestExpectedPrune;
 }
