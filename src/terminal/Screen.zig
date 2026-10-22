@@ -955,6 +955,7 @@ pub fn cursorDownScroll(self: *Screen) !void {
 
     // If we have no scrollback, then we shift all our rows instead.
     if (self.no_scrollback) {
+        self.dropSelectionRows(null);
         // If we have a single-row screen, we have no rows to shift
         // so our cursor is in the correct place we just have to clear
         // the cells.
@@ -1292,6 +1293,8 @@ pub fn cursorScrollRegionUp(self: *Screen, limit: usize) !void {
     assert(limit >= 1);
     assert(self.cursor.y >= limit);
     defer self.assertIntegrity();
+    // Without scrollback, a region at the top drops its top row.
+    if (self.no_scrollback and self.cursor.y == limit) self.dropSelectionRows(null);
 
     const pin: *Pin = self.cursor.page_pin;
 
@@ -2966,18 +2969,23 @@ pub fn clearPrunedSelection(self: *Screen) void {
     if (sel.start().garbage and sel.end().garbage) self.clearSelection();
 }
 
-/// `pages.eraseHistory(bl)`, first clearing the selection if its last row in
-/// reading order is erased. Erasing moves pins of erased rows to the oldest
-/// kept row without marking them garbage, so this is decided before the erase.
-fn eraseHistoryRows(self: *Screen, bl: ?point.Point) void {
-    if (self.selection) |sel| {
-        const last = self.pages.pointFromPin(.screen, sel.bottomRight(self)).?.screen.y;
-        const kept = if (bl) |pt|
-            self.pages.pointFromPin(.screen, self.pages.pin(pt).?).?.screen.y + 1
-        else
-            self.pages.total_rows - self.pages.rows;
-        if (last < kept) self.clearSelection();
+/// Before SCREEN rows above `kept_` (null: up to the active top row) are
+/// erased, which moves their pins unmarked: clears the selection if its last
+/// row in reading order goes, else moves an end there to column 0.
+fn dropSelectionRows(self: *Screen, kept_: ?usize) void {
+    const sel = if (self.selection) |*s| s else return;
+    const kept = kept_ orelse self.pages.total_rows - self.pages.rows + 1;
+    if (self.pages.pointFromPin(.screen, sel.bottomRight(self)).?.screen.y < kept) return self.clearSelection();
+    for ([_]*Pin{ sel.startPtr(), sel.endPtr() }) |p| {
+        if (self.pages.pointFromPin(.screen, p.*).?.screen.y < kept) p.x = 0;
     }
+}
+
+/// `pages.eraseHistory(bl)` under `dropSelectionRows` (skipped for a `bl` off the grid).
+fn eraseHistoryRows(self: *Screen, bl: ?point.Point) void {
+    if (bl) |pt| {
+        if (self.pages.pin(pt)) |p| self.dropSelectionRows(self.pages.pointFromPin(.screen, p).?.screen.y + 1);
+    } else self.dropSelectionRows(self.pages.total_rows - self.pages.rows);
     self.pages.eraseHistory(bl);
 }
 

@@ -16808,3 +16808,250 @@ test "Terminal: dropped rows clear the selection when a lower byte limit drops t
     t.setScrollbackMaxBytes(1);
     try testing.expect(primary.selection == null);
 }
+
+test "Terminal: dropped rows without scrollback clear a selection on the top row" {
+    var t = try testInitNoScrollback(3);
+    defer t.deinit(testing.allocator);
+    try testSelectPrimary(&t, .{ .active = .{ .x = 0, .y = 0 } }, .{ .active = .{ .x = 3, .y = 0 } });
+    try t.linefeed();
+    try testing.expect(t.screens.get(.primary).?.selection == null);
+}
+
+test "Terminal: dropped rows without scrollback clear an upward selection on the top row" {
+    var t = try testInitNoScrollback(3);
+    defer t.deinit(testing.allocator);
+    try testSelectPrimary(&t, .{ .active = .{ .x = 3, .y = 0 } }, .{ .active = .{ .x = 0, .y = 0 } });
+    try t.linefeed();
+    try testing.expect(t.screens.get(.primary).?.selection == null);
+}
+
+test "Terminal: dropped rows without scrollback clamp a selection that starts on the top row" {
+    var t = try testInitNoScrollback(3);
+    defer t.deinit(testing.allocator);
+    try testSelectPrimary(&t, .{ .active = .{ .x = 2, .y = 0 } }, .{ .active = .{ .x = 1, .y = 1 } });
+    try t.linefeed();
+    try testing.expectEqual(
+        [2]point.Coordinate{ .{ .x = 0, .y = 0 }, .{ .x = 1, .y = 0 } },
+        try testSelectionCoords(&t),
+    );
+}
+
+test "Terminal: dropped rows without scrollback clamp an upward selection that ends on the top row" {
+    var t = try testInitNoScrollback(3);
+    defer t.deinit(testing.allocator);
+    try testSelectPrimary(&t, .{ .active = .{ .x = 1, .y = 1 } }, .{ .active = .{ .x = 2, .y = 0 } });
+    try t.linefeed();
+    try testing.expectEqual(
+        [2]point.Coordinate{ .{ .x = 1, .y = 0 }, .{ .x = 0, .y = 0 } },
+        try testSelectionCoords(&t),
+    );
+}
+
+test "Terminal: dropped rows without scrollback leave a selection below the top row" {
+    var t = try testInitNoScrollback(3);
+    defer t.deinit(testing.allocator);
+    try testSelectPrimary(&t, .{ .active = .{ .x = 1, .y = 1 } }, .{ .active = .{ .x = 3, .y = 2 } });
+    try t.linefeed();
+    try testing.expectEqual(
+        [2]point.Coordinate{ .{ .x = 1, .y = 0 }, .{ .x = 3, .y = 1 } },
+        try testSelectionCoords(&t),
+    );
+}
+
+test "Terminal: dropped rows without scrollback clear a selection when scroll up erases its row" {
+    var t = try testInitNoScrollback(3);
+    defer t.deinit(testing.allocator);
+    try testSelectPrimary(&t, .{ .active = .{ .x = 0, .y = 0 } }, .{ .active = .{ .x = 3, .y = 0 } });
+    try t.scrollUp(1);
+    try testing.expect(t.screens.get(.primary).?.selection == null);
+}
+
+test "Terminal: dropped rows without scrollback clear a selection on a one-row screen" {
+    var t = try testInitNoScrollback(1);
+    defer t.deinit(testing.allocator);
+    try testSelectPrimary(&t, .{ .active = .{ .x = 0, .y = 0 } }, .{ .active = .{ .x = 3, .y = 0 } });
+    try t.linefeed();
+    try testing.expect(t.screens.get(.primary).?.selection == null);
+}
+
+test "Terminal: dropped rows without scrollback clear a selection when the screen spans two pages" {
+    // A screen one row taller than a page, so the scrolled region crosses a
+    // page boundary.
+    const page_rows = rows: {
+        var probe = try testInitNoScrollback(1);
+        defer probe.deinit(testing.allocator);
+        break :rows probe.screens.get(.primary).?.pages.pages.first.?.capacity().rows;
+    };
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = @intCast(page_rows + 1),
+        .max_scrollback_bytes = 0,
+    });
+    defer t.deinit(testing.allocator);
+    const primary = t.screens.get(.primary).?;
+    try testing.expect(primary.pages.pages.first != primary.pages.pages.last);
+    try t.printString("1ABC");
+    try testSelectPrimary(&t, .{ .active = .{ .x = 0, .y = 0 } }, .{ .active = .{ .x = 3, .y = 0 } });
+    t.setCursorPos(t.rows, 1);
+    try t.linefeed();
+    try testing.expect(primary.selection == null);
+}
+
+test "Terminal: dropped rows without scrollback clamp a selection on the top row of a top scroll region" {
+    var t = try testInitNoScrollback(3);
+    defer t.deinit(testing.allocator);
+    try testSelectPrimary(&t, .{ .active = .{ .x = 2, .y = 0 } }, .{ .active = .{ .x = 1, .y = 1 } });
+    // Rows 1-2 scroll in place within one page, row 3 stays.
+    t.setTopAndBottomMargin(1, 2);
+    t.setCursorPos(2, 1);
+    try t.index();
+    try testing.expectEqual(
+        [2]point.Coordinate{ .{ .x = 0, .y = 0 }, .{ .x = 1, .y = 0 } },
+        try testSelectionCoords(&t),
+    );
+}
+
+test "Terminal: dropped rows without scrollback clamp a selection on the top row of a top scroll region across two pages" {
+    // A screen two rows taller than a page, the bottom margin on the second
+    // page's first row: the region crosses the page boundary and the last
+    // row stays outside it.
+    const page_rows = rows: {
+        var probe = try testInitNoScrollback(1);
+        defer probe.deinit(testing.allocator);
+        break :rows probe.screens.get(.primary).?.pages.pages.first.?.capacity().rows;
+    };
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 5,
+        .rows = @intCast(page_rows + 2),
+        .max_scrollback_bytes = 0,
+    });
+    defer t.deinit(testing.allocator);
+    const primary = t.screens.get(.primary).?;
+    try t.printString("1ABC");
+    try testSelectPrimary(&t, .{ .active = .{ .x = 2, .y = 0 } }, .{ .active = .{ .x = 1, .y = 1 } });
+    t.setTopAndBottomMargin(1, page_rows + 1);
+    t.setCursorPos(page_rows + 1, 1);
+    try testing.expect(primary.cursor.page_pin.node != primary.pages.pages.first);
+    try t.index();
+    try testing.expectEqual(
+        [2]point.Coordinate{ .{ .x = 0, .y = 0 }, .{ .x = 1, .y = 0 } },
+        try testSelectionCoords(&t),
+    );
+}
+
+test "Terminal: dropped rows clear the selection when output prunes them" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 3, .max_scrollback_bytes = 1 });
+    defer t.deinit(testing.allocator);
+    try testSelectPrimary(&t, .{ .screen = .{ .x = 0, .y = 0 } }, .{ .screen = .{ .x = 4, .y = 0 } });
+    const primary = t.screens.get(.primary).?;
+    const first = primary.pages.pages.first;
+    for (0..100_000) |_| {
+        if (primary.pages.pages.first != first) break;
+        try t.linefeed();
+    } else return error.TestExpectedPrune;
+    try testing.expect(primary.selection == null);
+}
+
+test "Terminal: dropped rows clear the selection when a scroll region at the top prunes them" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 3, .max_scrollback_bytes = 1 });
+    defer t.deinit(testing.allocator);
+    try testSelectPrimary(&t, .{ .screen = .{ .x = 0, .y = 0 } }, .{ .screen = .{ .x = 4, .y = 0 } });
+    // Rows 1-2 scroll into history, row 3 stays: index uses cursorScrollAbove.
+    t.setTopAndBottomMargin(1, 2);
+    t.setCursorPos(2, 1);
+    const primary = t.screens.get(.primary).?;
+    const first = primary.pages.pages.first;
+    for (0..100_000) |_| {
+        if (primary.pages.pages.first != first) break;
+        try t.index();
+    } else return error.TestExpectedPrune;
+    try testing.expect(primary.selection == null);
+}
+
+test "Terminal: dropped rows clear the selection when scroll clear prunes them" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 80, .rows = 3, .max_scrollback_bytes = 1 });
+    defer t.deinit(testing.allocator);
+    try testSelectPrimary(&t, .{ .screen = .{ .x = 0, .y = 0 } }, .{ .screen = .{ .x = 4, .y = 0 } });
+    const primary = t.screens.get(.primary).?;
+    const first = primary.pages.pages.first;
+    for (0..100_000) |_| {
+        if (primary.pages.pages.first != first) break;
+        t.setCursorPos(1, 1);
+        try t.printString("X");
+        t.eraseDisplay(.scroll_complete, false);
+    } else return error.TestExpectedPrune;
+    try testing.expect(primary.selection == null);
+}
+
+test "Terminal: dropped rows clear the selection when a resize prunes them" {
+    var t = try init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 3,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = 2000,
+    });
+    defer t.deinit(testing.allocator);
+    for (0..1500) |_| {
+        try t.printString("X" ** 80);
+        t.carriageReturn();
+        try t.linefeed();
+    }
+    try testSelectPrimary(&t, .{ .screen = .{ .x = 0, .y = 0 } }, .{ .screen = .{ .x = 4, .y = 1 } });
+    try t.resize(testing.allocator, .{ .cols = 10, .rows = 3 });
+    try testing.expect(t.screens.get(.primary).?.selection == null);
+}
+
+test "Terminal: dropped rows clear the selection when erasing the scrollback drops them" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 5, .rows = 5, .max_scrollback_bytes = 1000 });
+    defer t.deinit(testing.allocator);
+    try t.printString("A\r\nB\r\nC\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6");
+    try testSelectPrimary(&t, .{ .screen = .{ .x = 0, .y = 0 } }, .{ .screen = .{ .x = 0, .y = 2 } });
+    t.eraseDisplay(.scrollback, false);
+    try testing.expect(t.screens.get(.primary).?.selection == null);
+}
+
+test "Terminal: dropped rows clear the selection when a resize without scrollback drops them" {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 5, .rows = 5, .max_scrollback_bytes = 0 });
+    defer t.deinit(testing.allocator);
+    try t.printString("1\r\n2\r\n3\r\n4\r\n5");
+    try testSelectPrimary(&t, .{ .active = .{ .x = 0, .y = 0 } }, .{ .active = .{ .x = 0, .y = 1 } });
+    try t.resize(testing.allocator, .{ .cols = 5, .rows = 3 });
+    try testing.expect(t.screens.get(.primary).?.selection == null);
+}
+
+/// Test helper: a 5-column terminal of `rows` rows without scrollback, rows
+/// reading `1ABC`, `2DEF`, … and the cursor on the last row, so the next
+/// line feed scrolls.
+fn testInitNoScrollback(rows: size.CellCountInt) !Terminal {
+    var t = try init(testing.io, testing.allocator, .{ .cols = 5, .rows = rows, .max_scrollback_bytes = 0 });
+    errdefer t.deinit(testing.allocator);
+    const lines = [_][]const u8{ "1ABC", "2DEF", "3GHI" };
+    for (lines[0..rows], 0..) |line, i| {
+        if (i > 0) {
+            t.carriageReturn();
+            try t.linefeed();
+        }
+        try t.printString(line);
+    }
+    try testing.expect(t.screens.get(.primary).?.no_scrollback);
+    return t;
+}
+
+/// Test helper: selects from `start` to `end` (any order, any tags) on the
+/// primary screen.
+fn testSelectPrimary(t: *Terminal, start: point.Point, end: point.Point) !void {
+    const Selection = @import("Selection.zig");
+    const s = t.screens.get(.primary).?;
+    try s.select(Selection.init(s.pages.pin(start).?, s.pages.pin(end).?, false));
+}
+
+/// Test helper: the primary selection's start and end as SCREEN coordinates,
+/// in the order they were selected.
+fn testSelectionCoords(t: *Terminal) ![2]point.Coordinate {
+    const s = t.screens.get(.primary).?;
+    const sel = s.selection orelse return error.TestExpectedSelection;
+    return .{
+        s.pages.pointFromPin(.screen, sel.start()).?.screen,
+        s.pages.pointFromPin(.screen, sel.end()).?.screen,
+    };
+}
