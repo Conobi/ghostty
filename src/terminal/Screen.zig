@@ -1694,13 +1694,14 @@ pub inline fn viewportIsBottom(self: Screen) bool {
 
 /// Erase the region specified by tl and br, inclusive. This will physically
 /// erase the rows meaning the memory will be reclaimed (if the underlying
-/// page is empty) and other rows will be shifted up.
+/// page is empty) and other rows will be shifted up. A selection whose last
+/// row in reading order is erased is cleared.
 pub inline fn eraseHistory(
     self: *Screen,
     bl: ?point.Point,
 ) void {
     defer self.assertIntegrity();
-    self.pages.eraseHistory(bl);
+    self.eraseHistoryRows(bl);
     self.cursorReload();
 }
 
@@ -2150,7 +2151,7 @@ pub inline fn resize(
     // If we have no scrollback and we shrunk our rows, we must explicitly
     // erase our history. This is because PageList always keeps at least
     // a page size of history.
-    if (self.no_scrollback) self.pages.eraseHistory(null);
+    if (self.no_scrollback) self.eraseHistoryRows(null);
 
     // If our cursor was updated, we do a full reload so all our cursor
     // state is correct.
@@ -2963,6 +2964,21 @@ pub fn clearSelection(self: *Screen) void {
 pub fn clearPrunedSelection(self: *Screen) void {
     const sel = self.selection orelse return;
     if (sel.start().garbage and sel.end().garbage) self.clearSelection();
+}
+
+/// `pages.eraseHistory(bl)`, first clearing the selection if its last row in
+/// reading order is erased. Erasing moves pins of erased rows to the oldest
+/// kept row without marking them garbage, so this is decided before the erase.
+fn eraseHistoryRows(self: *Screen, bl: ?point.Point) void {
+    if (self.selection) |sel| {
+        const last = self.pages.pointFromPin(.screen, sel.bottomRight(self)).?.screen.y;
+        const kept = if (bl) |pt|
+            self.pages.pointFromPin(.screen, self.pages.pin(pt).?).?.screen.y + 1
+        else
+            self.pages.total_rows - self.pages.rows;
+        if (last < kept) self.clearSelection();
+    }
+    self.pages.eraseHistory(bl);
 }
 
 pub const SelectionString = struct {
@@ -12850,4 +12866,96 @@ fn testScrollUntilPruned(s: *Screen) !void {
         try s.cursorDownScroll();
     }
     return error.TestExpectedPrune;
+}
+
+test "Screen: dropped rows by erase history clear a selection inside them" {
+    var s = try testInitHistory();
+    defer s.deinit();
+    try testSelect(&s, .{ .screen = .{ .x = 0, .y = 0 } }, .{ .screen = .{ .x = 0, .y = 2 } });
+    s.eraseHistory(null);
+    try std.testing.expect(s.selection == null);
+}
+
+test "Screen: dropped rows by erase history clear an upward selection inside them" {
+    var s = try testInitHistory();
+    defer s.deinit();
+    try testSelect(&s, .{ .screen = .{ .x = 0, .y = 2 } }, .{ .screen = .{ .x = 0, .y = 0 } });
+    s.eraseHistory(null);
+    try std.testing.expect(s.selection == null);
+}
+
+test "Screen: dropped rows by erase history clamp a selection that starts in them" {
+    const testing = std.testing;
+    var s = try testInitHistory();
+    defer s.deinit();
+    // From B (history) to 3 (on screen).
+    try testSelect(&s, .{ .screen = .{ .x = 0, .y = 1 } }, .{ .screen = .{ .x = 0, .y = 5 } });
+    s.eraseHistory(null);
+
+    const sel = s.selection orelse return error.TestExpectedSelection;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 0 }, testScreenCoord(&s, sel.start()));
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, testScreenCoord(&s, sel.end()));
+}
+
+test "Screen: dropped rows by erase history keep an upward selection that ends in them" {
+    const testing = std.testing;
+    var s = try testInitHistory();
+    defer s.deinit();
+    // Dragged up from 3 (on screen) to B (history).
+    try testSelect(&s, .{ .screen = .{ .x = 0, .y = 5 } }, .{ .screen = .{ .x = 0, .y = 1 } });
+    s.eraseHistory(null);
+
+    const sel = s.selection orelse return error.TestExpectedSelection;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 1 }, testScreenCoord(&s, sel.start()));
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 0 }, testScreenCoord(&s, sel.end()));
+}
+
+test "Screen: dropped rows by erase history leave a selection outside them" {
+    const testing = std.testing;
+    var s = try testInitHistory();
+    defer s.deinit();
+    // Rows 4 and 5, on screen.
+    try testSelect(&s, .{ .screen = .{ .x = 0, .y = 6 } }, .{ .screen = .{ .x = 0, .y = 7 } });
+    s.eraseHistory(null);
+
+    const sel = s.selection orelse return error.TestExpectedSelection;
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 2 }, testScreenCoord(&s, sel.start()));
+    try testing.expectEqual(point.Coordinate{ .x = 0, .y = 3 }, testScreenCoord(&s, sel.end()));
+}
+
+test "Screen: dropped rows by erase history up to a row clear a selection above it" {
+    var s = try testInitHistory();
+    defer s.deinit();
+    // A and B, the two rows the erase removes.
+    try testSelect(&s, .{ .screen = .{ .x = 0, .y = 0 } }, .{ .screen = .{ .x = 0, .y = 1 } });
+    s.eraseHistory(.{ .history = .{ .y = 1 } });
+    try std.testing.expect(s.selection == null);
+}
+
+test "Screen: dropped rows by erase history clear the selection after a resize without scrollback" {
+    var s = try init(std.testing.io, std.testing.allocator, .{
+        .cols = 5,
+        .rows = 5,
+        .max_scrollback_bytes = 0,
+    });
+    defer s.deinit();
+    try s.testWriteString("1\n2\n3\n4\n5");
+    // Rows 1 and 2: shrinking to three rows pushes them out, and without
+    // scrollback the resize erases them.
+    try testSelect(&s, .{ .active = .{ .x = 0, .y = 0 } }, .{ .active = .{ .x = 0, .y = 1 } });
+    try s.resize(.{ .cols = 5, .rows = 3, .reflow = false });
+    try std.testing.expect(s.selection == null);
+}
+
+/// Test helper: history A, B, C, 1 (SCREEN rows 0-3) above the active
+/// rows 2 to 6 (SCREEN rows 4-8).
+fn testInitHistory() !Screen {
+    var s = try init(std.testing.io, std.testing.allocator, .{
+        .cols = 5,
+        .rows = 5,
+        .max_scrollback_bytes = 1000,
+    });
+    errdefer s.deinit();
+    try s.testWriteString("A\nB\nC\n1\n2\n3\n4\n5\n6");
+    return s;
 }
