@@ -226,7 +226,18 @@ pub const LoadingImage = struct {
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const pathz = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return error.InvalidData;
 
-        const fd = std.c.shm_open(pathz, @as(c_int, @bitCast(std.c.O{ .ACCMODE = .RDONLY })), @as(u16, 0));
+        // O_NONBLOCK: a FIFO placed under /dev/shm must not block the open.
+        // Linux only: glibc and musl pass the flag through to open(2), but
+        // macOS may reject it with EINVAL and is unverified (a FIFO under
+        // /dev/shm is a Linux-only layout anyway).
+        const fd = std.c.shm_open(
+            pathz,
+            @as(c_int, @bitCast(std.c.O{
+                .ACCMODE = .RDONLY,
+                .NONBLOCK = builtin.target.os.tag == .linux,
+            })),
+            @as(u16, 0),
+        );
         switch (std.posix.errno(fd)) {
             .SUCCESS => {},
             else => |err| {
@@ -234,9 +245,9 @@ pub const LoadingImage = struct {
                 return error.InvalidData;
             },
         }
-        const file: std.Io.File = .{
+        var file: std.Io.File = .{
             .handle = fd,
-            .flags = .{ .nonblocking = false },
+            .flags = .{ .nonblocking = builtin.target.os.tag == .linux },
         };
 
         // We unlink whatever name the client sent, as the Kitty protocol
@@ -250,10 +261,8 @@ pub const LoadingImage = struct {
         // The size from stat on may be larger than our expected size because
         // shared memory has to be a multiple of the page size.
         const stat_size: usize = stat: {
-            const stat = file.stat(io) catch |err| {
-                log.warn("unable to fstat shared memory {s}: {}", .{ path, err });
-                return error.InvalidData;
-            };
+            const stat = try requireRegularFile(io, file);
+            try clearNonBlock(&file);
             if (stat.size <= 0) return error.InvalidData;
             break :stat std.math.cast(usize, stat.size) orelse
                 return error.InvalidData;
@@ -335,8 +344,11 @@ pub const LoadingImage = struct {
         return .{ .start = start, .end = start + data_size };
     }
 
-    /// Reads the data from a temporary file and returns it. This allocates
-    /// and does not free any of the data, so the caller must free it.
+    /// Reads the data from a file or temporary file and returns it. This
+    /// allocates and does not free any of the data, so the caller must free it.
+    ///
+    /// The file is opened right away, without waiting for a writer, and
+    /// refused unless it is a regular file, before anything is validated.
     ///
     /// This will also delete the temporary file if it is in a safe location.
     fn readFile(
@@ -373,11 +385,9 @@ pub const LoadingImage = struct {
 
         // Open our file right away before we do validation. This avoids
         // TOCTOU issues.
-        var file = std.Io.Dir.cwd().openFile(
-            io,
-            path,
-            .{},
-        ) catch |err| {
+        const pathz = std.mem.printSentinel(abs_buf, "{s}", .{path}, 0) catch
+            return error.InvalidData;
+        var file = openNonBlocking(io, pathz) catch |err| {
             log.warn("failed to open image file: {}", .{err});
             return error.InvalidData;
         };
@@ -392,6 +402,12 @@ pub const LoadingImage = struct {
                 };
             }
         }
+
+        // Anything but a regular file is refused before validation, the
+        // temporary file delete decision, or any read. This is what keeps
+        // a FIFO from blocking us and from being deleted.
+        _ = try requireRegularFile(io, file);
+        try clearNonBlock(&file);
 
         // Derive the path from the open handle so the file we validate is the
         // exact file we read. Resolving a path before opening it would allow a
@@ -420,17 +436,6 @@ pub const LoadingImage = struct {
                 "tty-graphics-protocol",
             ) == null) return error.TemporaryFileNotNamedCorrectly;
             delete_path = abs_path;
-        }
-
-        // File must be a regular file
-        if (file.stat(io)) |stat| {
-            if (stat.kind != .file) {
-                log.warn("file is not a regular file kind={}", .{stat.kind});
-                return error.InvalidData;
-            }
-        } else |err| {
-            log.warn("failed to stat file: {}", .{err});
-            return error.InvalidData;
         }
 
         var buf: [4096]u8 = undefined;
@@ -495,6 +500,80 @@ pub const LoadingImage = struct {
         }
 
         return path;
+    }
+
+    /// Opens `pathz` read-only without waiting for a writer.
+    ///
+    /// Opening a FIFO for reading blocks until another process opens the
+    /// other end, and the caller holds the terminal lock, so a program that
+    /// names a FIFO could freeze the terminal. `O_NONBLOCK` makes the open
+    /// return at once; the caller must `requireRegularFile` before reading
+    /// and then `clearNonBlock`. TinyIo's `openFile` cannot express
+    /// `O_NONBLOCK`, hence the raw `openat`.
+    fn openNonBlocking(io: std.Io, pathz: [:0]const u8) !std.Io.File {
+        // Windows has no FIFOs reachable by path; the portable open stays.
+        if (comptime builtin.target.os.tag == .windows) {
+            return std.Io.Dir.cwd().openFile(io, pathz, .{});
+        }
+        return openNonBlockingPosix(pathz);
+    }
+
+    fn openNonBlockingPosix(pathz: [:0]const u8) !std.Io.File {
+        const openat_sym = if (posix.lfs64_abi) posix.system.openat64 else posix.system.openat;
+
+        var flags: posix.O = .{ .ACCMODE = .RDONLY, .NONBLOCK = true };
+        if (@hasField(posix.O, "CLOEXEC")) flags.CLOEXEC = true;
+        if (@hasField(posix.O, "LARGEFILE")) flags.LARGEFILE = true;
+        if (@hasField(posix.O, "NOCTTY")) flags.NOCTTY = true;
+
+        while (true) {
+            const rc = openat_sym(posix.AT.FDCWD, pathz, flags, @as(posix.mode_t, 0));
+            switch (posix.errno(rc)) {
+                .SUCCESS => return .{
+                    .handle = @intCast(rc),
+                    .flags = .{ .nonblocking = true },
+                },
+                .INTR => continue,
+                else => |err| {
+                    log.warn("failed to open image file: {}", .{err});
+                    return error.InvalidData;
+                },
+            }
+        }
+    }
+
+    /// Fails unless `file` is a regular file, and returns its stat.
+    ///
+    /// Checked on the open handle, before anything is validated, read or
+    /// deleted, so FIFOs, devices and directories are never touched.
+    fn requireRegularFile(io: std.Io, file: std.Io.File) !std.Io.File.Stat {
+        const stat = file.stat(io) catch |err| {
+            log.warn("failed to stat file: {}", .{err});
+            return error.InvalidData;
+        };
+        if (stat.kind != .file) {
+            log.warn("file is not a regular file kind={}", .{stat.kind});
+            return error.InvalidData;
+        }
+        return stat;
+    }
+
+    /// Restores blocking mode on a handle from `openNonBlocking`.
+    fn clearNonBlock(file: *std.Io.File) !void {
+        if (comptime builtin.target.os.tag == .windows) return;
+
+        const Flags = @typeInfo(posix.O).@"struct".backing_integer.?;
+        const raw = posix.system.fcntl(file.handle, posix.F.GETFL, @as(usize, 0));
+        if (posix.errno(raw) != .SUCCESS) return error.InvalidData;
+        var flags: posix.O = @bitCast(@as(Flags, @intCast(raw)));
+        flags.NONBLOCK = false;
+        const set = posix.system.fcntl(
+            file.handle,
+            posix.F.SETFL,
+            @as(usize, @as(Flags, @bitCast(flags))),
+        );
+        if (posix.errno(set) != .SUCCESS) return error.InvalidData;
+        file.flags.nonblocking = false;
     }
 
     /// Returns true if path appears to be in a temporary directory.
@@ -2386,4 +2465,215 @@ test "limits: temporary file medium allowed by limits" {
         },
     );
     defer loading.deinit(alloc);
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+fn transmitCommand(
+    alloc: Allocator,
+    medium: command.Transmission.Medium,
+    path: []const u8,
+) !command.Command {
+    return .{
+        .control = .{ .transmit = .{
+            .format = .rgb,
+            .medium = medium,
+            .compression = .none,
+            .width = 20,
+            .height = 15,
+            .image_id = 31,
+        } },
+        .data = try alloc.dupe(u8, path),
+    };
+}
+
+/// Runs `LoadingImage.init` on a helper thread so a blocking open cannot
+/// stall the test runner; the test thread owns the watchdog.
+const InitAttempt = struct {
+    io: std.Io,
+    alloc: Allocator,
+    cmd: *const command.Command,
+    limits: LoadingImage.Limits,
+    done: std.Io.Event = .unset,
+    outcome: union(enum) { pending, loaded, refused: anyerror } = .pending,
+
+    fn run(self: *InitAttempt) void {
+        defer self.done.set(self.io);
+        if (LoadingImage.init(self.io, self.alloc, self.cmd, self.limits)) |loaded| {
+            var image = loaded;
+            image.deinit(self.alloc);
+            self.outcome = .loaded;
+        } else |err| {
+            self.outcome = .{ .refused = err };
+        }
+    }
+};
+
+/// Expects `init` to refuse promptly with `error.InvalidData`. When
+/// `fifo` is set and the helper is still blocked after two seconds, the
+/// FIFO is opened for writing (non-blocking) to release it, the thread
+/// is joined and the test fails.
+fn expectRefusedPromptly(
+    cmd: *const command.Command,
+    limits: LoadingImage.Limits,
+    fifo: ?[*:0]const u8,
+) !void {
+    const testing = std.testing;
+    const io = testing.io;
+    // Heap allocated: when the helper cannot be released it is detached and
+    // the state is leaked on purpose, so it must outlive this frame.
+    const gpa = std.heap.page_allocator;
+    const attempt = try gpa.create(InitAttempt);
+    attempt.* = .{
+        .io = io,
+        .alloc = testing.allocator,
+        .cmd = cmd,
+        .limits = limits,
+    };
+    const thread = try std.Thread.spawn(.{}, InitAttempt.run, .{attempt});
+    const two_seconds: std.Io.Timeout = .{
+        .duration = .{ .raw = .fromSeconds(2), .clock = .awake },
+    };
+    attempt.done.waitTimeout(io, two_seconds) catch |err| switch (err) {
+        error.Timeout => {
+            // Release a helper blocked in open(2) on a FIFO: a non-blocking
+            // write open succeeds only once the reader is inside open(2),
+            // and fails with ENXIO before that, so retry a bounded number
+            // of times (50 x 20 ms) and watch for the helper to finish.
+            var released = false;
+            if (fifo) |path| {
+                var tries: usize = 0;
+                while (tries < 50) : (tries += 1) {
+                    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .NONBLOCK = true });
+                    if (fd >= 0) _ = std.c.close(fd);
+                    attempt.done.waitTimeout(io, .{
+                        .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake },
+                    }) catch continue;
+                    released = true;
+                    break;
+                }
+            }
+            if (released) {
+                thread.join();
+                gpa.destroy(attempt);
+            } else {
+                // Nothing can unblock it: never join a stuck thread. Detach
+                // and leak the state so the runner is not held hostage.
+                thread.detach();
+            }
+            std.debug.print("LoadingImage.init blocked on a FIFO\n", .{});
+            return error.TestUnexpectedResult;
+        },
+        else => |e| return e,
+    };
+    thread.join();
+    defer gpa.destroy(attempt);
+    switch (attempt.outcome) {
+        .pending => return error.TestUnexpectedResult,
+        .loaded => {
+            std.debug.print("LoadingImage.init accepted a non-regular file\n", .{});
+            return error.TestUnexpectedResult;
+        },
+        .refused => |err| try testing.expect(err == error.InvalidData),
+    }
+}
+
+test "image load: fifo by file medium is refused without blocking" {
+    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = dir_buf[0..try tmp_dir.dir.realPath(io, &dir_buf)];
+
+    var fifo_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fifo_buf, "{s}/image.fifo", .{dir_path}, 0);
+    try testing.expectEqual(0, mkfifo(fifo, 0o600));
+
+    var cmd = try transmitCommand(alloc, .file, fifo);
+    defer cmd.deinit(alloc);
+    try expectRefusedPromptly(&cmd, .allWithTempDir(dir_path), fifo);
+}
+
+test "image load: fifo by temporary file medium is refused and kept" {
+    if (comptime builtin.target.os.tag == .windows or !builtin.link_libc) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = dir_buf[0..try tmp_dir.dir.realPath(io, &dir_buf)];
+
+    var fifo_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fifo_buf, "{s}/tty-graphics-protocol-image.fifo", .{dir_path}, 0);
+    try testing.expectEqual(0, mkfifo(fifo, 0o600));
+
+    var cmd = try transmitCommand(alloc, .temporary_file, fifo);
+    defer cmd.deinit(alloc);
+    try expectRefusedPromptly(&cmd, .allWithTempDir(dir_path), fifo);
+
+    // Refused before the delete decision: the entry must survive.
+    try tmp_dir.dir.access(io, "tty-graphics-protocol-image.fifo", .{});
+}
+
+test "image load: fifo under /dev/shm by shared memory medium is refused without blocking" {
+    if (comptime builtin.target.os.tag != .linux or !builtin.link_libc) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrintSentinel(&name_buf, "ghostty-test-fifo-{d}", .{std.c.getpid()}, 0);
+    var path_buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "/dev/shm/{s}", .{name}, 0);
+
+    // /dev/shm may be missing or read-only (sandboxes): nothing to test then.
+    if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
+    defer _ = std.c.unlink(path);
+
+    var shm_name_buf: [65]u8 = undefined;
+    const shm_name = try std.fmt.bufPrint(&shm_name_buf, "/{s}", .{name});
+    var cmd = try transmitCommand(alloc, .shared_memory, shm_name);
+    defer cmd.deinit(alloc);
+    try expectRefusedPromptly(&cmd, .{
+        .file = false,
+        .temporary_file = .disabled,
+        .shared_memory = true,
+    }, path);
+}
+
+test "image load: special files are refused" {
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_path = dir_buf[0..try tmp_dir.dir.realPath(io, &dir_buf)];
+
+    try tmp_dir.dir.symLink(io, "/proc/self/environ", "link-to-environ", .{});
+    var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const link = try std.fmt.bufPrint(&link_buf, "{s}/link-to-environ", .{dir_path});
+
+    const refused = [_][]const u8{
+        "/proc/self/environ",
+        "/dev/zero",
+        link,
+        dir_path, // a directory
+    };
+    for (refused) |path| {
+        var cmd = try transmitCommand(alloc, .file, path);
+        defer cmd.deinit(alloc);
+        try expectRefusedPromptly(&cmd, .allWithTempDir(dir_path), null);
+    }
 }
