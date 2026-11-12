@@ -3612,6 +3612,38 @@ GHOSTTY_API GhosttyResult ghostty_terminal_screen_rows_wrapped_preserving(
     size_t count,
     uint8_t* out_wrapped);
 
+/**
+ * Read the soft-wrap flags of the rows starting at a grid reference, without
+ * restoring history.
+ *
+ * Like ghostty_terminal_screen_rows_wrapped_preserving(), but the first row
+ * is given as a reference instead of a SCREEN row number, so the cost follows
+ * `count` and not the distance from the top of the scrollback. Pair it with
+ * ghostty_grid_ref_down() to read a long history chunk by chunk in linear
+ * time.
+ *
+ * You must not modify the terminal during the call or between taking `start`
+ * and this call, and must serialize it with other access to the same
+ * terminal.
+ *
+ * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param start Grid reference to the first row (NULL or a NULL node returns
+ *              GHOSTTY_INVALID_VALUE)
+ * @param count Number of rows to read; zero succeeds and writes nothing
+ * @param[out] out_wrapped Receives `count` bytes (NULL returns
+ *             GHOSTTY_INVALID_VALUE)
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if an argument is
+ *         NULL or the range runs past the last row, or GHOSTTY_OUT_OF_MEMORY
+ *         if the temporary memory could not be allocated
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_grid_ref_rows_wrapped_preserving(
+    GhosttyTerminal terminal,
+    const GhosttyGridRef* start,
+    size_t count,
+    uint8_t* out_wrapped);
+
 /** @} */
 
 /** @name Data

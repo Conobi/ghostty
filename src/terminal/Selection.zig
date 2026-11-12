@@ -11,16 +11,6 @@ const PageList = @import("PageList.zig");
 const Screen = @import("Screen.zig");
 const Pin = PageList.Pin;
 
-// NOTE(mitchellh): I'm not very happy with how this is implemented, because
-// the ordering operations which are used frequently require using
-// pointFromPin which -- at the time of writing this -- is slow. The overall
-// style of this struct is due to porting it from the previous implementation
-// which had an efficient ordering operation.
-//
-// While reimplementing this, there were too many callers that already
-// depended on this behavior so I kept it despite the inefficiency. In the
-// future, we should take a look at this again!
-
 /// The bounds of the selection.
 bounds: Bounds,
 
@@ -204,27 +194,29 @@ pub const Order = lib.Enum(lib.target, &.{
 });
 
 pub fn order(self: Selection, s: *const Screen) Order {
-    const start_pt = s.pages.pointFromPin(.screen, self.start()).?.screen;
-    const end_pt = s.pages.pointFromPin(.screen, self.end()).?.screen;
+    _ = s;
+    const start_pin = self.start();
+    const end_pin = self.end();
+    const rows = start_pin.compareRow(end_pin);
 
     if (self.rectangle) {
         // Reverse (also handles single-column)
-        if (start_pt.y > end_pt.y and start_pt.x >= end_pt.x) return .reverse;
-        if (start_pt.y >= end_pt.y and start_pt.x > end_pt.x) return .reverse;
+        if (rows == .gt and start_pin.x >= end_pin.x) return .reverse;
+        if (rows != .lt and start_pin.x > end_pin.x) return .reverse;
 
         // Mirror, bottom-left to top-right
-        if (start_pt.y > end_pt.y and start_pt.x < end_pt.x) return .mirrored_reverse;
+        if (rows == .gt and start_pin.x < end_pin.x) return .mirrored_reverse;
 
         // Mirror, top-right to bottom-left
-        if (start_pt.y < end_pt.y and start_pt.x > end_pt.x) return .mirrored_forward;
+        if (rows == .lt and start_pin.x > end_pin.x) return .mirrored_forward;
 
         // Forward
         return .forward;
     }
 
-    if (start_pt.y < end_pt.y) return .forward;
-    if (start_pt.y > end_pt.y) return .reverse;
-    if (start_pt.x <= end_pt.x) return .forward;
+    if (rows == .lt) return .forward;
+    if (rows == .gt) return .reverse;
+    if (start_pin.x <= end_pin.x) return .forward;
     return .reverse;
 }
 
@@ -1080,6 +1072,46 @@ test "Selection: rectangle corners clamp across mixed-width pages" {
     const bottom_right = sel.bottomRight(&s);
     _ = bottom_right.rowAndCell();
     try testing.expect((Pin{ .node = second, .x = 1 }).eql(bottom_right));
+}
+
+test "Selection: order across pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try Screen.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = null });
+    defer s.deinit();
+    while (s.pages.pages.first.? == s.pages.pages.last.? or
+        s.pages.pages.first.?.next.? == s.pages.pages.last.?)
+    {
+        _ = try s.pages.grow();
+    }
+
+    const first = s.pages.pages.first.?;
+    const last = s.pages.pages.last.?;
+    const top: Pin = .{ .node = first, .x = 3, .y = 1 };
+    const bottom: Pin = .{ .node = last, .x = 2, .y = 0 };
+    const top_same_x: Pin = .{ .node = first, .x = 5, .y = 1 };
+
+    try testing.expectEqual(Order.forward, Selection.init(top, bottom, false).order(&s));
+    try testing.expectEqual(Order.reverse, Selection.init(bottom, top, false).order(&s));
+    try testing.expectEqual(Order.forward, Selection.init(top, top_same_x, false).order(&s));
+    try testing.expectEqual(Order.reverse, Selection.init(top_same_x, top, false).order(&s));
+
+    // Rectangles: the corner pair decides the mirror.
+    try testing.expectEqual(Order.mirrored_forward, Selection.init(
+        .{ .node = first, .x = 7, .y = 1 },
+        .{ .node = last, .x = 2, .y = 0 },
+        true,
+    ).order(&s));
+    try testing.expectEqual(Order.mirrored_reverse, Selection.init(
+        .{ .node = last, .x = 2, .y = 0 },
+        .{ .node = first, .x = 7, .y = 1 },
+        true,
+    ).order(&s));
+    const bottom_right: Pin = .{ .node = last, .x = 9, .y = 0 };
+    try testing.expectEqual(Order.forward, Selection.init(top, bottom_right, true).order(&s));
+    try testing.expectEqual(Order.reverse, Selection.init(bottom_right, top, true).order(&s));
 }
 
 test "Selection: order, rectangle" {

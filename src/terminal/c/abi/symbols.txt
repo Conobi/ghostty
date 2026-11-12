@@ -24,6 +24,7 @@ ghostty_formatter_set
 ghostty_formatter_terminal_new
 ghostty_free
 ghostty_grid_ref_cell
+ghostty_grid_ref_down
 ghostty_grid_ref_graphemes
 ghostty_grid_ref_hyperlink_uri
 ghostty_grid_ref_row
@@ -178,6 +179,7 @@ ghostty_terminal_free
 ghostty_terminal_get
 ghostty_terminal_get_multi
 ghostty_terminal_grid_ref
+ghostty_terminal_grid_ref_rows_wrapped_preserving
 ghostty_terminal_grid_ref_track
 ghostty_terminal_new
 ghostty_terminal_paste

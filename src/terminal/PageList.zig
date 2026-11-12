@@ -6183,9 +6183,23 @@ pub fn rowsWrappedPreserving(
     const end = std.math.add(usize, y, out.len) catch return error.OutOfRange;
     if (end > self.total_rows) return error.OutOfRange;
     const first_y = std.math.cast(u32, y) orelse return error.OutOfRange;
-    const last_y = std.math.cast(u32, end - 1) orelse return error.OutOfRange;
     const top = self.pin(.{ .screen = .{ .y = first_y } }) orelse return error.OutOfRange;
-    const bot = self.pin(.{ .screen = .{ .y = last_y } }) orelse return error.OutOfRange;
+    return self.rowsWrappedPreservingFrom(alloc, top, out);
+}
+
+/// Like `rowsWrappedPreserving`, for the rows starting at `top`: the cost
+/// follows the rows read, not their distance from the top of the history,
+/// so a caller that resumes from where it stopped reads a whole history in
+/// linear time. `top` must be a live pin of this list.
+pub fn rowsWrappedPreservingFrom(
+    self: *const PageList,
+    alloc: Allocator,
+    top: Pin,
+    out: []bool,
+) RowsWrappedError!void {
+    _ = self; // A pin carries its page; the list only scopes the call.
+    if (out.len == 0) return;
+    const bot = top.down(out.len - 1) orelse return error.OutOfRange;
 
     var scratch: ReadScratch = .{};
     defer scratch.deinit(alloc);
@@ -8442,6 +8456,29 @@ pub const Pin = struct {
         return false;
     }
 
+    /// Orders the rows of two pins of one list, ignoring columns. The walk
+    /// goes both ways from `self` at once, so it costs the distance between
+    /// the pins, not their distance from the ends of the list. Both pins must
+    /// be live pins of the same list.
+    pub fn compareRow(self: Pin, other: Pin) std.math.Order {
+        if (self.node == other.node) return std.math.order(self.y, other.y);
+
+        var next = self.node.next;
+        var prev = self.node.prev;
+        while (next != null or prev != null) {
+            if (next) |node| {
+                if (node == other.node) return .lt;
+                next = node.next;
+            }
+            if (prev) |node| {
+                if (node == other.node) return .gt;
+                prev = node.prev;
+            }
+        }
+
+        unreachable; // assertion: both pins are in the same list
+    }
+
     /// Returns true if self is before other. This is very expensive since
     /// it requires traversing the linked list of pages. This should not
     /// be called in performance critical paths.
@@ -10379,6 +10416,73 @@ test "PageList rowsWrappedPreserving reads flags from compressed pages" {
     try testing.expectEqualSlices(bool, oracle[5..15], sub);
     try testing.expectError(error.OutOfRange, s.rowsWrappedPreserving(alloc, total - 3, sub));
     try testing.expectEqual(stats, s.memoryStats());
+}
+
+test "PageList rowsWrappedPreservingFrom reads from a pin like the y form" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try s.growColdPagesForTest(3);
+
+    var node = s.pages.first;
+    while (node) |n| : (node = n.next) {
+        const page = n.page();
+        for (0..n.rows()) |y| {
+            const rac = page.getRowAndCell(0, y);
+            rac.cell.* = .init('x');
+            rac.row.wrap = y % 3 == 0;
+        }
+    }
+    _ = s.compress(.full);
+    const stats = s.memoryStats();
+    try testing.expect(stats.compressed_pages >= 2);
+
+    // Every start row, a window that spans pages, against the y form.
+    const want = try alloc.alloc(bool, 300);
+    defer alloc.free(want);
+    const got = try alloc.alloc(bool, 300);
+    defer alloc.free(got);
+    var y: usize = 0;
+    while (y + want.len <= s.total_rows) : (y += 37) {
+        try s.rowsWrappedPreserving(alloc, y, want);
+        const top = s.pin(.{ .screen = .{ .y = @intCast(y) } }).?;
+        try s.rowsWrappedPreservingFrom(alloc, top, got);
+        try testing.expectEqualSlices(bool, want, got);
+    }
+    try testing.expectEqual(stats, s.memoryStats());
+
+    // Past the last row is out of range; empty output is fine.
+    const last = s.pin(.{ .screen = .{ .y = @intCast(s.total_rows - 1) } }).?;
+    try testing.expectError(error.OutOfRange, s.rowsWrappedPreservingFrom(alloc, last, got[0..2]));
+    try s.rowsWrappedPreservingFrom(alloc, last, got[0..1]);
+    try s.rowsWrappedPreservingFrom(alloc, last, got[0..0]);
+}
+
+test "Pin compareRow orders pins across pages without a screen point" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try s.growColdPagesForTest(5);
+
+    // Rows spread over several pages, columns varied: the order is by row only.
+    var pins: std.ArrayList(Pin) = .empty;
+    defer pins.deinit(alloc);
+    var y: usize = 0;
+    while (y < s.total_rows) : (y += 53) {
+        try pins.append(alloc, s.pin(.{ .screen = .{ .x = @intCast(y % 80), .y = @intCast(y) } }).?);
+    }
+    try pins.append(alloc, s.pin(.{ .screen = .{ .y = @intCast(s.total_rows - 1) } }).?);
+    try testing.expect(pins.items.len > 10);
+
+    for (pins.items) |a| for (pins.items) |b| {
+        const ay = s.pointFromPin(.screen, a).?.screen.y;
+        const by = s.pointFromPin(.screen, b).?.screen.y;
+        try testing.expectEqual(std.math.order(ay, by), a.compareRow(b));
+    };
 }
 
 test "PageList cold sweep compresses reflowed history and keeps the tail resident" {

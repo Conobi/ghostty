@@ -74,6 +74,21 @@ pub fn grid_ref_row(
     return .success;
 }
 
+pub fn grid_ref_down(
+    ref_: ?*const CGridRef,
+    rows: usize,
+    out_: ?*CGridRef,
+) callconv(lib.calling_conv) Result {
+    if (comptime !(lib.feature(.grid_introspection) or lib.feature(.selection))) return .unsupported;
+    const ref = ref_ orelse return .invalid_value;
+    const out = out_ orelse return .invalid_value;
+    const p = ref.toPin() orelse return .invalid_value;
+    var moved = p.down(rows) orelse return .invalid_value;
+    moved.x = @min(moved.x, moved.node.cols() - 1);
+    out.* = CGridRef.fromPin(moved);
+    return .success;
+}
+
 pub fn grid_ref_graphemes(
     ref_: ?*const CGridRef,
     buf_: ?[*]u32,

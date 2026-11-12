@@ -203,6 +203,7 @@ pub const terminal_scroll_viewport = terminal.scroll_viewport;
 pub const terminal_compression_activity = terminal.compression_activity;
 pub const terminal_compress = terminal.compress;
 pub const terminal_screen_rows_wrapped_preserving = terminal.screen_rows_wrapped_preserving;
+pub const terminal_grid_ref_rows_wrapped_preserving = terminal.grid_ref_rows_wrapped_preserving;
 pub const terminal_get = terminal.get;
 pub const terminal_get_multi = terminal.get_multi;
 pub const terminal_continuation_write = terminal.continuation_write;
@@ -262,6 +263,7 @@ pub const unicode_grapheme_width = unicode.grapheme_width;
 
 pub const grid_ref_cell = grid_ref.grid_ref_cell;
 pub const grid_ref_row = grid_ref.grid_ref_row;
+pub const grid_ref_down = grid_ref.grid_ref_down;
 pub const grid_ref_graphemes = grid_ref.grid_ref_graphemes;
 pub const grid_ref_hyperlink_uri = grid_ref.grid_ref_hyperlink_uri;
 pub const grid_ref_style = grid_ref.grid_ref_style;

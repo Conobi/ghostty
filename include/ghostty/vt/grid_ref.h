@@ -137,6 +137,31 @@ GHOSTTY_API GhosttyResult ghostty_grid_ref_row(const GhosttyGridRef *ref,
                                    GhosttyRow *out_row);
 
 /**
+ * Move a grid reference down by a number of rows.
+ *
+ * The result keeps the reference's column, clamped to the last column of the
+ * page it lands on (also when `rows` is zero). The cost follows `rows`, not the position in the history, so
+ * a caller that reads a long history in chunks can resume from the reference
+ * where the last chunk stopped.
+ *
+ * Like any grid reference, the result is valid only until the terminal next
+ * changes.
+ *
+ * @param ref Pointer to the grid reference (NULL returns
+ *            GHOSTTY_INVALID_VALUE)
+ * @param rows Number of rows to move down; zero copies the reference
+ * @param[out] out_ref On success, the moved reference (NULL returns
+ *             GHOSTTY_INVALID_VALUE)
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if the ref's
+ *         node is NULL or the move leaves the screen's last row behind
+ *
+ * @ingroup grid_ref
+ */
+GHOSTTY_API GhosttyResult ghostty_grid_ref_down(const GhosttyGridRef *ref,
+                                    size_t rows,
+                                    GhosttyGridRef *out_ref);
+
+/**
  * Get the grapheme cluster codepoints for the cell at the grid reference's
  * position.
  *

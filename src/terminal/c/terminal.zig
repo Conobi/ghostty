@@ -1472,6 +1472,28 @@ pub fn screen_rows_wrapped_preserving(
     return .success;
 }
 
+pub fn grid_ref_rows_wrapped_preserving(
+    terminal_: Terminal,
+    start_: ?*const grid_ref_c.CGridRef,
+    count: usize,
+    out_wrapped_: ?[*]u8,
+) callconv(lib.calling_conv) Result {
+    if (comptime !(lib.feature(.grid_introspection) or lib.feature(.selection))) return .unsupported;
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const top = (start_ orelse return .invalid_value).toPin() orelse return .invalid_value;
+    const out_wrapped = out_wrapped_ orelse return .invalid_value;
+    if (count == 0) return .success;
+    const alloc = t.gpa();
+    const flags = alloc.alloc(bool, count) catch return .out_of_memory;
+    defer alloc.free(flags);
+    t.screens.active.pages.rowsWrappedPreservingFrom(alloc, top, flags) catch |err| return switch (err) {
+        error.OutOfRange => .invalid_value,
+        error.OutOfMemory => .out_of_memory,
+    };
+    for (flags, 0..) |flag, i| out_wrapped[i] = @intFromBool(flag);
+    return .success;
+}
+
 /// What the primary screen's scrollback byte limit counts.
 ///
 /// The declaration order is part of the libghostty-vt C ABI.
@@ -3323,6 +3345,102 @@ test "screen_rows_wrapped_preserving" {
     var after: TerminalMemoryUsage = .{};
     try testing.expectEqual(Result.success, get(t, .memory_usage, @ptrCast(&after)));
     try testing.expectEqual(before.primary_compressed_pages, after.primary_compressed_pages);
+}
+
+test "a grid ref resumes row reads where the last one stopped" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer free(t);
+    const zt: *ZigTerminal = t.?.terminal;
+    zt.setScrollbackMaxBytes(null);
+
+    // Wrapped lines (longer than 80 columns) among short ones, then compress.
+    const long: []const u8 = &(@as([200]u8, @splat('w')) ++ "\r\n".*);
+    const short: []const u8 = "short line\r\n";
+    for (0..1_500) |i| {
+        if (i % 4 == 0) vt_write(t, long.ptr, long.len) else vt_write(t, short.ptr, short.len);
+    }
+    var result: CompressionResult = undefined;
+    try testing.expectEqual(
+        Result.success,
+        compress(t, @backingInt(CompressionMode.full), &result),
+    );
+
+    var total: usize = 0;
+    try testing.expectEqual(Result.success, get(t, .total_rows, @ptrCast(&total)));
+    try testing.expect(total > 2_000);
+
+    const chunk = 700;
+    var want: [chunk]u8 = undefined;
+    var got: [chunk]u8 = undefined;
+    var cursor: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, grid_ref(t, .{
+        .tag = .screen,
+        .value = .{ .screen = .{ .x = 0, .y = 0 } },
+    }, &cursor));
+
+    var y: usize = 0;
+    var wrapped_seen: usize = 0;
+    while (y + chunk <= total) : (y += chunk) {
+        // The ref-based read equals the y-based read for the same rows.
+        try testing.expectEqual(Result.success, screen_rows_wrapped_preserving(t, @intCast(y), chunk, &want));
+        try testing.expectEqual(Result.success, grid_ref_rows_wrapped_preserving(t, &cursor, chunk, &got));
+        try testing.expectEqualSlices(u8, &want, &got);
+        for (got) |f| wrapped_seen += f;
+
+        // The row `chunk` below the cursor is the next y-based row.
+        if (y + chunk >= total) break;
+        var next: grid_ref_c.CGridRef = .{};
+        try testing.expectEqual(Result.success, grid_ref_c.grid_ref_down(&cursor, chunk, &next));
+        var by_y: grid_ref_c.CGridRef = .{};
+        try testing.expectEqual(Result.success, grid_ref(t, .{
+            .tag = .screen,
+            .value = .{ .screen = .{ .x = 0, .y = @intCast(y + chunk) } },
+        }, &by_y));
+        try testing.expectEqual(by_y.node, next.node);
+        try testing.expectEqual(by_y.y, next.y);
+        cursor = next;
+    }
+    try testing.expect(wrapped_seen > 0);
+
+    // The last row is reachable, one past it is not; zero is the same row.
+    var last: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, grid_ref(t, .{
+        .tag = .screen,
+        .value = .{ .screen = .{ .x = 5, .y = @intCast(total - 1) } },
+    }, &last));
+    var first: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, grid_ref(t, .{
+        .tag = .screen,
+        .value = .{ .screen = .{ .x = 5, .y = 0 } },
+    }, &first));
+    var moved: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, grid_ref_c.grid_ref_down(&first, total - 1, &moved));
+    try testing.expectEqual(last.node, moved.node);
+    try testing.expectEqual(last.y, moved.y);
+    try testing.expectEqual(@as(u16, 5), moved.x);
+    try testing.expectEqual(Result.invalid_value, grid_ref_c.grid_ref_down(&first, total, &moved));
+    try testing.expectEqual(Result.invalid_value, grid_ref_c.grid_ref_down(&last, 1, &moved));
+    try testing.expectEqual(Result.success, grid_ref_c.grid_ref_down(&last, 0, &moved));
+
+    // A column past the page's width is clamped to its last column, even for no move.
+    var wide = first;
+    wide.x = 500;
+    try testing.expectEqual(Result.success, grid_ref_c.grid_ref_down(&wide, 0, &moved));
+    try testing.expectEqual(@as(u16, 79), moved.x);
+
+    // A read that runs past the bottom, and bad arguments.
+    try testing.expectEqual(Result.invalid_value, grid_ref_rows_wrapped_preserving(t, &last, 2, &got));
+    try testing.expectEqual(Result.success, grid_ref_rows_wrapped_preserving(t, &last, 1, &got));
+    try testing.expectEqual(Result.success, grid_ref_rows_wrapped_preserving(t, &last, 0, &got));
+    const empty: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.invalid_value, grid_ref_rows_wrapped_preserving(t, &empty, 1, &got));
+    try testing.expectEqual(Result.invalid_value, grid_ref_rows_wrapped_preserving(t, null, 1, &got));
+    try testing.expectEqual(Result.invalid_value, grid_ref_rows_wrapped_preserving(null, &last, 1, &got));
+    try testing.expectEqual(Result.invalid_value, grid_ref_rows_wrapped_preserving(t, &last, 1, null));
+    try testing.expectEqual(Result.invalid_value, grid_ref_c.grid_ref_down(null, 1, &moved));
+    try testing.expectEqual(Result.invalid_value, grid_ref_c.grid_ref_down(&empty, 1, &moved));
+    try testing.expectEqual(Result.invalid_value, grid_ref_c.grid_ref_down(&last, 1, null));
 }
 
 test "scrollback bytes mode and resident budget options" {

@@ -322,6 +322,7 @@ comptime {
         @export(&c.terminal_compression_activity, .{ .name = "ghostty_terminal_compression_activity" });
         @export(&c.terminal_compress, .{ .name = "ghostty_terminal_compress" });
         @export(&c.terminal_screen_rows_wrapped_preserving, .{ .name = "ghostty_terminal_screen_rows_wrapped_preserving" });
+        @export(&c.terminal_grid_ref_rows_wrapped_preserving, .{ .name = "ghostty_terminal_grid_ref_rows_wrapped_preserving" });
         @export(&c.terminal_get, .{ .name = "ghostty_terminal_get" });
         @export(&c.terminal_get_multi, .{ .name = "ghostty_terminal_get_multi" });
         @export(&c.terminal_continuation_write, .{ .name = "ghostty_terminal_continuation_write" });
@@ -390,6 +391,7 @@ comptime {
         @export(&c.kitty_graphics_placement_render_info, .{ .name = "ghostty_kitty_graphics_placement_render_info" });
         @export(&c.grid_ref_cell, .{ .name = "ghostty_grid_ref_cell" });
         @export(&c.grid_ref_row, .{ .name = "ghostty_grid_ref_row" });
+        @export(&c.grid_ref_down, .{ .name = "ghostty_grid_ref_down" });
         @export(&c.grid_ref_graphemes, .{ .name = "ghostty_grid_ref_graphemes" });
         @export(&c.grid_ref_hyperlink_uri, .{ .name = "ghostty_grid_ref_hyperlink_uri" });
         @export(&c.grid_ref_style, .{ .name = "ghostty_grid_ref_style" });
