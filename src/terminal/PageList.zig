@@ -53,6 +53,57 @@ const pin_preheat = 2;
 /// the bottommost page (the current active page).
 pub const List = DoublyLinkedList(Node);
 
+/// Byte accounting shared by a PageList and its nodes.
+///
+/// Heap-allocated so its address survives the by-value return of `init`;
+/// nodes point at it because a restore only has the node in hand.
+pub const Counters = struct {
+    /// Backing bytes of every resident page (a pool item, or the exact heap
+    /// size), active and viewport pages included. Compressed pages count 0.
+    resident_size: usize = 0,
+
+    /// Highest `resident_size` since it was last set; a diagnostic for tests.
+    resident_peak: usize = 0,
+
+    /// Oldest page that may still be worth compressing; see
+    /// `PageList.compressOldestResident`. Cleared by whatever destroys, reuses
+    /// or restores a node, so it is never dangling.
+    cursor: ?*List.Node = null,
+
+    /// Number of encode attempts, for tests and measurement.
+    encodes: usize = 0,
+
+    fn addResident(self: *Counters, bytes: usize) void {
+        self.resident_size += bytes;
+        self.resident_peak = @max(self.resident_peak, self.resident_size);
+    }
+
+    /// A resident node joins the accounted list.
+    fn attach(self: *Counters, node: *const List.Node) void {
+        self.addResident(node.backingBytes());
+    }
+
+    /// A resident node leaves the accounted list.
+    fn detach(self: *Counters, node: *const List.Node) void {
+        self.resident_size -= node.backingBytes();
+        if (self.cursor == node) self.cursor = null;
+    }
+
+    /// A node has just become compressed.
+    fn compressed(self: *Counters, node: *const List.Node) void {
+        self.resident_size -= node.backingBytes();
+    }
+
+    /// A node has just become resident again.
+    ///
+    /// A page behind the cursor is not a candidate for compression until it is
+    /// compressed again, but this one may be, so restart the scan.
+    fn restored(self: *Counters, node: *const List.Node) void {
+        self.addResident(node.backingBytes());
+        self.cursor = null;
+    }
+};
+
 /// A reusable decode buffer for reading compressed pages without restoring them.
 ///
 /// Holds one decoded page at a time; the page returned by
@@ -90,6 +141,15 @@ const Node = struct {
     /// This has no default on purpose so that every construction site
     /// is forced to make an explicit decision.
     owned: Owned,
+
+    /// The accounting this node reports to; null while the node is detached
+    /// (allocated by `allocatePage` and not yet finalized) and counts nothing.
+    counters: ?*Counters = null,
+
+    /// Set when `compressPage` found this page unprofitable to compress, so
+    /// that nothing tries again until it changes. Cleared when the page is
+    /// restored, reused, created or has its layout invalidated.
+    incompressible: bool = false,
 
     /// The physical representation of the page contents.
     ///
@@ -251,6 +311,14 @@ const Node = struct {
         return &scratch.page;
     }
 
+    /// Bytes this node retains: a pool item, or the exact heap size.
+    fn backingBytes(self: *const Node) usize {
+        return switch (self.owned) {
+            .pool => PagePool.item_size,
+            .heap => self.metadata().memory.len,
+        };
+    }
+
     /// Return the node's backing-memory representation without restoring it.
     pub inline fn storage(self: *const Node) Storage {
         return switch (self.data) {
@@ -343,6 +411,8 @@ const Node = struct {
 
         // We're now a resident, non-compressed node.
         self.data = .{ .resident = restored };
+        self.incompressible = false;
+        if (self.counters) |c| c.restored(self);
         return &self.data.resident;
     }
 
@@ -448,6 +518,10 @@ pub const MemoryPool = struct {
 
 /// The memory pool we get page nodes, pages from.
 pool: MemoryPool,
+
+/// Byte accounting for the nodes of this list. Heap-allocated from
+/// `pool.alloc` so that nodes can point at it; freed by `deinit`.
+counters: *Counters,
 
 /// The list of pages in the screen.
 pages: List,
@@ -712,11 +786,16 @@ pub fn init(
     );
     errdefer pool.deinit();
 
+    const counters = try pool.alloc.create(Counters);
+    counters.* = .{};
+    errdefer pool.alloc.destroy(counters);
+
     try tw.check(.init_pages);
     var page_serial: u64 = 0;
     const page_list, const page_size = try initPages(
         &pool,
         &page_serial,
+        counters,
         cols,
         rows,
     );
@@ -740,6 +819,7 @@ pub fn init(
         .cols = cols,
         .rows = rows,
         .pool = pool,
+        .counters = counters,
         .pages = page_list,
         .page_serial = page_serial,
         .page_serial_epoch = 0,
@@ -775,6 +855,7 @@ const initPages_tw = tripwire.module(enum {
 fn initPages(
     pool: *MemoryPool,
     serial: *u64,
+    counters: *Counters,
     cols: size.CellCountInt,
     rows: size.CellCountInt,
 ) Allocator.Error!struct { List, usize } {
@@ -834,6 +915,7 @@ fn initPages(
             .data = .{ .resident = .initBuf(.init(page_buf), layout) },
             .serial = serial.*,
             .owned = if (pooled) .pool else .heap,
+            .counters = counters,
         };
         node.page().size.rows = @min(rem, node.capacity().rows);
         rem -= node.rows();
@@ -841,6 +923,7 @@ fn initPages(
         // Add the page to the list
         page_list.append(node);
         page_size += page_buf.len;
+        counters.attach(node);
         errdefer comptime unreachable;
 
         // Increment our serial
@@ -983,6 +1066,35 @@ fn verifyIntegrity(self: *const PageList) IntegrityError!void {
     }
 }
 
+/// Fails unless the cached byte counters equal a recount from the nodes.
+///
+/// O(pages), and kept out of `verifyIntegrity` because tests that build node
+/// states by hand legitimately bypass the accounting.
+pub fn verifyCounters(self: *const PageList) error{CountersMismatch}!void {
+    const recount = self.recountCounters();
+    if (recount.resident_size != self.counters.resident_size) {
+        log.warn(
+            "PageList counters mismatch resident={} recount={}",
+            .{ self.counters.resident_size, recount.resident_size },
+        );
+        return error.CountersMismatch;
+    }
+}
+
+/// Recomputes the counters from the nodes (O(pages)); the invariant check.
+///
+/// A node stashed for reuse during a reflow is outside the list but still
+/// counted, so it is included.
+pub fn recountCounters(self: *const PageList) Counters {
+    var result: Counters = .{};
+    var node = self.pages.first;
+    while (node) |n| : (node = n.next) {
+        if (n.storage() == .resident) result.resident_size += n.backingBytes();
+    }
+    if (self.recycle_node) |n| result.resident_size += n.backingBytes();
+    return result;
+}
+
 /// Release every page in the list during a teardown walk (deinit,
 /// reset, or an errdefer unwinding a partially built list): heap-owned
 /// pages go back to the page allocator, pool-owned pages back to the
@@ -1032,6 +1144,7 @@ pub fn deinit(self: *PageList) void {
 
     // Release every page and node back to the pools, then free the pools.
     releasePages(&self.pool, self.pages);
+    self.pool.alloc.destroy(self.counters);
     self.pool.deinit();
 }
 
@@ -1071,6 +1184,7 @@ pub fn reset(self: *PageList) void {
     // pages go back to the page allocator and pool-owned pages back to
     // the page pool.
     releasePages(&self.pool, self.pages);
+    self.counters.* = .{};
 
     // Reset our pools to free as much memory as possible while retaining
     // the capacity for at least the minimum number of pages we need.
@@ -1091,6 +1205,7 @@ pub fn reset(self: *PageList) void {
     self.pages, self.page_size = initPages(
         &self.pool,
         &self.page_serial,
+        self.counters,
         self.cols,
         self.rows,
     ) catch @panic("initPages failed");
@@ -1175,6 +1290,10 @@ pub fn clone(
     );
     errdefer pool.deinit();
 
+    const counters = try pool.alloc.create(Counters);
+    counters.* = .{};
+    errdefer pool.alloc.destroy(counters);
+
     // Create our viewport. In a clone, the viewport always goes
     // to the top.
     const viewport_pin = try pool.pins.create(pool.alloc);
@@ -1197,6 +1316,7 @@ pub fn clone(
             .{ .cap = chunk.node.capacity() },
             &page_serial,
             &page_size,
+            counters,
         );
 
         // Add the page to the list immediately so that the errdefer
@@ -1244,6 +1364,7 @@ pub fn clone(
 
     var result: PageList = .{
         .pool = pool,
+        .counters = counters,
         .pages = page_list,
         .page_serial = page_serial,
         .page_serial_epoch = 0,
@@ -3727,6 +3848,8 @@ pub fn scrollClear(self: *PageList) Allocator.Error!void {
 pub fn invalidateNodeLayout(self: *PageList, node: *List.Node) void {
     node.serial = self.page_serial;
     self.page_serial += 1;
+    node.incompressible = false;
+    if (node.counters) |c| c.cursor = null;
 }
 
 /// Compact a page to use the minimum required memory for the contents
@@ -4209,6 +4332,8 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         // be dirty, since every path that gives up a pool item zeroes
         // the bytes it used.
         const old_memory = first.restore(.discard).memory;
+        first.incompressible = false;
+        if (self.counters.cursor == first) self.counters.cursor = null;
         assert(old_memory.len <= std_size);
         assert(layout.total_size <= std_size);
         const item: *align(std.heap.page_size_min) [std_size]u8 =
@@ -4971,6 +5096,7 @@ pub fn allocatePage(
             .{ .cap = capacity },
             &self.page_serial,
             null,
+            null,
         ),
     };
 }
@@ -5085,6 +5211,8 @@ pub const PageAllocation = struct {
         // quantity affected by inserting rows above the existing first page.
         errdefer comptime unreachable;
         destination.pages.prepend(node);
+        node.counters = destination.counters;
+        destination.counters.attach(node);
         destination.page_size = page_size;
         destination.total_rows = total_rows;
         if (destination.viewport == .pin) {
@@ -5159,10 +5287,12 @@ inline fn createPage(
         // pool item in page_size, so destroying the node and
         // creating a new pooled one is a net zero.
 
+        if (self.counters.cursor == node) self.counters.cursor = null;
         node.* = .{
             .data = .{ .resident = .initBuf(.init(item), layout) },
             .serial = self.page_serial,
             .owned = .pool,
+            .counters = self.counters,
         };
         node.page().size.rows = 0;
         self.page_serial += 1;
@@ -5174,6 +5304,7 @@ inline fn createPage(
         opts,
         &self.page_serial,
         &self.page_size,
+        self.counters,
     );
 }
 
@@ -5182,6 +5313,7 @@ inline fn createPageExt(
     opts: CreatePage,
     serial: *u64,
     total_size: ?*usize,
+    counters: ?*Counters,
 ) Allocator.Error!*List.Node {
     var page = try pool.nodes.create();
     errdefer pool.nodes.destroy(page);
@@ -5226,9 +5358,11 @@ inline fn createPageExt(
         .data = .{ .resident = .initBuf(.init(page_buf), layout) },
         .serial = serial.*,
         .owned = if (pooled) .pool else .heap,
+        .counters = counters,
     };
     page.page().size.rows = 0;
     serial.* += 1;
+    if (counters) |c| c.attach(page);
 
     if (total_size) |v| {
         // Accumulate page size now. We don't assert or check max size
@@ -5719,6 +5853,7 @@ fn compressPage(self: *PageList, node: *List.Node) bool {
     // Publish the new state only after both the encoded allocation and the
     // retained-mapping decommit have succeeded.
     node.data = .{ .compressed = compressed };
+    if (node.counters) |c| c.compressed(node);
     return true;
 }
 
@@ -5739,6 +5874,7 @@ fn destroyNodeExt(
     total_size: ?*usize,
 ) void {
     const page = node.restore(.discard);
+    if (node.counters) |c| c.detach(node);
 
     // Update our accounting for page size. This must mirror what was
     // added at creation time: a pool-owned page always accounts for a
@@ -8304,6 +8440,7 @@ pub const Pin = struct {
 /// for other purposes as well.
 pub const Builder = struct {
     pool: MemoryPool,
+    counters: *Counters,
     pages: List = .{},
     page_serial: u64 = 0,
     page_size: usize = 0,
@@ -8317,12 +8454,17 @@ pub const Builder = struct {
         alloc: Allocator,
         options: Options,
     ) Allocator.Error!Builder {
+        var pool = try MemoryPool.init(
+            alloc,
+            pageAllocator(alloc),
+            page_preheat,
+        );
+        errdefer pool.deinit();
+        const counters = try alloc.create(Counters);
+        counters.* = .{};
         return .{
-            .pool = try MemoryPool.init(
-                alloc,
-                pageAllocator(alloc),
-                page_preheat,
-            ),
+            .pool = pool,
+            .counters = counters,
             .options = options,
         };
     }
@@ -8341,6 +8483,7 @@ pub const Builder = struct {
             &self.page_size,
         );
         // Free memory pool
+        self.pool.alloc.destroy(self.counters);
         self.pool.deinit();
         self.* = undefined;
     }
@@ -8359,6 +8502,7 @@ pub const Builder = struct {
             .{ .cap = capacity },
             &self.page_serial,
             &self.page_size,
+            self.counters,
         );
         self.pages.append(node);
         return node.pageAssumeResident();
@@ -8429,6 +8573,7 @@ pub const Builder = struct {
             .cols = self.options.cols,
             .rows = self.options.rows,
             .pool = self.pool,
+            .counters = self.counters,
             .pages = self.pages,
             .page_serial = self.page_serial,
             .page_serial_epoch = 0,
@@ -9025,6 +9170,12 @@ fn fillTextRowsForTest(self: *PageList) void {
         const page = n.page();
         for (0..n.rows()) |y| page.getRowAndCell(0, y).cell.* = .init('x');
     }
+}
+
+/// Fails unless the counters equal a recount from the nodes.
+fn expectCountersForTest(self: *const PageList) !void {
+    const want = self.recountCounters();
+    try std.testing.expectEqual(want.resident_size, self.counters.resident_size);
 }
 
 /// Fill the current tail page to capacity without allocating a successor.
@@ -10090,6 +10241,81 @@ test "PageList cold sweep skips a list too small for any page to be cold" {
     s.fillTextRowsForTest();
     try s.resize(.{ .cols = 100, .rows = 24 });
     try testing.expectEqual(@as(usize, 0), s.memoryStats().compressed_pages);
+}
+
+test "PageList counters follow compress, restore, prune reuse and reset" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_size = 6 * PagePool.item_size,
+    });
+    defer s.deinit();
+    try s.growColdPagesForTest(3);
+    try s.expectCountersForTest();
+    const all = s.counters.resident_size;
+    try testing.expectEqual(s.page_size, all); // everything resident
+
+    const first = s.pages.first.?;
+    try testing.expect(s.compressPage(first));
+    try testing.expectEqual(all - PagePool.item_size, s.counters.resident_size);
+    try s.expectCountersForTest();
+
+    _ = first.page(); // a restore puts it back
+    try testing.expectEqual(all, s.counters.resident_size);
+
+    try testing.expect(s.compressPage(first));
+    for (0..6_000) |_| _ = try s.grow(); // grow, prune, reuse a compressed first page
+    try s.expectCountersForTest();
+
+    s.reset();
+    try s.expectCountersForTest();
+    try testing.expectEqual(s.page_size, s.counters.resident_size);
+    try s.verifyCounters();
+}
+
+test "PageList counters survive resize, clone, erase and detached pages" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try s.growColdPagesForTest(6);
+    s.fillTextRowsForTest();
+    _ = s.compress(.full);
+
+    try s.resize(.{ .cols = 50 });
+    try s.expectCountersForTest();
+    try s.resize(.{ .cols = 90, .reflow = false });
+    try s.expectCountersForTest();
+
+    var copy = try s.clone(testing.allocator, .{ .top = .{ .screen = .{} } });
+    defer copy.deinit();
+    try copy.expectCountersForTest();
+    try s.expectCountersForTest();
+
+    // A detached page counts nothing until it is finalized.
+    const before = s.counters.resident_size;
+    var detached = try s.allocatePage(initialCapacity(s.cols));
+    defer detached.deinit();
+    try testing.expectEqual(before, s.counters.resident_size);
+
+    s.eraseHistory(null);
+    try s.expectCountersForTest();
+}
+
+test "PageList counters track a resize that restores compressed history within a bound" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try s.growColdPagesForTest(40);
+    s.fillTextRowsForTest();
+    _ = s.compress(.full);
+    const before = s.counters.resident_size;
+    s.counters.resident_peak = before;
+
+    try s.resize(.{ .cols = 100, .rows = 24 });
+
+    try testing.expect(s.counters.resident_peak <= before + 8 * PagePool.item_size);
+    try s.expectCountersForTest();
 }
 
 test "PageList memory stats include unused pool backing" {
