@@ -1542,6 +1542,7 @@ fn resizeCols(
 
     // Reflow all our rows.
     {
+        var sweep: ColdSweep = .{ .threshold = @max(self.rows, opts.rows orelse self.rows) };
         var reflow_cursor: ReflowCursor = .init(first_rewritten_node);
         while (it.next()) |row| {
             try reflow_cursor.reflowRow(
@@ -1566,6 +1567,8 @@ fn resizeCols(
 
                 self.recycle_node = row.node;
             }
+
+            sweep.advance(self, reflow_cursor.node, reflow_cursor.total_rows);
         }
 
         // At the end of the reflow, setup our total row cache
@@ -2883,6 +2886,7 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
             // resize the columns, and clear any cells that are beyond
             // the new size.
             .lt => {
+                var sweep: ColdSweep = .{ .threshold = @max(self.rows, opts.rows orelse self.rows) };
                 var it = self.pageIterator(.right_down, .{ .screen = .{} }, null);
                 while (it.next()) |chunk| {
                     const page = chunk.node.page();
@@ -2897,6 +2901,7 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                     }
 
                     page.size.cols = cols;
+                    sweep.advance(self, chunk.node.next, self.total_rows);
                 }
 
                 // Update all our tracked pins. If they have an X
@@ -2916,13 +2921,18 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                 // See the comment in the while loop when setting self.cols
                 const old_cols = self.cols;
 
+                var sweep: ColdSweep = .{ .threshold = @max(self.rows, opts.rows orelse self.rows) };
                 var it = self.pageIterator(.right_down, .{ .screen = .{} }, null);
                 while (it.next()) |chunk| {
+                    // The chunk's node may be replaced, so keep its successor.
+                    const following = chunk.node.next;
+
                     // We need to restore our old cols after we resize because
                     // we have an assertion on this and we want to be able to
                     // call this method multiple times.
                     self.cols = old_cols;
                     try self.resizeWithoutReflowGrowCols(cols, chunk);
+                    sweep.advance(self, following, self.total_rows);
                 }
 
                 self.cols = cols;
@@ -5410,6 +5420,69 @@ const CompressionIterator = struct {
 
     fn done(self: *const CompressionIterator) bool {
         return self.current == self.active;
+    }
+};
+
+/// Compresses finished pages behind a rebuild (reflow, column change) that
+/// restores or recreates pages one at a time, so history is never resident
+/// all at once.
+///
+/// Pages are judged oldest first, once each. A page is compressed when it is
+/// neither the frontier (the page being written) nor the page before it (a
+/// step may still refill that one), has at least `threshold` rows after it (so
+/// it is never in the final active area) and does not intersect the viewport.
+/// Compression is best effort.
+const ColdSweep = struct {
+    /// The oldest page not yet judged; null until the first `advance`.
+    next: ?*List.Node = null,
+
+    /// Rows in the pages before `next`.
+    rows_before: usize = 0,
+
+    /// Rows that must follow a page before it may be compressed; also the
+    /// viewport height, which is never more than this.
+    threshold: usize,
+
+    fn advance(
+        self: *ColdSweep,
+        list: *PageList,
+        frontier: ?*List.Node,
+        total_rows: usize,
+    ) void {
+        if (!terminal_mem.canReclaim(.strict)) return;
+        while (true) {
+            const node = self.next orelse list.pages.first.?;
+            if (node == frontier or node.next == frontier or node.next == null) return;
+            const after = total_rows -| (self.rows_before + node.rows());
+            if (after < self.threshold) return;
+            if (!self.viewportHolds(list, node)) _ = list.compressPage(node);
+            self.rows_before += node.rows();
+            self.next = node.next;
+        }
+    }
+
+    /// Whether `node`, the next page to judge, is part of the viewport.
+    ///
+    /// The active viewport is not reported: the row threshold already keeps
+    /// the active area resident. A pin still on a page of the list being
+    /// rebuilt walks that old chain and never matches a new page, which is
+    /// right: the new pages judged so far all precede its rows.
+    fn viewportHolds(self: *const ColdSweep, list: *const PageList, node: *const List.Node) bool {
+        switch (list.viewport) {
+            .active => return false,
+            .top => return self.rows_before < self.threshold,
+            .pin => {
+                const top = list.viewport_pin.*;
+                var covered: usize = 0;
+                var current: ?*const List.Node = top.node;
+                while (current) |n| : (current = n.next) {
+                    if (n == node) return true;
+                    covered += n.rows() - (if (n == top.node) top.y else 0);
+                    if (covered >= self.threshold) return false;
+                }
+                return false;
+            },
+        }
     }
 };
 
@@ -8945,6 +9018,15 @@ fn growColdPagesForTest(self: *PageList, count: usize) !void {
     }
 }
 
+/// A non-blank cell in every row of every page, so reflow keeps the rows.
+fn fillTextRowsForTest(self: *PageList) void {
+    var node = self.pages.first;
+    while (node) |n| : (node = n.next) {
+        const page = n.page();
+        for (0..n.rows()) |y| page.getRowAndCell(0, y).cell.* = .init('x');
+    }
+}
+
 /// Fill the current tail page to capacity without allocating a successor.
 /// Capturing the tail before the loop makes this stop at the allocation
 /// boundary needed by bounded-pruning tests.
@@ -9938,6 +10020,76 @@ test "PageList rowsWrappedPreserving reads flags from compressed pages" {
     try testing.expectEqualSlices(bool, oracle[5..15], sub);
     try testing.expectError(error.OutOfRange, s.rowsWrappedPreserving(alloc, total - 3, sub));
     try testing.expectEqual(stats, s.memoryStats());
+}
+
+test "PageList cold sweep compresses reflowed history and keeps the tail resident" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try s.growColdPagesForTest(12);
+    s.fillTextRowsForTest();
+    _ = s.compress(.full);
+    const rows_before = s.total_rows;
+
+    try s.resize(.{ .cols = 100, .rows = 24 });
+
+    try testing.expectEqual(rows_before, s.total_rows);
+    const stats = s.memoryStats();
+    // At most six pages, the tail plus the lag, stay resident.
+    try testing.expect(stats.resident_pages <= 6);
+    try testing.expect(stats.compressed_pages > 0);
+    // The active area (and the viewport, which is active) stays resident.
+    var it = s.pageIterator(.right_down, .{ .active = .{} }, null);
+    while (it.next()) |chunk| try testing.expect(!chunk.node.isCompressed());
+}
+
+test "PageList cold sweep keeps a scrolled viewport resident" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try s.growColdPagesForTest(12);
+    s.fillTextRowsForTest();
+    _ = s.compress(.full);
+    s.scroll(.{ .row = 700 }); // viewport pinned inside old history
+    try testing.expect(s.viewport == .pin);
+
+    try s.resize(.{ .cols = 100, .rows = 24 });
+
+    try testing.expect(s.memoryStats().compressed_pages > 0);
+    const vp = s.getTopLeft(.viewport);
+    var covered: usize = 0;
+    var node: ?*List.Node = vp.node;
+    while (node) |n| : (node = n.next) {
+        try testing.expect(!n.isCompressed());
+        covered += n.rows() - (if (n == vp.node) vp.y else 0);
+        if (covered >= s.rows) break;
+    }
+}
+
+test "PageList cold sweep compresses column changes without reflow" {
+    const testing = std.testing;
+    inline for (.{ 60, 100 }) |new_cols| {
+        var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+        defer s.deinit();
+        try s.growColdPagesForTest(10);
+        s.fillTextRowsForTest();
+        _ = s.compress(.full);
+        const rows_before = s.total_rows;
+
+        try s.resize(.{ .cols = new_cols, .reflow = false });
+
+        try testing.expectEqual(rows_before, s.total_rows);
+        try testing.expect(s.memoryStats().compressed_pages >= 6);
+    }
+}
+
+test "PageList cold sweep skips a list too small for any page to be cold" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.fillTextRowsForTest();
+    try s.resize(.{ .cols = 100, .rows = 24 });
+    try testing.expectEqual(@as(usize, 0), s.memoryStats().compressed_pages);
 }
 
 test "PageList memory stats include unused pool backing" {
