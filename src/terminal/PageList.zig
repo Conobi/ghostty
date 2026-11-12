@@ -4352,6 +4352,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         // does when it recycles a page. Only the old layout's bytes can
         // be dirty, since every path that gives up a pool item zeroes
         // the bytes it used.
+        const was_compressed = first.isCompressed();
         const old_memory = first.restore(.discard).memory;
         first.incompressible = false;
         self.counters.forget(first);
@@ -4359,7 +4360,10 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         assert(layout.total_size <= std_size);
         const item: *align(std.heap.page_size_min) [std_size]u8 =
             @ptrCast(@alignCast(old_memory.ptr));
-        @memset(old_memory, 0);
+        // A page that was compressed was strictly decommitted, which on these
+        // platforms already zeroed it; skipping the memset saves a write of a
+        // whole page (and its page faults) per pruned page.
+        if (!(was_compressed and terminal_mem.decommitZeroes())) @memset(old_memory, 0);
         if (comptime build_options.slow_runtime_safety) {
             // Check that the rest of the item is zero. verifyIntegrity
             // can't catch stale bytes because they look like page data.
@@ -10564,6 +10568,34 @@ test "PageList encode on grow leaves a page the viewport shows resident" {
     _ = viewport_node.page();
     for (0..3_000) |_| _ = try s.grow();
     try testing.expect(!viewport_node.isCompressed());
+    try s.expectCountersForTest();
+}
+
+test "PageList prune reuse of a compressed page gives a zeroed page" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_size = 2 * PagePool.item_size,
+    });
+    defer s.deinit();
+    while (s.pages.first == s.pages.last) _ = try s.grow();
+    const first = s.pages.first.?;
+    @memset(first.page().memory[0..64], 0xAB); // dirty data, then compressed away
+    try testing.expect(s.compressPage(first));
+
+    var reused: ?*List.Node = null;
+    for (0..s.pages.last.?.capacity().rows + 1) |_| {
+        if (try s.grow()) |n| if (n == first) {
+            reused = n;
+            break;
+        };
+    }
+    const node = reused orelse return error.SkipZigTest;
+    // Only the new first row may differ from a fresh page: the dirtied bytes
+    // are gone.
+    try testing.expect(!std.mem.containsAtLeast(u8, node.page().memory[0..64], 1, &.{0xAB}));
+    try testing.expect(std.mem.allEqual(u8, node.page().memory[node.page().memory.len - 64 ..], 0));
     try s.expectCountersForTest();
 }
 

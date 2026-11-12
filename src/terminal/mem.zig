@@ -116,6 +116,16 @@ pub inline fn canReclaim(comptime mode: DecommitMode) bool {
     };
 }
 
+/// Whether a successful strict `decommit` leaves the range reading as zeros.
+///
+/// True where the OS guarantees it (Linux `MADV_DONTNEED`, FreeBSD's fresh
+/// mapping) and in test builds, which imitate it. Darwin `FREE_REUSABLE` and
+/// Windows `DiscardVirtualMemory` may keep the old bytes.
+pub inline fn decommitZeroes() bool {
+    return builtin.is_test or builtin.target.os.tag == .linux or
+        builtin.target.os.tag == .freebsd;
+}
+
 /// Release the physical memory behind `memory` while keeping its address
 /// range.
 ///
@@ -433,4 +443,10 @@ test "test builds can reclaim retained mappings" {
     const testing = std.testing;
     try testing.expect(canReclaim(.zero));
     try testing.expect(canReclaim(.strict));
+}
+
+test "decommitZeroes matches the platforms whose strict decommit zeroes" {
+    const want = builtin.is_test or
+        builtin.target.os.tag == .linux or builtin.target.os.tag == .freebsd;
+    try std.testing.expectEqual(want, decommitZeroes());
 }
