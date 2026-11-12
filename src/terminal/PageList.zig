@@ -5767,6 +5767,41 @@ fn cloneRowGrowCapacity(
     }
 }
 
+pub const RowsWrappedError = Allocator.Error || error{OutOfRange};
+
+/// Soft-wrap flags of SCREEN rows `y..y + out.len` without restoring pages.
+///
+/// One decode per compressed page touched, into a scratch freed on return
+/// (a flag is a row bit stored in page memory, so even this read decodes).
+pub fn rowsWrappedPreserving(
+    self: *const PageList,
+    alloc: Allocator,
+    y: usize,
+    out: []bool,
+) RowsWrappedError!void {
+    if (out.len == 0) return;
+    const end = std.math.add(usize, y, out.len) catch return error.OutOfRange;
+    if (end > self.total_rows) return error.OutOfRange;
+    const first_y = std.math.cast(u32, y) orelse return error.OutOfRange;
+    const last_y = std.math.cast(u32, end - 1) orelse return error.OutOfRange;
+    const top = self.pin(.{ .screen = .{ .y = first_y } }) orelse return error.OutOfRange;
+    const bot = self.pin(.{ .screen = .{ .y = last_y } }) orelse return error.OutOfRange;
+
+    var scratch: ReadScratch = .{};
+    defer scratch.deinit(alloc);
+    var written: usize = 0;
+    var it = top.pageIterator(.right_down, bot);
+    while (it.next()) |chunk| {
+        const page = try chunk.node.readPreserving(&scratch, alloc);
+        const rows = page.rows.ptr(page.memory);
+        for (chunk.start..chunk.end) |row_y| {
+            out[written] = rows[row_y].wrap;
+            written += 1;
+        }
+    }
+    assert(written == out.len);
+}
+
 /// Fast-path function to erase exactly 1 row. Erasing means that the row
 /// is completely REMOVED, not just cleared. All rows following the removed
 /// row will be shifted up by 1 to fill the empty space.
@@ -9851,6 +9886,57 @@ test "PageList readPreserving decodes into the scratch and keeps the node compre
         node.readPreserving(&empty, failing.allocator()),
     );
     try testing.expect(node.isCompressed());
+    try testing.expectEqual(stats, s.memoryStats());
+}
+
+test "PageList rowsWrappedPreserving reads flags from compressed pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try s.growColdPagesForTest(3);
+
+    // Text in every row; a soft wrap on every third row of the first two pages.
+    var node = s.pages.first;
+    var wrapped_rows: usize = 0;
+    while (node) |n| : (node = n.next) {
+        const page = n.page();
+        for (0..n.rows()) |y| {
+            const rac = page.getRowAndCell(0, y);
+            rac.cell.* = .init('x');
+            if (y % 3 == 0 and n != s.pages.last.?) {
+                rac.row.wrap = true;
+                wrapped_rows += 1;
+            }
+        }
+    }
+    try testing.expect(wrapped_rows > 0);
+    const total = s.total_rows;
+
+    // Oracle: the restoring read, before anything is compressed.
+    const oracle = try alloc.alloc(bool, total);
+    defer alloc.free(oracle);
+    for (oracle, 0..) |*flag, y| {
+        flag.* = s.pin(.{ .screen = .{ .y = @intCast(y) } }).?.rowAndCell().row.wrap;
+    }
+
+    _ = s.compress(.full);
+    const stats = s.memoryStats();
+    try testing.expect(stats.compressed_pages >= 2);
+
+    const got = try alloc.alloc(bool, total);
+    defer alloc.free(got);
+    try s.rowsWrappedPreserving(alloc, 0, got);
+    try testing.expectEqualSlices(bool, oracle, got);
+    try testing.expectEqual(stats, s.memoryStats());
+
+    // A sub-range starting mid-page, and range errors.
+    const sub = try alloc.alloc(bool, 10);
+    defer alloc.free(sub);
+    try s.rowsWrappedPreserving(alloc, 5, sub);
+    try testing.expectEqualSlices(bool, oracle[5..15], sub);
+    try testing.expectError(error.OutOfRange, s.rowsWrappedPreserving(alloc, total - 3, sub));
     try testing.expectEqual(stats, s.memoryStats());
 }
 

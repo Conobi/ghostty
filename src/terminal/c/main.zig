@@ -202,6 +202,7 @@ pub const terminal_vt_write_until = terminal.vt_write_until;
 pub const terminal_scroll_viewport = terminal.scroll_viewport;
 pub const terminal_compression_activity = terminal.compression_activity;
 pub const terminal_compress = terminal.compress;
+pub const terminal_screen_rows_wrapped_preserving = terminal.screen_rows_wrapped_preserving;
 pub const terminal_get = terminal.get;
 pub const terminal_get_multi = terminal.get_multi;
 pub const terminal_continuation_write = terminal.continuation_write;

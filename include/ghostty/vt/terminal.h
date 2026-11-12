@@ -3508,6 +3508,38 @@ GHOSTTY_API GhosttyResult ghostty_terminal_compress(
     GhosttyTerminalCompressionMode mode,
     GhosttyTerminalCompressionResult* out_result);
 
+/**
+ * Read the soft-wrap flags of a range of rows without restoring history.
+ *
+ * Rows are SCREEN rows of the active screen, counted from the top of the
+ * scrollback, so `y` is an offset into the whole history plus the active
+ * area. One byte is written per row: 1 when the row continues on the next
+ * row (soft-wrapped), 0 otherwise.
+ *
+ * Compressed pages stay compressed: each page the range touches is decoded
+ * once into temporary memory, which is freed before the call returns. A
+ * per-row lookup of the same flags would decode a page for every row.
+ *
+ * You must not modify the terminal during the call, and must serialize it
+ * with other access to the same terminal.
+ *
+ * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param y First SCREEN row to read
+ * @param count Number of rows to read; zero succeeds and writes nothing
+ * @param[out] out_wrapped Receives `count` bytes (NULL returns
+ *             GHOSTTY_INVALID_VALUE)
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if an argument is
+ *         NULL or the range lies outside the screen, or GHOSTTY_OUT_OF_MEMORY
+ *         if the temporary memory could not be allocated
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_screen_rows_wrapped_preserving(
+    GhosttyTerminal terminal,
+    uint32_t y,
+    size_t count,
+    uint8_t* out_wrapped);
+
 /** @} */
 
 /** @name Data

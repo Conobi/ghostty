@@ -321,6 +321,7 @@ comptime {
         @export(&c.terminal_scroll_viewport, .{ .name = "ghostty_terminal_scroll_viewport" });
         @export(&c.terminal_compression_activity, .{ .name = "ghostty_terminal_compression_activity" });
         @export(&c.terminal_compress, .{ .name = "ghostty_terminal_compress" });
+        @export(&c.terminal_screen_rows_wrapped_preserving, .{ .name = "ghostty_terminal_screen_rows_wrapped_preserving" });
         @export(&c.terminal_get, .{ .name = "ghostty_terminal_get" });
         @export(&c.terminal_get_multi, .{ .name = "ghostty_terminal_get_multi" });
         @export(&c.terminal_continuation_write, .{ .name = "ghostty_terminal_continuation_write" });

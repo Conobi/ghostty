@@ -1452,6 +1452,26 @@ pub fn compress(
     return .success;
 }
 
+pub fn screen_rows_wrapped_preserving(
+    terminal_: Terminal,
+    y: u32,
+    count: usize,
+    out_wrapped_: ?[*]u8,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const out_wrapped = out_wrapped_ orelse return .invalid_value;
+    if (count == 0) return .success;
+    const alloc = t.gpa();
+    const flags = alloc.alloc(bool, count) catch return .out_of_memory;
+    defer alloc.free(flags);
+    t.screens.active.pages.rowsWrappedPreserving(alloc, y, flags) catch |err| return switch (err) {
+        error.OutOfRange => .invalid_value,
+        error.OutOfMemory => .out_of_memory,
+    };
+    for (flags, 0..) |flag, i| out_wrapped[i] = @intFromBool(flag);
+    return .success;
+}
+
 /// C: GhosttyTerminalOption
 pub const Option = enum(c_int) {
     invalid = 0,
@@ -3222,6 +3242,57 @@ test "scroll_viewport invalid arguments" {
     raw.* = std.math.maxInt(c_int) - 1;
     try testing.expectEqual(Result.invalid_value, scroll_viewport(t, behavior));
     try testing.expectEqual(Result.invalid_value, scroll_viewport(null, behavior));
+}
+
+test "screen_rows_wrapped_preserving" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+    const zt: *ZigTerminal = t.?.terminal;
+    zt.setScrollbackMaxBytes(null);
+
+    const line = "numbered history line\r\n";
+    for (0..3_000) |_| vt_write(t, line.ptr, line.len);
+
+    var result: CompressionResult = undefined;
+    try testing.expectEqual(
+        Result.success,
+        compress(t, @backingInt(CompressionMode.full), &result),
+    );
+    var before: TerminalMemoryUsage = .{};
+    try testing.expectEqual(Result.success, get(t, .memory_usage, @ptrCast(&before)));
+    if (before.compression_supported) try testing.expect(before.primary_compressed_pages > 0);
+
+    var flags: [100]u8 = @splat(0xFF);
+    try testing.expectEqual(Result.success, screen_rows_wrapped_preserving(t, 0, flags.len, &flags));
+    for (flags) |f| try testing.expectEqual(@as(u8, 0), f);
+
+    try testing.expectEqual(Result.success, screen_rows_wrapped_preserving(t, 0, 0, &flags));
+    try testing.expectEqual(
+        Result.invalid_value,
+        screen_rows_wrapped_preserving(t, 1_000_000, flags.len, &flags),
+    );
+    try testing.expectEqual(
+        Result.invalid_value,
+        screen_rows_wrapped_preserving(t, std.math.maxInt(u32), flags.len, &flags),
+    );
+    try testing.expectEqual(
+        Result.invalid_value,
+        screen_rows_wrapped_preserving(null, 0, flags.len, &flags),
+    );
+    try testing.expectEqual(
+        Result.invalid_value,
+        screen_rows_wrapped_preserving(t, 0, flags.len, null),
+    );
+
+    var after: TerminalMemoryUsage = .{};
+    try testing.expectEqual(Result.success, get(t, .memory_usage, @ptrCast(&after)));
+    try testing.expectEqual(before.primary_compressed_pages, after.primary_compressed_pages);
 }
 
 test "compression invalid arguments" {
