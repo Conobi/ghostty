@@ -4310,6 +4310,14 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
     // reuses the popped page. It is possible to have a single page and
     // exceed the max size if that page was adjusted to be larger after
     // initial allocation.
+    //
+    // Under the stored cap, shrinking a resident history page can make room
+    // that pruning one would otherwise take, so one is encoded first.
+    if (self.limits.bytes_mode == .stored and
+        self.limitedBytes() + new_size > self.limits.max(.bytes))
+    {
+        _ = self.compressOldestResident();
+    }
     if (self.pages.first != null and
         self.pages.first != self.pages.last and
         self.limitedBytes() + new_size > self.limits.max(.bytes))
@@ -10742,6 +10750,38 @@ test "PageList logical mode and no budget still behave as before" {
     try testing.expect(packed_list.page_size <= cap + PagePool.item_size);
     try testing.expectEqual(plain.total_rows, packed_list.total_rows);
     try testing.expectEqual(plain.page_size, packed_list.page_size);
+}
+
+test "PageList compress before prune keeps history that fits once compressed" {
+    const testing = std.testing;
+    const cap = 12 * PagePool.item_size;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+
+    // A compressed history that is far below the cap: its pages cost a few
+    // KiB each, but a resident page costs a whole pool item.
+    try s.growColdPagesForTest(60);
+    _ = s.compress(.full);
+    const history_pages = s.memoryStats().compressed_pages;
+    try testing.expect(history_pages >= 60);
+    s.limits.set(.bytes, cap);
+    s.limits.bytes_mode = .stored;
+    s.limits.enforce(&s, .bytes);
+    try testing.expectEqual(history_pages, s.memoryStats().compressed_pages);
+
+    // No resident budget: only the cap's own encode makes room for each new
+    // page. Without it, every new page at the cap would prune the whole
+    // compressed history to pay for one resident page.
+    for (0..40_000) |_| _ = try s.grow();
+    try testing.expect(s.counters.stored_size <= cap + PagePool.item_size);
+    try testing.expect(s.memoryStats().compressed_pages >= history_pages);
+    try s.expectCountersForTest();
+
+    // Logical mode does not encode before pruning.
+    var plain = try init(testing.allocator, .{ .cols = 80, .rows = 24, .max_size = cap });
+    defer plain.deinit();
+    for (0..40_000) |_| _ = try plain.grow();
+    try testing.expectEqual(@as(usize, 0), plain.counters.encodes);
 }
 
 test "PageList memory stats include unused pool backing" {
