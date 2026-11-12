@@ -65,10 +65,16 @@ pub const Counters = struct {
     /// Highest `resident_size` since it was last set; a diagnostic for tests.
     resident_peak: usize = 0,
 
-    /// Oldest page that may still be worth compressing; see
-    /// `PageList.compressOldestResident`. Cleared by whatever destroys, reuses
-    /// or restores a node, so it is never dangling.
+    /// Every page before this one is compressed, marked incompressible, or
+    /// the `deferred` page; see `PageList.compressOldestResident`. Null means
+    /// "scan from the first page". Cleared by whatever destroys, reuses or
+    /// restores a node, so it is never dangling.
     cursor: ?*List.Node = null,
+
+    /// The first resident page the scan skipped because the viewport shows
+    /// it, so it is found again once the viewport moves away. Cleared with
+    /// `cursor`.
+    deferred: ?*List.Node = null,
 
     /// Number of encode attempts, for tests and measurement.
     encodes: usize = 0,
@@ -83,10 +89,21 @@ pub const Counters = struct {
         self.addResident(node.backingBytes());
     }
 
+    /// Forget the scan position, so the next scan starts at the first page.
+    fn resetScan(self: *Counters) void {
+        self.cursor = null;
+        self.deferred = null;
+    }
+
+    /// Forget the scan position if it refers to `node`.
+    fn forget(self: *Counters, node: *const List.Node) void {
+        if (self.cursor == node or self.deferred == node) self.resetScan();
+    }
+
     /// A resident node leaves the accounted list.
     fn detach(self: *Counters, node: *const List.Node) void {
         self.resident_size -= node.backingBytes();
-        if (self.cursor == node) self.cursor = null;
+        self.forget(node);
     }
 
     /// A node has just become compressed.
@@ -100,7 +117,7 @@ pub const Counters = struct {
     /// compressed again, but this one may be, so restart the scan.
     fn restored(self: *Counters, node: *const List.Node) void {
         self.addResident(node.backingBytes());
-        self.cursor = null;
+        self.resetScan();
     }
 };
 
@@ -1452,6 +1469,9 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     // TODO(mitchellh): Deferred reflow on non-viewport/non-active pages.
     self.page_compression.reset();
     self.page_compression.markActivity();
+
+    // A resize can replace every page.
+    self.counters.resetScan();
 
     if (comptime std.debug.runtime_safety) {
         // Resize does not work with 0 values, this should be protected
@@ -3849,7 +3869,7 @@ pub fn invalidateNodeLayout(self: *PageList, node: *List.Node) void {
     node.serial = self.page_serial;
     self.page_serial += 1;
     node.incompressible = false;
-    if (node.counters) |c| c.cursor = null;
+    if (node.counters) |c| c.resetScan();
 }
 
 /// Compact a page to use the minimum required memory for the contents
@@ -3924,6 +3944,7 @@ pub fn compact(self: *PageList, node: *List.Node) Allocator.Error!?*List.Node {
     self.pages.remove(node);
     self.destroyNode(node);
     self.page_compression.markActivity();
+    self.counters.resetScan();
 
     new_page.assertIntegrity();
     return new_node;
@@ -4333,7 +4354,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         // the bytes it used.
         const old_memory = first.restore(.discard).memory;
         first.incompressible = false;
-        if (self.counters.cursor == first) self.counters.cursor = null;
+        self.counters.forget(first);
         assert(old_memory.len <= std_size);
         assert(layout.total_size <= std_size);
         const item: *align(std.heap.page_size_min) [std_size]u8 =
@@ -4365,6 +4386,8 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
 
         page.assertIntegrity();
 
+        self.compressOverBudget();
+
         // An earlier grow may have left us over the byte limit, because
         // pruning would have cut into the active area (see the trimming
         // costs in growCapacity). Reuse swaps one pool item for another,
@@ -4390,6 +4413,8 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
     // Record the increased row count
     self.total_rows += 1;
 
+    self.compressOverBudget();
+
     // The prune above removes at most one old page for this new one,
     // and the two may differ in size. A pooled page is always one pool
     // item, while a heap page is as large as its capacity. If a larger
@@ -4401,6 +4426,16 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
     // active-boundary page wholly historical.
     self.limits.enforce(self, .lines);
     return next_node;
+}
+
+/// When resident history exceeds `Limits.resident_budget`, compress the
+/// oldest resident page, at most one encode. A no-op without a budget.
+///
+/// Never touches `page_compression`: the incremental pass validates its
+/// marker by node serial, so the two interleave safely.
+fn compressOverBudget(self: *PageList) void {
+    const budget = self.limits.resident_budget orelse return;
+    if (self.counters.resident_size > budget) _ = self.compressOldestResident();
 }
 
 /// Choose the capacity for a page that `grow` is about to append after
@@ -5074,6 +5109,7 @@ pub fn increaseCapacity(
     self.pages.remove(node);
     self.destroyNode(node);
     self.page_compression.markActivity();
+    self.counters.resetScan();
 
     new_page.assertIntegrity();
     return new_node;
@@ -5213,6 +5249,7 @@ pub const PageAllocation = struct {
         destination.pages.prepend(node);
         node.counters = destination.counters;
         destination.counters.attach(node);
+        destination.counters.resetScan();
         destination.page_size = page_size;
         destination.total_rows = total_rows;
         if (destination.viewport == .pin) {
@@ -5287,7 +5324,7 @@ inline fn createPage(
         // pool item in page_size, so destroying the node and
         // creating a new pooled one is a net zero.
 
-        if (self.counters.cursor == node) self.counters.cursor = null;
+        self.counters.forget(node);
         node.* = .{
             .data = .{ .resident = .initBuf(.init(item), layout) },
             .serial = self.page_serial,
@@ -5757,6 +5794,75 @@ fn compressIncremental(self: *PageList) IncrementalCompressionResult {
     return .complete;
 }
 
+/// The pages the viewport shows; they are contiguous in the list.
+const ViewportNodes = struct {
+    first: *List.Node,
+    last: *List.Node,
+
+    fn init(list: *const PageList) ViewportNodes {
+        return .{
+            .first = list.getTopLeft(.viewport).node,
+            .last = list.getBottomRight(.viewport).?.node,
+        };
+    }
+
+    fn holds(self: ViewportNodes, node: *const List.Node) bool {
+        var current = self.first;
+        while (true) {
+            if (current == node) return true;
+            if (current == self.last) return false;
+            current = current.next orelse return false;
+        }
+    }
+};
+
+/// Compresses the oldest resident, eligible, unmarked history page, at most
+/// one encode. Returns whether a page was compressed.
+///
+/// Scans forward from `counters.cursor` (the first page when it was cleared),
+/// moving the cursor past compressed and marked pages. A page held back by the
+/// viewport is skipped and remembered as `counters.deferred`, which is tried
+/// first on the next call, so it is found again once the viewport moves away
+/// without every call walking the whole history.
+fn compressOldestResident(self: *PageList) bool {
+    if (!terminal_mem.canReclaim(.strict)) return false;
+    const counters = self.counters;
+    const active = self.getTopLeft(.active).node;
+    const viewport: ViewportNodes = .init(self);
+
+    // A deferred page whose viewport left it restarts the scan there, which
+    // finds it and the pages that were skipped with it.
+    if (counters.deferred) |node| {
+        if (!viewport.holds(node)) {
+            counters.cursor = node;
+            counters.deferred = null;
+        }
+    }
+
+    var current: ?*List.Node = counters.cursor orelse self.pages.first.?;
+    while (current) |node| : (current = node.next) {
+        if (node == active) {
+            // Everything before the active area has been looked at.
+            counters.cursor = active;
+            return false;
+        }
+
+        const candidate = node.storage() == .resident and !node.incompressible;
+        if (!candidate) continue;
+        if (viewport.holds(node)) {
+            if (counters.deferred == null) counters.deferred = node;
+            continue;
+        }
+
+        counters.cursor = node;
+        return self.compressPage(node);
+    }
+
+    // The cursor was past the active area (history shrank under it).
+    counters.resetScan();
+    return false;
+}
+
 /// Compress every fully historical resident page which is currently cold.
 fn compressFull(self: *PageList) void {
     var it: CompressionIterator = .init(self);
@@ -5776,9 +5882,26 @@ fn compressFull(self: *PageList) void {
 /// usable. Candidate selection and retry policy belong to `compress`; this
 /// primitive only performs one state transition.
 fn compressPage(self: *PageList, node: *List.Node) bool {
+    return self.compressPageOutcome(node) == .compressed;
+}
+
+/// What `compressPageOutcome` did to a page.
+const CompressOutcome = enum {
+    compressed,
+
+    /// Compressing cannot save memory for this page; it is marked so nothing
+    /// tries again until the page changes.
+    unprofitable,
+
+    /// A transient failure (allocation, decommit); retrying may succeed.
+    failed,
+};
+
+/// `compressPage` with the reason it did not compress.
+fn compressPageOutcome(self: *PageList, node: *List.Node) CompressOutcome {
     // Recompression requires first restoring the raw page and is a policy
     // decision, so this primitive only accepts resident nodes.
-    if (node.isCompressed()) return false;
+    if (node.isCompressed()) return .failed;
 
     const page = node.page();
 
@@ -5789,9 +5912,15 @@ fn compressPage(self: *PageList, node: *List.Node) bool {
         switch (err) {
             error.InputTooLarge,
             error.OutputTooSmall,
-            => return false,
+            => {
+                node.incompressible = true;
+                return .unprofitable;
+            },
         };
-    if (required == 0) return false;
+    if (required == 0) {
+        node.incompressible = true;
+        return .unprofitable;
+    }
 
     // Build the compressed candidate without changing the node. This scope is
     // intentional: its defer releases the borrowed or temporary scratch before
@@ -5803,7 +5932,7 @@ fn compressPage(self: *PageList, node: *List.Node) bool {
             required,
             page.memory.len,
         ) catch |err| switch (err) {
-            error.OutOfMemory => return false,
+            error.OutOfMemory => return .failed,
         };
 
         // The encoder writes at most `required` bytes and reports exactly
@@ -5812,6 +5941,7 @@ fn compressPage(self: *PageList, node: *List.Node) bool {
         var dirty_len: usize = required;
         defer scratch.deinit(&self.pool, dirty_len);
 
+        self.counters.encodes += 1;
         var table: compression.lz4.HashTable = undefined;
         const result = compression.Page.init(
             self.pool.alloc,
@@ -5819,10 +5949,13 @@ fn compressPage(self: *PageList, node: *List.Node) bool {
             scratch.bytes()[0..required],
             &table,
         ) catch |err| switch (err) {
-            error.OutOfMemory,
+            error.OutOfMemory => return .failed,
             error.InputTooLarge,
             error.OutputTooSmall,
-            => return false,
+            => {
+                node.incompressible = true;
+                return .unprofitable;
+            },
         };
         if (result) |compressed| dirty_len = compressed.encoded.len;
         break :candidate result;
@@ -5830,7 +5963,10 @@ fn compressPage(self: *PageList, node: *List.Node) bool {
 
     // Null means compression crossed the break-even point. The node and its
     // resident mapping are still untouched in this case.
-    var compressed = candidate orelse return false;
+    var compressed = candidate orelse {
+        node.incompressible = true;
+        return .unprofitable;
+    };
 
     // Strict decommit is the final fallible step. It either discards the whole
     // raw mapping or leaves it untouched, so failure can safely free the
@@ -5847,14 +5983,14 @@ fn compressPage(self: *PageList, node: *List.Node) bool {
         compressed.page.memory.len,
     )) {
         compressed.deinit();
-        return false;
+        return .failed;
     }
 
     // Publish the new state only after both the encoded allocation and the
     // retained-mapping decommit have succeeded.
     node.data = .{ .compressed = compressed };
     if (node.counters) |c| c.compressed(node);
-    return true;
+    return .compressed;
 }
 
 /// Destroy the memory of the given node in the PageList linked list
@@ -7839,8 +7975,12 @@ const Limits = struct {
     bytes: Limit,
     lines: Limit,
 
+    /// Resident backing bytes above which `grow` compresses one old history
+    /// page per new page. Null (upstream's default) disables it.
+    resident_budget: ?usize = null,
+
     /// The limit keys.
-    pub const Key = std.meta.FieldEnum(Limits);
+    pub const Key = enum { bytes, lines };
 
     pub const Limit = struct {
         /// Explicit is the specified maximum value for this limit
@@ -10315,6 +10455,115 @@ test "PageList counters track a resize that restores compressed history within a
     try s.resize(.{ .cols = 100, .rows = 24 });
 
     try testing.expect(s.counters.resident_peak <= before + 8 * PagePool.item_size);
+    try s.expectCountersForTest();
+}
+
+test "PageList encode on grow keeps resident bytes at the budget during a long feed" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    const budget = 6 * PagePool.item_size;
+    s.limits.resident_budget = budget;
+
+    var worst: usize = 0;
+    for (0..60_000) |_| {
+        _ = try s.grow();
+        worst = @max(worst, s.counters.resident_size);
+    }
+    // Budget, plus the page being added and the active/viewport pages.
+    try testing.expect(worst <= budget + 4 * PagePool.item_size);
+    try testing.expect(s.memoryStats().compressed_pages > 20);
+    try s.expectCountersForTest();
+}
+
+test "PageList encode on grow compresses at most one page per grow" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.limits.resident_budget = 2 * PagePool.item_size;
+    for (0..20_000) |_| {
+        const before = s.counters.encodes;
+        _ = try s.grow();
+        try testing.expect(s.counters.encodes - before <= 1);
+    }
+}
+
+test "PageList encode on grow is off without a budget" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    for (0..20_000) |_| _ = try s.grow();
+    try testing.expectEqual(@as(usize, 0), s.counters.encodes);
+    try testing.expectEqual(@as(usize, 0), s.memoryStats().compressed_pages);
+}
+
+test "PageList encode on grow does not re-encode an incompressible page" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try s.growColdPagesForTest(3);
+    const first = s.pages.first.?;
+    var prng = std.Random.DefaultPrng.init(0x494E_434F_4D50_5245);
+    prng.random().bytes(first.page().memory);
+
+    s.limits.resident_budget = PagePool.item_size;
+    for (0..6_000) |_| _ = try s.grow();
+
+    try testing.expect(first.incompressible);
+    try testing.expect(!first.isCompressed());
+    // Every other cold page was compressed; the marked one was tried once.
+    const stats = s.memoryStats();
+    try testing.expect(stats.compressed_pages >= 3);
+    const encodes = s.counters.encodes;
+    const compressed_before = stats.compressed_pages;
+    for (0..6_000) |_| _ = try s.grow();
+    // New pages are encoded once each; the marked page adds none.
+    try testing.expect(s.counters.encodes - encodes <= s.memoryStats().compressed_pages - compressed_before + 1);
+    try testing.expect(first.incompressible);
+
+    // A restore clears nothing here (it is resident) but a layout change does.
+    s.invalidateNodeLayout(first);
+    try testing.expect(!first.incompressible);
+}
+
+test "PageList encode on grow interleaves with the incremental pass" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.limits.resident_budget = 3 * PagePool.item_size;
+    for (0..30_000) |i| {
+        _ = try s.grow();
+        if (i % 500 == 0) _ = s.compress(.incremental);
+    }
+    _ = s.compress(.drain);
+    try s.expectCountersForTest();
+}
+
+test "PageList encode on grow finds a page scrolled away from again" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.limits.resident_budget = 3 * PagePool.item_size;
+    for (0..30_000) |_| _ = try s.grow();
+    s.scroll(.{ .row = 4_000 });
+    const viewport_node = s.getTopLeft(.viewport).node;
+    _ = viewport_node.page(); // the draw restores it
+    s.scroll(.active);
+    for (0..3_000) |_| _ = try s.grow();
+    try testing.expect(viewport_node.isCompressed());
+}
+
+test "PageList encode on grow leaves a page the viewport shows resident" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.limits.resident_budget = 3 * PagePool.item_size;
+    for (0..30_000) |_| _ = try s.grow();
+    s.scroll(.{ .row = 4_000 });
+    const viewport_node = s.getTopLeft(.viewport).node;
+    _ = viewport_node.page();
+    for (0..3_000) |_| _ = try s.grow();
+    try testing.expect(!viewport_node.isCompressed());
     try s.expectCountersForTest();
 }
 
