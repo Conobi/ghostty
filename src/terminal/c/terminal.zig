@@ -1472,6 +1472,16 @@ pub fn screen_rows_wrapped_preserving(
     return .success;
 }
 
+/// What the primary screen's scrollback byte limit counts.
+///
+/// The declaration order is part of the libghostty-vt C ABI.
+///
+/// C: GhosttyTerminalScrollbackBytesMode
+pub const ScrollbackBytesMode = lib.Enum(lib.target, &.{
+    "logical",
+    "stored",
+});
+
 /// C: GhosttyTerminalOption
 pub const Option = enum(c_int) {
     invalid = 0,
@@ -1523,6 +1533,8 @@ pub const Option = enum(c_int) {
     xt_checksum_extension = 46,
     program_status = 47,
     resize_window = 48,
+    scrollback_bytes_mode = 49,
+    scrollback_resident_budget = 50,
 
     _,
 
@@ -1566,10 +1578,12 @@ pub const Option = enum(c_int) {
             .apc_max_bytes_kitty,
             .scrollback_max_bytes,
             .scrollback_max_lines,
+            .scrollback_resident_budget,
             .continuation_max_bytes,
             .unknown_max_bytes,
             .clipboard_write_max_bytes,
             => ?*const usize,
+            .scrollback_bytes_mode => ?*const ScrollbackBytesMode,
             .selection => ?*const selection_c.CSelection,
             .default_cursor_style => ?*const CursorStyle,
             .default_cursor_blink => ?*const bool,
@@ -1795,6 +1809,19 @@ fn setTyped(
         .scrollback_max_lines => wrapper.terminal.setScrollbackMaxLines(
             if (value) |ptr| ptr.* else default_options.max_scrollback_lines,
         ),
+        .scrollback_bytes_mode => {
+            const mode: ScrollbackBytesMode = if (value) |ptr|
+                lib.enumFromPtr(ScrollbackBytesMode, ptr) orelse return .invalid_value
+            else
+                .logical;
+            wrapper.terminal.setScrollbackBytesMode(switch (mode) {
+                .logical => .logical,
+                .stored => .stored,
+            });
+        },
+        .scrollback_resident_budget => wrapper.terminal.setScrollbackResidentBudget(
+            if (value) |ptr| ptr.* else null,
+        ),
         .continuation_max_bytes => setContinuationMaxBytes(
             wrapper,
             if (value) |ptr| ptr.* else default_continuation_max_bytes,
@@ -1999,6 +2026,7 @@ pub const TerminalData = enum(c_int) {
     clipboard_write_max_bytes = 40,
     mouse_shape = 41,
     memory_usage = 42,
+    scrollback_stored_bytes = 43,
 
     _,
 
@@ -2025,6 +2053,7 @@ pub const TerminalData = enum(c_int) {
             .scrollback_rows,
             .scrollback_max_bytes,
             .scrollback_max_lines,
+            .scrollback_stored_bytes,
             .continuation_max_bytes,
             .clipboard_write_max_bytes,
             => usize,
@@ -2174,6 +2203,7 @@ fn getTyped(
             if (max == std.math.maxInt(usize)) return .no_value;
             out.* = max;
         },
+        .scrollback_stored_bytes => out.* = t.screens.get(.primary).?.pages.counters.stored_size,
         .continuation_max_bytes => out.* = continuationMaxBytes(wrapper),
         .clipboard_write_max_bytes => out.* = wrapper.stream.handler.kitty_clipboard_write_max_bytes,
         .mode => {
@@ -3293,6 +3323,54 @@ test "screen_rows_wrapped_preserving" {
     var after: TerminalMemoryUsage = .{};
     try testing.expectEqual(Result.success, get(t, .memory_usage, @ptrCast(&after)));
     try testing.expectEqual(before.primary_compressed_pages, after.primary_compressed_pages);
+}
+
+test "scrollback bytes mode and resident budget options" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer free(t);
+
+    const mib = 1024 * 1024;
+    var cap: usize = 8 * mib;
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_bytes, &cap));
+    var mode: ScrollbackBytesMode = .stored;
+    var budget: usize = 2 * mib;
+    try testing.expectEqual(Result.success, set(t, .scrollback_bytes_mode, &mode));
+    try testing.expectEqual(Result.success, set(t, .scrollback_resident_budget, &budget));
+
+    const line = "stored and compressible terminal history line\r\n";
+    for (0..60_000) |_| vt_write(t, line.ptr, line.len);
+
+    var stored: usize = 0;
+    try testing.expectEqual(Result.success, get(t, .scrollback_stored_bytes, @ptrCast(&stored)));
+    try testing.expect(stored > 0 and stored <= cap + mib);
+    var usage: TerminalMemoryUsage = .{};
+    try testing.expectEqual(Result.success, get(t, .memory_usage, @ptrCast(&usage)));
+    if (usage.compression_supported) try testing.expect(usage.primary_compressed_pages > 0);
+
+    // NULL restores the defaults; a bad enum value is refused.
+    try testing.expectEqual(Result.success, set(t, .scrollback_bytes_mode, null));
+    try testing.expectEqual(Result.success, set(t, .scrollback_resident_budget, null));
+    var bad: c_int = 99;
+    try testing.expectEqual(Result.invalid_value, set(t, .scrollback_bytes_mode, &bad));
+}
+
+test "stored mode applies to the primary screen only" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer free(t);
+    var mode: ScrollbackBytesMode = .stored;
+    try testing.expectEqual(Result.success, set(t, .scrollback_bytes_mode, &mode));
+    vt_write(t, "\x1b[?1049h", 8); // create the alternate screen
+    const zt: *ZigTerminal = t.?.terminal;
+    try testing.expectEqual(
+        PageList.BytesMode.logical,
+        zt.screens.get(.alternate).?.pages.limits.bytes_mode,
+    );
+    try testing.expectEqual(
+        PageList.BytesMode.stored,
+        zt.screens.get(.primary).?.pages.limits.bytes_mode,
+    );
 }
 
 test "compression invalid arguments" {

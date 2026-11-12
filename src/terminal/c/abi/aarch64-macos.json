@@ -4318,6 +4318,7 @@
         "CLIPBOARD_WRITE_MAX_BYTES": 40,
         "MOUSE_SHAPE": 41,
         "MEMORY_USAGE": 42,
+        "SCROLLBACK_STORED_BYTES": 43,
         "MAX_VALUE": 2147483647
       },
       "keys": {
@@ -4492,6 +4493,10 @@
         "MEMORY_USAGE": {
           "direction": "out",
           "type": "GhosttyTerminalMemoryUsage"
+        },
+        "SCROLLBACK_STORED_BYTES": {
+          "direction": "out",
+          "type": "u64"
         }
       }
     },
@@ -4551,6 +4556,8 @@
         "XT_CHECKSUM_EXTENSION": 46,
         "PROGRAM_STATUS": 47,
         "RESIZE_WINDOW": 48,
+        "SCROLLBACK_BYTES_MODE": 49,
+        "SCROLLBACK_RESIDENT_BUDGET": 50,
         "MAX_VALUE": 2147483647
       },
       "keys": {
@@ -4747,6 +4754,14 @@
         "RESIZE_WINDOW": {
           "direction": "in",
           "type": "GhosttyTerminalResizeWindowFn"
+        },
+        "SCROLLBACK_BYTES_MODE": {
+          "direction": "in",
+          "type": "GhosttyTerminalScrollbackBytesMode"
+        },
+        "SCROLLBACK_RESIDENT_BUDGET": {
+          "direction": "in",
+          "type": "u64"
         }
       }
     },
@@ -4774,6 +4789,18 @@
       "values": {
         "PRIMARY": 0,
         "ALTERNATE": 1,
+        "MAX_VALUE": 2147483647
+      }
+    },
+    "GhosttyTerminalScrollbackBytesMode": {
+      "kind": "enum",
+      "size": 4,
+      "align": 4,
+      "underlying": "i32",
+      "prefix": "GHOSTTY_TERMINAL_SCROLLBACK_BYTES_MODE_",
+      "values": {
+        "LOGICAL": 0,
+        "STORED": 1,
         "MAX_VALUE": 2147483647
       }
     },

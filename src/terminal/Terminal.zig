@@ -537,6 +537,29 @@ pub fn setScrollbackMaxBytes(self: *Terminal, max: ?usize) void {
     if (primary.no_scrollback) primary.eraseHistory(null);
 }
 
+/// Choose what the primary screen's byte limit counts.
+///
+/// `stored` counts compressed history at the size it takes, so the same limit
+/// keeps more lines; the alternate screen stays `logical`. Switching can drop
+/// history, as lowering the limit does.
+pub fn setScrollbackBytesMode(self: *Terminal, mode: PageList.BytesMode) void {
+    const primary = self.screens.get(.primary).?;
+    primary.pages.limits.bytes_mode = mode;
+    primary.pages.limits.enforce(&primary.pages, .bytes);
+    primary.clearPrunedSelection();
+
+    // Dropped history takes its placements with it.
+    if (comptime build_options.kitty_graphics) primary.kitty_images.markDirty();
+}
+
+/// Set the resident history size above which the primary screen compresses
+/// one old page per new page; null turns it off.
+///
+/// The next page allocation acts on it: nothing is compressed here.
+pub fn setScrollbackResidentBudget(self: *Terminal, budget: ?usize) void {
+    self.screens.get(.primary).?.pages.limits.resident_budget = budget;
+}
+
 /// Change the primary screen's maximum number of physical scrollback lines.
 ///
 /// Null removes the line limit. The alternate screen is intentionally

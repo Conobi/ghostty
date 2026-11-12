@@ -92,6 +92,28 @@ typedef enum GHOSTTY_ENUM_TYPED {
 } GhosttyTerminalCompressionResult;
 
 /**
+ * What the scrollback byte limit counts.
+ *
+ * Set with `GHOSTTY_TERMINAL_OPT_SCROLLBACK_BYTES_MODE`.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /**
+   * The limit counts the uncompressed size of the history pages, whether or
+   * not they are compressed. This is the default.
+   */
+  GHOSTTY_TERMINAL_SCROLLBACK_BYTES_MODE_LOGICAL = 0,
+
+  /**
+   * The limit counts what history pages really take: a compressed page counts
+   * its encoded size, so the same limit holds more lines.
+   */
+  GHOSTTY_TERMINAL_SCROLLBACK_BYTES_MODE_STORED = 1,
+  GHOSTTY_TERMINAL_SCROLLBACK_BYTES_MODE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyTerminalScrollbackBytesMode;
+
+/**
  * Scroll viewport behavior tag.
  *
  * @ingroup terminal
@@ -2651,6 +2673,43 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyTerminalResizeWindowFn
    */
   GHOSTTY_TERMINAL_OPT_RESIZE_WINDOW = 48,
+
+  /**
+   * Choose what `GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES` counts on the
+   * primary screen. The alternate screen is always
+   * `GHOSTTY_TERMINAL_SCROLLBACK_BYTES_MODE_LOGICAL`.
+   *
+   * With `GHOSTTY_TERMINAL_SCROLLBACK_BYTES_MODE_STORED`, compressed history
+   * counts at its encoded size, so the limit keeps many more lines. Pages
+   * only shrink once they are compressed (see ghostty_terminal_compress() and
+   * `GHOSTTY_TERMINAL_OPT_SCROLLBACK_RESIDENT_BUDGET`), and a page that is
+   * restored, for example by scrolling to it, counts in full again.
+   * Switching modes can drop history, as lowering the limit does.
+   *
+   * Set to NULL to restore the default,
+   * `GHOSTTY_TERMINAL_SCROLLBACK_BYTES_MODE_LOGICAL`.
+   *
+   * Input type: GhosttyTerminalScrollbackBytesMode*
+   */
+  GHOSTTY_TERMINAL_OPT_SCROLLBACK_BYTES_MODE = 49,
+
+  /**
+   * Set the size, in bytes, of resident primary-screen history above which
+   * writing compresses old pages as it goes.
+   *
+   * When a write needs a new page and the resident history is over this
+   * budget, the terminal compresses one old page that is not in the
+   * viewport, so memory stays near the budget during a long flood instead of
+   * waiting for the terminal to go idle. This costs at most one compression
+   * (about 400 KiB of input) per new page, on the thread that writes. The
+   * budget counts the active area and the viewport too, so the history that
+   * can stay uncompressed is somewhat smaller.
+   *
+   * Set to NULL to turn it off (the default).
+   *
+   * Input type: size_t*
+   */
+  GHOSTTY_TERMINAL_OPT_SCROLLBACK_RESIDENT_BUDGET = 50,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
@@ -3088,6 +3147,19 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: GhosttyTerminalMemoryUsage *
    */
   GHOSTTY_TERMINAL_DATA_MEMORY_USAGE = 42,
+
+  /**
+   * Bytes the primary screen's history takes as the stored-mode byte limit
+   * counts them: resident pages in full, compressed pages at their encoded
+   * size plus the part of their allocation compression cannot release. Node
+   * structures and allocator overhead are not counted.
+   *
+   * This is O(1), unlike `GHOSTTY_TERMINAL_DATA_MEMORY_USAGE`, and is
+   * available in either mode.
+   *
+   * Output type: size_t *
+   */
+  GHOSTTY_TERMINAL_DATA_SCROLLBACK_STORED_BYTES = 43,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
