@@ -53,6 +53,21 @@ const pin_preheat = 2;
 /// the bottommost page (the current active page).
 pub const List = DoublyLinkedList(Node);
 
+/// A reusable decode buffer for reading compressed pages without restoring them.
+///
+/// Holds one decoded page at a time; the page returned by
+/// `Node.readPreserving` is valid until the next read with the same scratch.
+pub const ReadScratch = struct {
+    buf: []align(std.heap.page_size_min) u8 = &.{},
+    page: Page = undefined,
+
+    /// Free the buffer; the scratch may be reused afterwards.
+    pub fn deinit(self: *ReadScratch, alloc: Allocator) void {
+        if (self.buf.len > 0) alloc.free(self.buf);
+        self.* = .{};
+    }
+};
+
 /// A single node within the PageList linked list.
 ///
 /// This isn't pub because you can access the type via List.Node.
@@ -201,6 +216,39 @@ const Node = struct {
                 } };
             },
         };
+    }
+
+    /// Read-only page contents without restoring the node or allocating per call.
+    ///
+    /// A resident node is borrowed. A compressed node is decoded into `scratch`
+    /// (at least a pool item, grown for heap pages), so reading a whole history
+    /// holds one decoded page. The result is valid until the next read with the
+    /// same scratch and while the caller has exclusive access to the list.
+    pub fn readPreserving(
+        self: *const Node,
+        scratch: *ReadScratch,
+        alloc: Allocator,
+    ) Allocator.Error!*const Page {
+        const compressed = switch (self.data) {
+            .resident => |*page_| return page_,
+            .compressed => |*page_| page_,
+        };
+        const need = compressed.page.memory.len;
+        if (scratch.buf.len < need) {
+            const buf = try alloc.alignedAlloc(
+                u8,
+                .fromByteUnits(std.heap.page_size_min),
+                @max(need, PagePool.item_size),
+            );
+            if (scratch.buf.len > 0) alloc.free(scratch.buf);
+            scratch.buf = buf;
+        }
+        scratch.page = compressed.cloneBuf(scratch.buf) catch |err| {
+            // Same boundary as `pagePreservingState`: our codec produced the data.
+            log.err("failed to read compressed page err={}", .{err});
+            @panic("failed to read compressed terminal page");
+        };
+        return &scratch.page;
     }
 
     /// Return the node's backing-memory representation without restoring it.
@@ -9759,6 +9807,51 @@ test "PageList preserved page keeps compressed storage" {
         expected_encoded,
         node.data.compressed.encoded,
     );
+}
+
+test "PageList readPreserving decodes into the scratch and keeps the node compressed" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try s.growColdPagesForTest(2);
+
+    const node = s.pages.first.?;
+    node.page().getRowAndCell(3, 2).cell.* = .init('X');
+    const expected = try alloc.dupe(u8, node.page().memory);
+    defer alloc.free(expected);
+
+    var scratch: ReadScratch = .{};
+    defer scratch.deinit(alloc);
+
+    // A resident node is borrowed: nothing is allocated.
+    const resident = try node.readPreserving(&scratch, alloc);
+    try testing.expectEqual(@as(*const Page, node.pageAssumeResident()), resident);
+    try testing.expectEqual(@as(usize, 0), scratch.buf.len);
+
+    try testing.expect(s.compressPage(node));
+    const stats = s.memoryStats();
+
+    const decoded = try node.readPreserving(&scratch, alloc);
+    try testing.expectEqualSlices(u8, expected, decoded.memory);
+    try testing.expect(node.isCompressed());
+    try testing.expectEqual(stats, s.memoryStats());
+
+    // The buffer is reused, not reallocated, by the next read.
+    const buf_ptr = scratch.buf.ptr;
+    _ = try node.readPreserving(&scratch, alloc);
+    try testing.expectEqual(buf_ptr, scratch.buf.ptr);
+
+    // Allocation failure leaves the node untouched.
+    var empty: ReadScratch = .{};
+    var failing = testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        node.readPreserving(&empty, failing.allocator()),
+    );
+    try testing.expect(node.isCompressed());
+    try testing.expectEqual(stats, s.memoryStats());
 }
 
 test "PageList memory stats include unused pool backing" {
