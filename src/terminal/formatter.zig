@@ -63,6 +63,30 @@ pub fn formatStyled(fmt: Format) bool {
     };
 }
 
+/// Whether `cell` is a Kitty unicode placeholder that `emit` formats as a
+/// blank. Its combining marks only encode the row and column of an image
+/// and mean nothing as text. VT keeps it: the cell's colors hold the image
+/// id, so replaying the output can show the image again.
+fn isBlankPlaceholder(comptime emit: Format, cell: Cell) bool {
+    if (comptime emit == .vt) return false;
+    return switch (cell.content_tag) {
+        .codepoint, .codepoint_grapheme => cell.content.codepoint.data ==
+            kitty.graphics.unicode.placeholder,
+        .bg_color_palette, .bg_color_rgb => false,
+    };
+}
+
+/// `Cell.hasTextAny` that does not count blank placeholders (see
+/// `isBlankPlaceholder`) as text.
+fn hasTextAny(comptime emit: Format, cells: []const Cell) bool {
+    if (!Cell.hasTextAny(cells)) return false;
+    if (comptime emit == .vt) return true;
+    for (cells) |cell| {
+        if (cell.hasText() and !isBlankPlaceholder(emit, cell)) return true;
+    }
+    return false;
+}
+
 pub const CodepointMap = struct {
     /// Unicode codepoint range to replace.
     /// Asserts: range[0] <= range[1]
@@ -1297,7 +1321,7 @@ pub const PageFormatter = struct {
             // blanks. In VT a row of cells that only carry a background
             // (erased while a background color was set) isn't blank,
             // since dropping it would lose the color.
-            if (!Cell.hasTextAny(cells_subset) and
+            if (!hasTextAny(emit, cells_subset) and
                 !(emit == .vt and hasBackgroundAny(cells_subset)))
             {
                 blank_rows += 1;
@@ -1447,11 +1471,12 @@ pub const PageFormatter = struct {
                     // the cell has some kind of styling or is not empty
                     // then this isn't blank.
                     if (comptime formatStyled(emit)) {
-                        if (!cell.isEmpty() or cell.hasStyling()) break :blank;
+                        if (!(cell.isEmpty() or isBlankPlaceholder(emit, cell.*)) or
+                            cell.hasStyling()) break :blank;
                     }
 
                     // Cells with no text are blank
-                    if (!cell.hasText()) {
+                    if (!cell.hasText() or isBlankPlaceholder(emit, cell.*)) {
                         blank_cells += 1;
                         continue;
                     }
@@ -1815,13 +1840,15 @@ pub const PageFormatter = struct {
                 // Styled formats only treat unstyled empty cells as
                 // blank; anything else (including spaces) is written
                 // so that styling is preserved.
-                if (cp == 0 and cell.wide == .narrow and run_style_id == 0) {
+                if ((cp == 0 or isBlankPlaceholder(emit, cell.*)) and
+                    cell.wide == .narrow and run_style_id == 0)
+                {
                     pending += 1;
                     continue;
                 }
             } else {
                 // Cells with no text are blank.
-                if (cp == 0) {
+                if (cp == 0 or isBlankPlaceholder(emit, cell.*)) {
                     pending += 1;
                     continue;
                 }
@@ -1888,7 +1915,7 @@ pub const PageFormatter = struct {
 
             // Empty (but styled or wide) cells emit a space, matching
             // writeCell.
-            if (cp == 0) {
+            if (cp == 0 or isBlankPlaceholder(emit, cell.*)) {
                 buf[len] = ' ';
                 len += 1;
                 cell_bytes = 1;
@@ -2094,7 +2121,7 @@ pub const PageFormatter = struct {
         // Blank cells get an empty space that isn't replaced by anything
         // because it isn't really a space. We do this so that formatting
         // is preserved if we're emitting styles.
-        if (!cell.hasText()) {
+        if (!cell.hasText() or isBlankPlaceholder(emit, cell.*)) {
             try writer.writeByte(' ');
             return;
         }
@@ -8264,4 +8291,69 @@ test "Page HTML hyperlink point map maps closing to previous cell" {
     for (closing_idx..closing_idx + "</a>".len) |i| {
         try testing.expectEqual(expected_coord, point_map.items[i]);
     }
+}
+
+/// Format the whole screen of a terminal fed with `input`.
+fn formatScreenForTest(
+    alloc: Allocator,
+    input: []const u8,
+    opts: Options,
+) ![]u8 {
+    var t = try Terminal.init(std.testing.io, alloc, .{ .cols = 20, .rows = 6 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice(input);
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    errdefer builder.deinit();
+    var formatter: TerminalFormatter = .init(&t, opts);
+    try formatter.format(&builder.writer);
+    return builder.toOwnedSlice();
+}
+
+test "Kitty placeholder cells format as blanks in plain and html" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Placeholder cells carry combining marks (row, column, high byte).
+    const ph = "\u{10EEEE}\u{0305}\u{0305}\u{0749}";
+    const input = "ab" ++ ph ++ ph ++ ph ++ "cd\r\n" ++
+        ph ++ ph ++ ph ++ "\r\n" ++
+        "tail" ++ ph ++ ph;
+    // The same screen with those cells left empty.
+    const empty = "ab\x1b[3Ccd\r\n\r\ntail";
+
+    for ([_]Options{ .plain, .{ .emit = .html } }) |opts| {
+        const got = try formatScreenForTest(alloc, input, opts);
+        defer alloc.free(got);
+        const want = try formatScreenForTest(alloc, empty, opts);
+        defer alloc.free(want);
+        try testing.expectEqualStrings(want, got);
+    }
+
+    const plain = try formatScreenForTest(alloc, input, .plain);
+    defer alloc.free(plain);
+    try testing.expectEqualStrings("ab   cd\n\ntail", plain);
+
+    // VT keeps them: they carry the image id and replay an image.
+    const vt = try formatScreenForTest(alloc, input, .vt);
+    defer alloc.free(vt);
+    try testing.expect(std.mem.indexOf(u8, vt, "\u{10EEEE}") != null);
+}
+
+test "Kitty placeholder cells with a color format as blanks in html" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const ph = "\u{10EEEE}\u{0305}\u{0305}\u{0749}";
+    const input = "ab\x1b[38;2;1;2;3m" ++ ph ++ ph ++ "\x1b[0mcd";
+    const html = try formatScreenForTest(alloc, input, .{ .emit = .html });
+    defer alloc.free(html);
+    try testing.expect(std.mem.indexOf(u8, html, "&#1109742;") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "&#773;") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "&#1865;") == null);
+    try testing.expect(std.mem.indexOf(u8, html, "ab") != null);
+    try testing.expect(std.mem.indexOf(u8, html, "cd") != null);
 }
