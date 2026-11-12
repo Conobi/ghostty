@@ -974,12 +974,20 @@ pub const PageListFormatter = struct {
         const tl: PageList.Pin = self.top_left orelse self.list.getTopLeft(.screen);
         var br: PageList.Pin = self.bottom_right orelse self.list.getBottomRight(.screen).?;
 
+        // Compressed pages are decoded into one reusable buffer instead of
+        // being restored, so formatting a whole history leaves it compressed.
+        const scratch_alloc = self.list.pool.alloc;
+        var scratch: PageList.ReadScratch = .{};
+        defer scratch.deinit(scratch_alloc);
+
         // If the end is a spacer head, move it onto the wrapped wide char,
         // which may be on another page.
-        if (self.opts.unwrap and !self.rectangle and
-            br.rowAndCell().cell.wide == .spacer_head)
-        {
-            br = br.rightWrap(1) orelse br;
+        if (self.opts.unwrap and !self.rectangle) {
+            const br_page = br.node.readPreserving(&scratch, scratch_alloc) catch
+                return error.WriteFailed;
+            if (br_page.getRowAndCell(br.x, br.y).cell.wide == .spacer_head) {
+                br = br.rightWrap(1) orelse br;
+            }
         }
 
         var page_state: ?PageFormatter.TrailingState = null;
@@ -988,7 +996,9 @@ pub const PageListFormatter = struct {
             assert(chunk.start < chunk.end);
             assert(chunk.end > 0);
 
-            var formatter: PageFormatter = .init(chunk.node.page(), self.opts);
+            const chunk_page = chunk.node.readPreserving(&scratch, scratch_alloc) catch
+                return error.WriteFailed;
+            var formatter: PageFormatter = .init(chunk_page, self.opts);
             formatter.start_y = chunk.start;
             formatter.end_y = chunk.end - 1;
             formatter.trailing_state = page_state;
@@ -8356,4 +8366,47 @@ test "Kitty placeholder cells with a color format as blanks in html" {
     try testing.expect(std.mem.indexOf(u8, html, "&#1865;") == null);
     try testing.expect(std.mem.indexOf(u8, html, "ab") != null);
     try testing.expect(std.mem.indexOf(u8, html, "cd") != null);
+}
+
+test "PageListFormatter reads compressed history without restoring it" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Two identical terminals: one stays resident as the oracle.
+    var plain_t = try Terminal.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = null });
+    defer plain_t.deinit(alloc);
+    var packed_t = try Terminal.init(io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = null });
+    defer packed_t.deinit(alloc);
+    var plain_s = plain_t.vtStream();
+    defer plain_s.deinit();
+    var packed_s = packed_t.vtStream();
+    defer packed_s.deinit();
+
+    var line_buf: [64]u8 = undefined;
+    for (0..6_000) |i| {
+        const line = try std.fmt.bufPrint(&line_buf, "line {d:0>6} the quick brown fox\r\n", .{i});
+        plain_s.nextSlice(line);
+        packed_s.nextSlice(line);
+    }
+
+    const pages = &packed_t.screens.active.pages;
+    _ = pages.compress(.full);
+    const before = pages.memoryStats();
+    try testing.expect(before.compressed_pages > 2);
+
+    inline for (.{ false, true }) |unwrap| {
+        var opts = Options.plain;
+        opts.unwrap = unwrap;
+        var want: std.Io.Writer.Allocating = .init(alloc);
+        defer want.deinit();
+        var got: std.Io.Writer.Allocating = .init(alloc);
+        defer got.deinit();
+        try PageListFormatter.init(&plain_t.screens.active.pages, opts).format(&want.writer);
+        try PageListFormatter.init(pages, opts).format(&got.writer);
+        try testing.expectEqualStrings(want.writer.buffered(), got.writer.buffered());
+    }
+
+    // The whole history was read and not one page was restored.
+    try testing.expectEqual(before, pages.memoryStats());
 }
