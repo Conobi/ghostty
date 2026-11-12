@@ -10784,6 +10784,55 @@ test "PageList compress before prune keeps history that fits once compressed" {
     try testing.expectEqual(@as(usize, 0), plain.counters.encodes);
 }
 
+test "PageList counters property: random operations never desynchronise the counters" {
+    const testing = std.testing;
+    const formatter = @import("formatter.zig");
+    const seed: u64 = 0x434F_554E_5445_5253;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+
+    var s = try init(testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_size = 16 * PagePool.item_size,
+    });
+    defer s.deinit();
+    s.limits.bytes_mode = .stored;
+    s.limits.resident_budget = 4 * PagePool.item_size;
+    var scratch: ReadScratch = .{};
+    defer scratch.deinit(testing.allocator);
+
+    var step: usize = 0;
+    errdefer std.debug.print("counters property failed: seed=0x{x} step={}\n", .{ seed, step });
+    while (step < 600) : (step += 1) {
+        switch (random.uintLessThan(u8, 12)) {
+            0...3 => for (0..random.intRangeAtMost(usize, 1, 3_000)) |_| {
+                _ = try s.grow();
+            },
+            4 => _ = s.compress(.drain),
+            5 => _ = s.compress(.incremental),
+            6 => if (s.pages.first) |n| {
+                _ = n.page(); // a restore of the oldest page
+            },
+            7 => try s.resize(.{
+                .cols = random.intRangeAtMost(size.CellCountInt, 40, 120),
+                .reflow = random.boolean(),
+            }),
+            8 => s.eraseHistory(null),
+            9 => s.reset(),
+            10 => {
+                var out: std.Io.Writer.Allocating = .init(testing.allocator);
+                defer out.deinit();
+                try formatter.PageListFormatter.init(&s, .plain).format(&out.writer);
+            },
+            11 => s.scroll(.{ .row = random.intRangeAtMost(usize, 0, s.total_rows - 1) }),
+            else => unreachable,
+        }
+        try s.expectCountersForTest();
+        if (s.pages.first) |n| _ = try n.readPreserving(&scratch, testing.allocator);
+    }
+}
+
 test "PageList memory stats include unused pool backing" {
     const testing = std.testing;
 
