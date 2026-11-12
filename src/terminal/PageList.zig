@@ -65,6 +65,12 @@ pub const Counters = struct {
     /// Highest `resident_size` since it was last set; a diagnostic for tests.
     resident_peak: usize = 0,
 
+    /// Resident history as `PageList.memoryStats` reports it: a resident page
+    /// counts its backing bytes; a compressed page counts its encoded length
+    /// plus the resident tail of its pool item. Not counted: node structs,
+    /// page metadata and allocator overhead.
+    stored_size: usize = 0,
+
     /// Every page before this one is compressed, marked incompressible, or
     /// the `deferred` page; see `PageList.compressOldestResident`. Null means
     /// "scan from the first page". Cleared by whatever destroys, reuses or
@@ -87,6 +93,7 @@ pub const Counters = struct {
     /// A resident node joins the accounted list.
     fn attach(self: *Counters, node: *const List.Node) void {
         self.addResident(node.backingBytes());
+        self.stored_size += node.backingBytes();
     }
 
     /// Forget the scan position, so the next scan starts at the first page.
@@ -103,20 +110,24 @@ pub const Counters = struct {
     /// A resident node leaves the accounted list.
     fn detach(self: *Counters, node: *const List.Node) void {
         self.resident_size -= node.backingBytes();
+        self.stored_size -= node.backingBytes();
         self.forget(node);
     }
 
     /// A node has just become compressed.
     fn compressed(self: *Counters, node: *const List.Node) void {
         self.resident_size -= node.backingBytes();
+        self.stored_size -= node.metadata().memory.len -
+            node.data.compressed.encoded.len;
     }
 
     /// A node has just become resident again.
     ///
     /// A page behind the cursor is not a candidate for compression until it is
     /// compressed again, but this one may be, so restart the scan.
-    fn restored(self: *Counters, node: *const List.Node) void {
+    fn restored(self: *Counters, node: *const List.Node, encoded_len: usize) void {
         self.addResident(node.backingBytes());
+        self.stored_size += node.metadata().memory.len - encoded_len;
         self.resetScan();
     }
 };
@@ -424,12 +435,13 @@ const Node = struct {
         };
 
         // Remove our compressed data
+        const encoded_len = compressed.encoded.len;
         compressed.deinit();
 
         // We're now a resident, non-compressed node.
         self.data = .{ .resident = restored };
         self.incompressible = false;
-        if (self.counters) |c| c.restored(self);
+        if (self.counters) |c| c.restored(self, encoded_len);
         return &self.data.resident;
     }
 
@@ -1089,10 +1101,17 @@ fn verifyIntegrity(self: *const PageList) IntegrityError!void {
 /// states by hand legitimately bypass the accounting.
 pub fn verifyCounters(self: *const PageList) error{CountersMismatch}!void {
     const recount = self.recountCounters();
-    if (recount.resident_size != self.counters.resident_size) {
+    if (recount.resident_size != self.counters.resident_size or
+        recount.stored_size != self.counters.stored_size)
+    {
         log.warn(
-            "PageList counters mismatch resident={} recount={}",
-            .{ self.counters.resident_size, recount.resident_size },
+            "PageList counters mismatch resident={}/{} stored={}/{}",
+            .{
+                self.counters.resident_size,
+                recount.resident_size,
+                self.counters.stored_size,
+                recount.stored_size,
+            },
         );
         return error.CountersMismatch;
     }
@@ -1106,9 +1125,19 @@ pub fn recountCounters(self: *const PageList) Counters {
     var result: Counters = .{};
     var node = self.pages.first;
     while (node) |n| : (node = n.next) {
-        if (n.storage() == .resident) result.resident_size += n.backingBytes();
+        switch (n.data) {
+            .resident => {
+                result.resident_size += n.backingBytes();
+                result.stored_size += n.backingBytes();
+            },
+            .compressed => |c| result.stored_size += c.encoded.len +
+                (n.backingBytes() - c.page.memory.len),
+        }
     }
-    if (self.recycle_node) |n| result.resident_size += n.backingBytes();
+    if (self.recycle_node) |n| {
+        result.resident_size += n.backingBytes();
+        result.stored_size += n.backingBytes();
+    }
     return result;
 }
 
@@ -4283,7 +4312,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
     // initial allocation.
     if (self.pages.first != null and
         self.pages.first != self.pages.last and
-        self.page_size + new_size > self.limits.max(.bytes))
+        self.limitedBytes() + new_size > self.limits.max(.bytes))
     prune: {
         const first = self.pages.popFirst().?;
         assert(first != last);
@@ -4430,6 +4459,14 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
     // active-boundary page wholly historical.
     self.limits.enforce(self, .lines);
     return next_node;
+}
+
+/// The size the byte limit is compared with, per `Limits.bytes_mode`.
+fn limitedBytes(self: *const PageList) usize {
+    return switch (self.limits.bytes_mode) {
+        .logical => self.page_size,
+        .stored => self.counters.stored_size,
+    };
 }
 
 /// When resident history exceeds `Limits.resident_budget`, compress the
@@ -5238,9 +5275,15 @@ pub const PageAllocation = struct {
             node_size,
         ) catch return error.PageSizeOverflow;
 
+        const limited_size = std.math.add(
+            usize,
+            destination.limitedBytes(),
+            node_size,
+        ) catch return error.PageSizeOverflow;
+
         // Restored history is exact data, so reject a page which cannot
         // coexist with the receiving PageList's configured limits.
-        if (page_size > destination.limits.max(.bytes)) {
+        if (limited_size > destination.limits.max(.bytes)) {
             return error.MaxSizeExceeded;
         }
         if (total_rows - destination.rows > destination.limits.max(.lines)) {
@@ -7974,10 +8017,22 @@ fn markDirty(self: *PageList, pt: point.Point) void {
     self.pin(pt).?.markDirty();
 }
 
+/// What a PageList's byte limit counts.
+pub const BytesMode = enum {
+    /// `max_size` bounds `page_size`, the uncompressed size (upstream's rule).
+    logical,
+
+    /// `max_size` bounds `Counters.stored_size`, what pages really take.
+    stored,
+};
+
 /// Runtime-configurable byte and line limits for a PageList.
 const Limits = struct {
     bytes: Limit,
     lines: Limit,
+
+    /// What `bytes` counts; see `BytesMode`.
+    bytes_mode: BytesMode = .logical,
 
     /// Resident backing bytes above which `grow` compresses one old history
     /// page per new page. Null (upstream's default) disables it.
@@ -8047,7 +8102,7 @@ const Limits = struct {
         limit: Key,
     ) bool {
         return switch (limit) {
-            .bytes => pagelist.page_size > self.max(.bytes),
+            .bytes => pagelist.limitedBytes() > self.max(.bytes),
             .lines => pagelist.total_rows > pagelist.rows and
                 pagelist.total_rows - pagelist.rows > self.max(.lines),
         };
@@ -9320,6 +9375,7 @@ fn fillTextRowsForTest(self: *PageList) void {
 fn expectCountersForTest(self: *const PageList) !void {
     const want = self.recountCounters();
     try std.testing.expectEqual(want.resident_size, self.counters.resident_size);
+    try std.testing.expectEqual(want.stored_size, self.counters.stored_size);
 }
 
 /// Fill the current tail page to capacity without allocating a successor.
@@ -10597,6 +10653,95 @@ test "PageList prune reuse of a compressed page gives a zeroed page" {
     try testing.expect(!std.mem.containsAtLeast(u8, node.page().memory[0..64], 1, &.{0xAB}));
     try testing.expect(std.mem.allEqual(u8, node.page().memory[node.page().memory.len - 64 ..], 0));
     try s.expectCountersForTest();
+}
+
+test "PageList stored mode counts a compressed page at its encoded size" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try s.growColdPagesForTest(4);
+    const first = s.pages.first.?;
+    try testing.expectEqual(s.page_size, s.counters.stored_size);
+
+    try testing.expect(s.compressPage(first));
+    const encoded = first.data.compressed.encoded.len;
+    const tail = PagePool.item_size - first.metadata().memory.len;
+    try testing.expectEqual(s.page_size - PagePool.item_size + encoded + tail, s.counters.stored_size);
+    try testing.expectEqual(s.memoryStats().estimatedResidentBytes(), s.counters.stored_size);
+    try s.expectCountersForTest();
+
+    _ = first.page(); // restore
+    try testing.expectEqual(s.page_size, s.counters.stored_size);
+}
+
+test "PageList stored mode keeps more history under the same byte cap" {
+    const testing = std.testing;
+    const cap = 20 * PagePool.item_size;
+    inline for (.{ BytesMode.logical, BytesMode.stored }) |mode| {
+        var s = try init(testing.allocator, .{ .cols = 80, .rows = 24, .max_size = cap });
+        defer s.deinit();
+        s.limits.bytes_mode = mode;
+        s.limits.resident_budget = 4 * PagePool.item_size;
+        for (0..80_000) |_| _ = try s.grow();
+        _ = s.compress(.drain);
+        try s.expectCountersForTest();
+        const kept = s.total_rows;
+        const page_rows: usize = s.pages.last.?.capacity().rows;
+        if (mode == .logical) {
+            try testing.expect(s.page_size <= cap + PagePool.item_size);
+            try testing.expect(kept <= 21 * page_rows);
+        } else {
+            try testing.expect(s.counters.stored_size <= cap + PagePool.item_size);
+            try testing.expect(kept > 3 * 20 * page_rows); // several times the logical figure
+        }
+    }
+}
+
+test "PageList stored mode enforces the cap when it is switched on and in finalize" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try s.growColdPagesForTest(30);
+    _ = s.compress(.full);
+    s.limits.set(.bytes, 10 * PagePool.item_size);
+    s.limits.bytes_mode = .stored;
+    s.limits.enforce(&s, .bytes);
+    try testing.expect(s.counters.stored_size <= 10 * PagePool.item_size);
+    try s.expectCountersForTest();
+
+    // A prepended page that fits the stored size is accepted where the
+    // logical size would refuse it.
+    var tight = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer tight.deinit();
+    try tight.growColdPagesForTest(8);
+    _ = tight.compress(.full);
+    tight.limits.set(.bytes, tight.page_size - 2 * PagePool.item_size);
+    tight.limits.bytes_mode = .stored;
+    var page = try tight.allocatePage(initialCapacity(tight.cols));
+    defer page.deinit();
+    page.page().size.rows = 1;
+    try page.finalize(.prepend, .{});
+    try tight.expectCountersForTest();
+}
+
+test "PageList logical mode and no budget still behave as before" {
+    const testing = std.testing;
+    const cap = 6 * PagePool.item_size;
+    var packed_list = try init(testing.allocator, .{ .cols = 80, .rows = 24, .max_size = cap });
+    defer packed_list.deinit();
+    var plain = try init(testing.allocator, .{ .cols = 80, .rows = 24, .max_size = cap });
+    defer plain.deinit();
+    try testing.expectEqual(BytesMode.logical, packed_list.limits.bytes_mode);
+
+    for (0..10_000) |i| {
+        _ = try packed_list.grow();
+        _ = try plain.grow();
+        // Compressing in logical mode never changes how much the cap keeps.
+        if (i % 1_000 == 0) _ = packed_list.compress(.drain);
+    }
+    try testing.expect(packed_list.page_size <= cap + PagePool.item_size);
+    try testing.expectEqual(plain.total_rows, packed_list.total_rows);
+    try testing.expectEqual(plain.page_size, packed_list.page_size);
 }
 
 test "PageList memory stats include unused pool backing" {
