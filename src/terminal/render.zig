@@ -1204,8 +1204,9 @@ pub const RenderState = struct {
             if (page_dirty) p.dirty = false;
 
             // Get our contiguous rows for this chunk.
+            // A page above the lazy reflow boundary may have another width;
+            // `RowBuilder.row` clips or pads its rows to ours.
             const page_rows: []page.Row = p.rows.ptr(p.memory)[chunk.start..][0..take];
-            assert(p.size.cols == self.cols);
 
             // Store our pins and their node generations. We have to store
             // these even for rows that aren't dirty because dirty is only a
@@ -1392,7 +1393,18 @@ pub const RenderState = struct {
                 else
                     start.x;
 
-                sel_bounds.* = .{ start_x, end.x };
+                // A row of another width can hold a bound past our columns.
+                // A selection that starts beyond them highlights nothing.
+                if (start_x >= self.cols) {
+                    if (sel_bounds.* != null) {
+                        sel_bounds.* = null;
+                        dirty.* = true;
+                        any_dirty = true;
+                    }
+                    continue;
+                }
+
+                sel_bounds.* = .{ start_x, @min(end.x, self.cols - 1) };
             }
         }
 
@@ -2689,8 +2701,11 @@ const RowBuilder = struct {
         }
         b.dirties[vy] = true;
 
-        // Get all our cells in the page.
-        const page_cells: []const page.Cell = page_row.cells.ptr(p.memory)[0..b.cols];
+        // Get all our cells in the page. A page of another width (above the
+        // lazy reflow boundary) is clipped to our columns here, and padded
+        // with blank cells below.
+        const copy_cols: usize = @min(@as(usize, p.size.cols), b.cols);
+        const page_cells: []const page.Cell = page_row.cells.ptr(p.memory)[0..copy_cols];
 
         // Copy our raw row data. The terminal row stays dirty until the
         // build succeeds, but the render-state snapshot is always rebuilt.
@@ -2723,9 +2738,16 @@ const RowBuilder = struct {
         const cells_slice = cells.slice();
         fastmem.copy(
             page.Cell,
-            cells_slice.items(.raw),
+            cells_slice.items(.raw)[0..copy_cols],
             page_cells,
         );
+        if (copy_cols < b.cols) {
+            @memset(cells_slice.items(.raw)[copy_cols..], .{});
+        } else if (p.size.cols > b.cols) {
+            // The cut must not split a wide character: blank its head.
+            const last = &cells_slice.items(.raw)[b.cols - 1];
+            if (last.wide == .wide) last.* = .{};
+        }
         // Rows with Kitty placeholders are rare. They get their own copy
         // of the scan below, so other rows pay nothing for them. These
         // rows are scanned even without managed memory, because a
@@ -6077,4 +6099,132 @@ test "render update retries rows after OOM" {
 
     const cells = state.row_data.items(.cells)[0].slice();
     try testing.expectEqualSlices(u21, &.{0x301}, cells.items(.grapheme)[1]);
+}
+
+/// A lazily reflowing terminal with `lines` numbered lines of `width`
+/// characters, resized from `from` to `to` columns, viewport at the top.
+fn lazyStaleTerminalForTest(
+    alloc: std.mem.Allocator,
+    from: size.CellCountInt,
+    to: size.CellCountInt,
+    lead: []const u8,
+    fill: []const u8,
+    width: usize,
+) !Terminal {
+    const testing = std.testing;
+    var t = try Terminal.init(testing.io, alloc, .{
+        .cols = from,
+        .rows = 4,
+        .max_scrollback_bytes = null,
+    });
+    errdefer t.deinit(alloc);
+    t.setLazyReflow(true);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(alloc);
+    for (0..12000) |n| {
+        line.clearRetainingCapacity();
+        try line.print(alloc, "{d:0>4}", .{n});
+        try line.appendSlice(alloc, lead);
+        var cols: usize = 4 + lead.len;
+        while (cols < width) : (cols += 1) try line.appendSlice(alloc, fill);
+        try line.appendSlice(alloc, "\r\n");
+        s.nextSlice(line.items);
+    }
+    try t.resize(alloc, .{ .cols = to, .rows = 4 });
+    try testing.expect(t.screens.active.pages.stale_tail != null);
+    t.scrollViewport(.top);
+    return t;
+}
+
+test "RenderState clips and pads rows of other widths" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Clipped: stale pages 120 wide under an 80-wide tail.
+    {
+        var t = try lazyStaleTerminalForTest(alloc, 120, 80, "", "x", 110);
+        defer t.deinit(alloc);
+        var state: RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &t);
+        try testing.expectEqual(@as(usize, 4), state.row_data.len);
+        const cells = state.row_data.slice().items(.cells);
+        for (0..4) |y| {
+            try testing.expectEqual(@as(usize, 80), cells[y].len);
+            try testing.expectEqual('0', cells[y].get(0).raw.codepoint());
+            try testing.expectEqual('x', cells[y].get(79).raw.codepoint());
+        }
+        const text = try t.plainString(alloc);
+        defer alloc.free(text);
+        try testing.expect(std.mem.startsWith(u8, text, "0000"));
+    }
+
+    // Padded: stale pages 40 wide under an 80-wide tail.
+    {
+        var t = try lazyStaleTerminalForTest(alloc, 40, 80, "", "y", 30);
+        defer t.deinit(alloc);
+        var state: RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &t);
+        const cells = state.row_data.slice().items(.cells);
+        for (0..4) |y| {
+            try testing.expectEqual(@as(usize, 80), cells[y].len);
+            try testing.expectEqual('y', cells[y].get(29).raw.codepoint());
+            try testing.expectEqual(@as(u21, 0), cells[y].get(30).raw.codepoint());
+            try testing.expectEqual(@as(u21, 0), cells[y].get(79).raw.codepoint());
+        }
+    }
+
+    // A wide character cut at the clip edge is blanked: 'a' then wide
+    // characters put a wide head in the last kept column.
+    {
+        var t = try lazyStaleTerminalForTest(alloc, 120, 80, "a", "\u{65E5}", 200);
+        defer t.deinit(alloc);
+        var state: RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &t);
+        const cells = state.row_data.slice().items(.cells);
+        try testing.expectEqual(@as(usize, 80), cells[0].len);
+        // Columns 5..: 'a' at 4, heads at odd... the cut falls inside a pair.
+        const last = cells[0].get(79).raw;
+        try testing.expect(last.wide != .wide);
+    }
+}
+
+test "RenderState selection bounds are clamped to the render width" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try lazyStaleTerminalForTest(alloc, 120, 80, "", "x", 110);
+    defer t.deinit(alloc);
+    const screen: *Screen = t.screens.active;
+
+    // Starting past the render width in a stale row: nothing is selected there.
+    // `pin` refuses columns past the list's width, so build them by hand.
+    var wide_start = screen.pages.pin(.{ .screen = .{ .x = 0, .y = 1 } }).?;
+    var wide_end = wide_start;
+    wide_start.x = 100;
+    wide_end.x = 110;
+    try screen.select(.init(wide_start, wide_end, false));
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    {
+        const sels = state.row_data.slice().items(.selection);
+        try testing.expectEqual(null, sels[1]);
+    }
+
+    // Ending past it: the bound is clamped to the last column.
+    var from = wide_start;
+    from.x = 10;
+    var to = wide_start;
+    to.x = 100;
+    try screen.select(.init(from, to, false));
+    try state.update(alloc, &t);
+    {
+        const sels = state.row_data.slice().items(.selection);
+        try testing.expectEqualSlices(size.CellCountInt, &.{ 10, 79 }, &sels[1].?);
+    }
 }
