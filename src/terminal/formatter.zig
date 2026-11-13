@@ -8384,11 +8384,19 @@ test "PageListFormatter reads compressed history without restoring it" {
     defer packed_s.deinit();
 
     var line_buf: [64]u8 = undefined;
+    var plain_bulk: PageList.BulkGrowth = .init(&plain_t.screens.active.pages);
+    var packed_bulk: PageList.BulkGrowth = .init(&packed_t.screens.active.pages);
     for (0..6_000) |i| {
         const line = try std.fmt.bufPrint(&line_buf, "line {d:0>6} the quick brown fox\r\n", .{i});
         plain_s.nextSlice(line);
         packed_s.nextSlice(line);
+        if (i % 10 == 9) {
+            plain_bulk.refresh();
+            packed_bulk.refresh();
+        }
     }
+    plain_bulk.finish();
+    packed_bulk.finish();
 
     const pages = &packed_t.screens.active.pages;
     _ = pages.compress(.full);

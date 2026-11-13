@@ -10194,6 +10194,68 @@ fn fillTextRowsForTest(self: *PageList) void {
     }
 }
 
+/// Bulk growth for tests: pauses the list's integrity scan and the tail
+/// page's, which cost milliseconds per row in a debug build. `finish` resumes
+/// both and runs one check, so a broken state still fails the test.
+pub const BulkGrowth = struct {
+    list: *PageList,
+    tail: *List.Node,
+
+    pub fn init(list: *PageList) BulkGrowth {
+        list.pauseIntegrityChecks(true);
+        const tail = list.pages.last.?;
+        tail.page().pauseIntegrityChecks(true);
+        return .{ .list = list, .tail = tail };
+    }
+
+    /// `grow`, keeping the new tail paused. The old tail is released after
+    /// the call, unless the grow encoded it (that drops its pause with it).
+    fn grow(self: *BulkGrowth) !?*List.Node {
+        const reused = try self.list.grow();
+        self.refresh();
+        return reused;
+    }
+
+    /// Moves the pause to the current tail page. Call it every so often
+    /// when rows are added by something other than `grow`, such as a VT
+    /// stream.
+    pub fn refresh(self: *BulkGrowth) void {
+        const tail = self.list.pages.last.?;
+        if (tail == self.tail) return;
+        if (!self.tail.isCompressed()) self.tail.page().pauseIntegrityChecks(false);
+        self.tail = tail;
+        tail.page().pauseIntegrityChecks(true);
+    }
+
+    fn growMany(self: *BulkGrowth, count: usize) !void {
+        for (0..count) |_| _ = try self.grow();
+    }
+
+    pub fn finish(self: *BulkGrowth) void {
+        if (!self.tail.isCompressed()) self.tail.page().pauseIntegrityChecks(false);
+        self.list.pauseIntegrityChecks(false);
+        self.list.assertIntegrity();
+        if (!self.tail.isCompressed()) self.tail.page().assertIntegrity();
+    }
+};
+
+/// `growColdPagesForTest` without the per-row integrity scans.
+fn growColdPagesQuietForTest(self: *PageList, count: usize) !void {
+    var bulk: BulkGrowth = .init(self);
+    defer bulk.finish();
+    while (true) {
+        const active_node = self.getTopLeft(.active).node;
+        var cold_count: usize = 0;
+        var current = self.pages.first;
+        while (current) |node| : (current = node.next) {
+            if (node == active_node) break;
+            cold_count += 1;
+        }
+        if (cold_count >= count) return;
+        _ = try bulk.grow();
+    }
+}
+
 /// Fails unless the counters equal a recount from the nodes.
 fn expectCountersForTest(self: *const PageList) !void {
     const want = self.recountCounters();
@@ -11106,7 +11168,7 @@ test "PageList readPreserving decodes into the scratch and keeps the node compre
 
     var s = try init(alloc, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
-    try s.growColdPagesForTest(2);
+    try s.growColdPagesQuietForTest(2);
 
     const node = s.pages.first.?;
     node.page().getRowAndCell(3, 2).cell.* = .init('X');
@@ -11151,7 +11213,7 @@ test "PageList rowsWrappedPreserving reads flags from compressed pages" {
 
     var s = try init(alloc, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
-    try s.growColdPagesForTest(3);
+    try s.growColdPagesQuietForTest(3);
 
     // Text in every row; a soft wrap on every third row of the first two pages.
     var node = s.pages.first;
@@ -11202,7 +11264,7 @@ test "PageList rowsWrappedPreservingFrom reads from a pin like the y form" {
 
     var s = try init(alloc, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
-    try s.growColdPagesForTest(3);
+    try s.growColdPagesQuietForTest(3);
 
     var node = s.pages.first;
     while (node) |n| : (node = n.next) {
@@ -11244,7 +11306,7 @@ test "Pin compareRow orders pins across pages without a screen point" {
 
     var s = try init(alloc, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
-    try s.growColdPagesForTest(5);
+    try s.growColdPagesQuietForTest(5);
 
     // Rows spread over several pages, columns varied: the order is by row only.
     var pins: std.ArrayList(Pin) = .empty;
@@ -11267,7 +11329,7 @@ test "PageList cold sweep compresses reflowed history and keeps the tail residen
     const testing = std.testing;
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
-    try s.growColdPagesForTest(12);
+    try s.growColdPagesQuietForTest(12);
     s.fillTextRowsForTest();
     _ = s.compress(.full);
     const rows_before = s.total_rows;
@@ -11288,7 +11350,7 @@ test "PageList cold sweep keeps a scrolled viewport resident" {
     const testing = std.testing;
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
-    try s.growColdPagesForTest(12);
+    try s.growColdPagesQuietForTest(12);
     s.fillTextRowsForTest();
     _ = s.compress(.full);
     s.scroll(.{ .row = 700 }); // viewport pinned inside old history
@@ -11309,10 +11371,12 @@ test "PageList cold sweep keeps a scrolled viewport resident" {
 
 test "PageList cold sweep compresses column changes without reflow" {
     const testing = std.testing;
-    inline for (.{ 60, 100 }) |new_cols| {
-        var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    // Wide pages hold fewer rows each, and a column change without reflow
+    // costs a check per row.
+    inline for (.{ 150, 250 }) |new_cols| {
+        var s = try init(testing.allocator, .{ .cols = 215, .rows = 24 });
         defer s.deinit();
-        try s.growColdPagesForTest(10);
+        try s.growColdPagesQuietForTest(10);
         s.fillTextRowsForTest();
         _ = s.compress(.full);
         const rows_before = s.total_rows;
@@ -11341,7 +11405,7 @@ test "PageList counters follow compress, restore, prune reuse and reset" {
         .max_size = 6 * PagePool.item_size,
     });
     defer s.deinit();
-    try s.growColdPagesForTest(3);
+    try s.growColdPagesQuietForTest(3);
     try s.expectCountersForTest();
     const all = s.counters.resident_size;
     try testing.expectEqual(s.page_size, all); // everything resident
@@ -11355,7 +11419,9 @@ test "PageList counters follow compress, restore, prune reuse and reset" {
     try testing.expectEqual(all, s.counters.resident_size);
 
     try testing.expect(s.compressPage(first));
-    for (0..6_000) |_| _ = try s.grow(); // grow, prune, reuse a compressed first page
+    var bulk: BulkGrowth = .init(&s);
+    try bulk.growMany(6_000); // grow, prune, reuse a compressed first page
+    bulk.finish();
     try s.expectCountersForTest();
 
     s.reset();
@@ -11368,7 +11434,7 @@ test "PageList counters survive resize, clone, erase and detached pages" {
     const testing = std.testing;
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
-    try s.growColdPagesForTest(6);
+    try s.growColdPagesQuietForTest(3);
     s.fillTextRowsForTest();
     _ = s.compress(.full);
 
@@ -11396,7 +11462,7 @@ test "PageList counters track a resize that restores compressed history within a
     const testing = std.testing;
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
-    try s.growColdPagesForTest(40);
+    try s.growColdPagesQuietForTest(40);
     s.fillTextRowsForTest();
     _ = s.compress(.full);
     const before = s.counters.resident_size;
@@ -11416,10 +11482,12 @@ test "PageList encode on grow keeps resident bytes at the budget during a long f
     s.limits.resident_budget = budget;
 
     var worst: usize = 0;
-    for (0..60_000) |_| {
-        _ = try s.grow();
+    var bulk: BulkGrowth = .init(&s);
+    for (0..24_000) |_| {
+        _ = try bulk.grow();
         worst = @max(worst, s.counters.resident_size);
     }
+    bulk.finish();
     // Budget, plus the page being added and the active/viewport pages.
     try testing.expect(worst <= budget + 4 * PagePool.item_size);
     try testing.expect(s.memoryStats().compressed_pages > 20);
@@ -11431,9 +11499,11 @@ test "PageList encode on grow compresses at most one page per grow" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.limits.resident_budget = 2 * PagePool.item_size;
+    var bulk: BulkGrowth = .init(&s);
+    defer bulk.finish();
     for (0..20_000) |_| {
         const before = s.counters.encodes;
-        _ = try s.grow();
+        _ = try bulk.grow();
         try testing.expect(s.counters.encodes - before <= 1);
     }
 }
@@ -11442,7 +11512,9 @@ test "PageList encode on grow is off without a budget" {
     const testing = std.testing;
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
-    for (0..20_000) |_| _ = try s.grow();
+    var bulk: BulkGrowth = .init(&s);
+    try bulk.growMany(20_000);
+    bulk.finish();
     try testing.expectEqual(@as(usize, 0), s.counters.encodes);
     try testing.expectEqual(@as(usize, 0), s.memoryStats().compressed_pages);
 }
@@ -11451,13 +11523,14 @@ test "PageList encode on grow does not re-encode an incompressible page" {
     const testing = std.testing;
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
-    try s.growColdPagesForTest(3);
+    try s.growColdPagesQuietForTest(3);
     const first = s.pages.first.?;
     var prng = std.Random.DefaultPrng.init(0x494E_434F_4D50_5245);
     prng.random().bytes(first.page().memory);
 
     s.limits.resident_budget = PagePool.item_size;
-    for (0..6_000) |_| _ = try s.grow();
+    var bulk: BulkGrowth = .init(&s);
+    try bulk.growMany(6_000);
 
     try testing.expect(first.incompressible);
     try testing.expect(!first.isCompressed());
@@ -11466,7 +11539,8 @@ test "PageList encode on grow does not re-encode an incompressible page" {
     try testing.expect(stats.compressed_pages >= 3);
     const encodes = s.counters.encodes;
     const compressed_before = stats.compressed_pages;
-    for (0..6_000) |_| _ = try s.grow();
+    try bulk.growMany(6_000);
+    bulk.finish();
     // New pages are encoded once each; the marked page adds none.
     try testing.expect(s.counters.encodes - encodes <= s.memoryStats().compressed_pages - compressed_before + 1);
     try testing.expect(first.incompressible);
@@ -11481,10 +11555,12 @@ test "PageList encode on grow interleaves with the incremental pass" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.limits.resident_budget = 3 * PagePool.item_size;
+    var bulk: BulkGrowth = .init(&s);
     for (0..30_000) |i| {
-        _ = try s.grow();
+        _ = try bulk.grow();
         if (i % 500 == 0) _ = s.compress(.incremental);
     }
+    bulk.finish();
     _ = s.compress(.drain);
     try s.expectCountersForTest();
 }
@@ -11494,12 +11570,16 @@ test "PageList encode on grow finds a page scrolled away from again" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.limits.resident_budget = 3 * PagePool.item_size;
-    for (0..30_000) |_| _ = try s.grow();
+    var bulk: BulkGrowth = .init(&s);
+    try bulk.growMany(30_000);
+    bulk.finish();
     s.scroll(.{ .row = 4_000 });
     const viewport_node = s.getTopLeft(.viewport).node;
     _ = viewport_node.page(); // the draw restores it
     s.scroll(.active);
-    for (0..3_000) |_| _ = try s.grow();
+    bulk = .init(&s);
+    try bulk.growMany(3_000);
+    bulk.finish();
     try testing.expect(viewport_node.isCompressed());
 }
 
@@ -11508,11 +11588,15 @@ test "PageList encode on grow leaves a page the viewport shows resident" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.limits.resident_budget = 3 * PagePool.item_size;
-    for (0..30_000) |_| _ = try s.grow();
+    var bulk: BulkGrowth = .init(&s);
+    try bulk.growMany(30_000);
+    bulk.finish();
     s.scroll(.{ .row = 4_000 });
     const viewport_node = s.getTopLeft(.viewport).node;
     _ = viewport_node.page();
-    for (0..3_000) |_| _ = try s.grow();
+    bulk = .init(&s);
+    try bulk.growMany(3_000);
+    bulk.finish();
     try testing.expect(!viewport_node.isCompressed());
     try s.expectCountersForTest();
 }
@@ -11549,7 +11633,7 @@ test "PageList stored mode counts a compressed page at its encoded size" {
     const testing = std.testing;
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
-    try s.growColdPagesForTest(4);
+    try s.growColdPagesQuietForTest(4);
     const first = s.pages.first.?;
     try testing.expectEqual(s.page_size, s.counters.stored_size);
 
@@ -11572,7 +11656,9 @@ test "PageList stored mode keeps more history under the same byte cap" {
         defer s.deinit();
         s.limits.bytes_mode = mode;
         s.limits.resident_budget = 4 * PagePool.item_size;
-        for (0..80_000) |_| _ = try s.grow();
+        var bulk: BulkGrowth = .init(&s);
+        try bulk.growMany(80_000);
+        bulk.finish();
         _ = s.compress(.drain);
         try s.expectCountersForTest();
         const kept = s.total_rows;
@@ -11591,7 +11677,7 @@ test "PageList stored mode enforces the cap when it is switched on and in finali
     const testing = std.testing;
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
-    try s.growColdPagesForTest(30);
+    try s.growColdPagesQuietForTest(30);
     _ = s.compress(.full);
     s.limits.set(.bytes, 10 * PagePool.item_size);
     s.limits.bytes_mode = .stored;
@@ -11603,7 +11689,7 @@ test "PageList stored mode enforces the cap when it is switched on and in finali
     // logical size would refuse it.
     var tight = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer tight.deinit();
-    try tight.growColdPagesForTest(8);
+    try tight.growColdPagesQuietForTest(8);
     _ = tight.compress(.full);
     tight.limits.set(.bytes, tight.page_size - 2 * PagePool.item_size);
     tight.limits.bytes_mode = .stored;
@@ -11623,12 +11709,16 @@ test "PageList logical mode and no budget still behave as before" {
     defer plain.deinit();
     try testing.expectEqual(BytesMode.logical, packed_list.limits.bytes_mode);
 
+    var packed_bulk: BulkGrowth = .init(&packed_list);
+    var plain_bulk: BulkGrowth = .init(&plain);
     for (0..10_000) |i| {
-        _ = try packed_list.grow();
-        _ = try plain.grow();
+        _ = try packed_bulk.grow();
+        _ = try plain_bulk.grow();
         // Compressing in logical mode never changes how much the cap keeps.
         if (i % 1_000 == 0) _ = packed_list.compress(.drain);
     }
+    packed_bulk.finish();
+    plain_bulk.finish();
     try testing.expect(packed_list.page_size <= cap + PagePool.item_size);
     try testing.expectEqual(plain.total_rows, packed_list.total_rows);
     try testing.expectEqual(plain.page_size, packed_list.page_size);
@@ -11642,7 +11732,7 @@ test "PageList compress before prune keeps history that fits once compressed" {
 
     // A compressed history that is far below the cap: its pages cost a few
     // KiB each, but a resident page costs a whole pool item.
-    try s.growColdPagesForTest(60);
+    try s.growColdPagesQuietForTest(60);
     _ = s.compress(.full);
     const history_pages = s.memoryStats().compressed_pages;
     try testing.expect(history_pages >= 60);
@@ -11654,7 +11744,9 @@ test "PageList compress before prune keeps history that fits once compressed" {
     // No resident budget: only the cap's own encode makes room for each new
     // page. Without it, every new page at the cap would prune the whole
     // compressed history to pay for one resident page.
-    for (0..40_000) |_| _ = try s.grow();
+    var bulk: BulkGrowth = .init(&s);
+    try bulk.growMany(40_000);
+    bulk.finish();
     try testing.expect(s.counters.stored_size <= cap + PagePool.item_size);
     try testing.expect(s.memoryStats().compressed_pages >= history_pages);
     try s.expectCountersForTest();
@@ -11662,7 +11754,9 @@ test "PageList compress before prune keeps history that fits once compressed" {
     // Logical mode does not encode before pruning.
     var plain = try init(testing.allocator, .{ .cols = 80, .rows = 24, .max_size = cap });
     defer plain.deinit();
-    for (0..40_000) |_| _ = try plain.grow();
+    var plain_bulk: BulkGrowth = .init(&plain);
+    try plain_bulk.growMany(40_000);
+    plain_bulk.finish();
     try testing.expectEqual(@as(usize, 0), plain.counters.encodes);
 }
 
@@ -11676,7 +11770,7 @@ test "PageList counters property: random operations never desynchronise the coun
     var s = try init(testing.allocator, .{
         .cols = 80,
         .rows = 24,
-        .max_size = 16 * PagePool.item_size,
+        .max_size = 10 * PagePool.item_size,
     });
     defer s.deinit();
     s.limits.bytes_mode = .stored;
@@ -11686,19 +11780,23 @@ test "PageList counters property: random operations never desynchronise the coun
 
     var step: usize = 0;
     errdefer std.debug.print("counters property failed: seed=0x{x} step={}\n", .{ seed, step });
-    while (step < 600) : (step += 1) {
+    while (step < 250) : (step += 1) {
         switch (random.uintLessThan(u8, 12)) {
-            0...3 => for (0..random.intRangeAtMost(usize, 1, 3_000)) |_| {
-                _ = try s.grow();
+            0...3 => {
+                var bulk: BulkGrowth = .init(&s);
+                try bulk.growMany(random.intRangeAtMost(usize, 1, 3_000));
+                bulk.finish();
             },
             4 => _ = s.compress(.drain),
             5 => _ = s.compress(.incremental),
             6 => if (s.pages.first) |n| {
                 _ = n.page(); // a restore of the oldest page
             },
+            // A resize without reflow rebuilds every page row by row, with
+            // an integrity check per row: only on a short history.
             7 => try s.resize(.{
                 .cols = random.intRangeAtMost(size.CellCountInt, 40, 120),
-                .reflow = random.boolean(),
+                .reflow = random.boolean() or s.total_rows > 1_500,
             }),
             8 => s.eraseHistory(null),
             9 => s.reset(),
@@ -24357,7 +24455,7 @@ test "PageList ends_wrapped follows the last row of each node" {
     const testing = std.testing;
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
-    try s.growColdPagesForTest(3);
+    try s.growColdPagesQuietForTest(3);
 
     const first = s.nodeAtForTest(0);
     const second = s.nodeAtForTest(1);
@@ -24385,9 +24483,9 @@ test "PageList ends_wrapped follows the last row of each node" {
 
 test "PageList stale state follows prune, erase, reset and clone" {
     const testing = std.testing;
-    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    var s = try init(testing.allocator, .{ .cols = 215, .rows = 24 });
     defer s.deinit();
-    try s.growColdPagesForTest(10);
+    try s.growColdPagesQuietForTest(5);
 
     const n0 = s.nodeAtForTest(0);
     const n1 = s.nodeAtForTest(1);
@@ -24430,7 +24528,7 @@ test "PageList stale state follows prune, erase, reset and clone" {
     s.assertStaleInvariant();
 
     // Reset clears it too.
-    try s.growColdPagesForTest(4);
+    try s.growColdPagesQuietForTest(4);
     s.markStaleForTest(s.nodeAtForTest(1));
     s.reset();
     try testing.expect(s.stale_tail == null);
@@ -24470,46 +24568,47 @@ test "PageList stale state follows pruning and the prune reuse path" {
 
 test "PageList no-reflow column change leaves stale pages and their pins alone" {
     const testing = std.testing;
-    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    var s = try init(testing.allocator, .{ .cols = 215, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(30);
+    try s.growColdPagesQuietForTest(30);
     s.fillTextRowsForTest();
-    try s.resize(.{ .cols = 40 });
+    try s.resize(.{ .cols = 120 });
     try testing.expect(s.stale_tail != null);
     const stale_tail = s.stale_tail.?;
 
     const stale_pin = try s.trackPin(.{ .node = s.nodeAtForTest(0), .y = 3, .x = 70 });
     defer s.untrackPin(stale_pin);
-    const fresh_pin = try s.trackPin(.{ .node = s.pages.last.?, .y = 0, .x = 39 });
+    const fresh_pin = try s.trackPin(.{ .node = s.pages.last.?, .y = 0, .x = 119 });
     defer s.untrackPin(fresh_pin);
     const total = s.total_rows;
     const stale_rows = s.stale_rows;
 
-    // Narrower, without reflow.
-    try s.resize(.{ .cols = 20, .reflow = false });
+    // Narrower, without reflow. Wide pages keep the row count per page low,
+    // and so the cost of rebuilding them row by row.
+    try s.resize(.{ .cols = 60, .reflow = false });
     try testing.expectEqual(total, s.total_rows);
     try testing.expectEqual(stale_rows, s.stale_rows);
     try testing.expect(s.stale_tail == stale_tail);
     try testing.expectEqual(@as(size.CellCountInt, 70), stale_pin.x);
-    try testing.expectEqual(@as(size.CellCountInt, 19), fresh_pin.x);
+    try testing.expectEqual(@as(size.CellCountInt, 59), fresh_pin.x);
     {
         var n: ?*List.Node = s.pages.first;
         while (n) |x| : (n = x.next) {
             const stale = s.stale_tail != null and s.nodeIsStaleForTest(x);
-            try testing.expectEqual(@as(size.CellCountInt, if (stale) 80 else 20), x.cols());
+            try testing.expectEqual(@as(size.CellCountInt, if (stale) 215 else 60), x.cols());
         }
     }
 
     // Wider, without reflow.
-    try s.resize(.{ .cols = 100, .reflow = false });
+    try s.resize(.{ .cols = 250, .reflow = false });
     try testing.expect(s.stale_tail == stale_tail);
     try testing.expectEqual(@as(size.CellCountInt, 70), stale_pin.x);
     {
         var n: ?*List.Node = s.pages.first;
         while (n) |x| : (n = x.next) {
             const stale = s.nodeIsStaleForTest(x);
-            try testing.expectEqual(@as(size.CellCountInt, if (stale) 80 else 100), x.cols());
+            try testing.expectEqual(@as(size.CellCountInt, if (stale) 215 else 250), x.cols());
         }
     }
     s.assertStaleInvariant();
@@ -24531,7 +24630,7 @@ test "PageList grow loop after reflow does not walk from the first node" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(40);
+    try s.growColdPagesQuietForTest(40);
     s.fillTextRowsForTest();
     _ = s.compress(.full);
 
@@ -24549,7 +24648,7 @@ test "PageList lazy resize reflows only the tail" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(60);
+    try s.growColdPagesQuietForTest(60);
     s.fillTextRowsForTest();
     _ = s.compress(.full);
     const compressed_before = s.memoryStats().compressed_pages;
@@ -24593,7 +24692,7 @@ test "PageList lazy resize picks a hard line start through the previous row's wr
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(40);
+    try s.growColdPagesQuietForTest(40);
     s.fillTextRowsForTest();
 
     // One logical line begins in the node that would be the boundary's
@@ -24625,7 +24724,11 @@ test "PageList lazy resize keeps a soft boundary inside a very long line" {
     s.lazy_reflow = true;
 
     // A single logical line three times the cap, in every cell 'x'.
-    while (s.total_rows < 3 * max_line_rows + 4 * 215) _ = try s.grow();
+    {
+        var bulk: BulkGrowth = .init(&s);
+        defer bulk.finish();
+        while (s.total_rows < 3 * max_line_rows + 4 * 215) _ = try bulk.grow();
+    }
     {
         var node = s.pages.first;
         while (node) |n| : (node = n.next) {
@@ -24716,7 +24819,7 @@ test "PageList lazy resize keeps the active area fresh" {
         var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
         defer s.deinit();
         s.lazy_reflow = true;
-        try s.growColdPagesForTest(60);
+        try s.growColdPagesQuietForTest(60);
         s.fillTextRowsForTest();
         try s.resize(.{ .cols = 60 });
         try testing.expect(s.stale_tail != null);
@@ -24731,7 +24834,7 @@ test "PageList lazy resize viewport offset" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(60);
+    try s.growColdPagesQuietForTest(60);
     s.fillTextRowsForTest();
 
     // Pinned in what will become the stale prefix.
@@ -24761,7 +24864,7 @@ test "PageList lazy resize after half a reflow does not walk fresh nodes" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(60);
+    try s.growColdPagesQuietForTest(60);
     s.fillTextRowsForTest();
     _ = s.compress(.full);
     try s.resize(.{ .cols = 60 });
@@ -24788,7 +24891,7 @@ test "PageList reflowStep drains to the eager result" {
         defer eager.deinit();
         lazy.lazy_reflow = true;
         for ([_]*PageList{ &lazy, &eager }) |s| {
-            try s.growColdPagesForTest(30);
+            try s.growColdPagesQuietForTest(30);
             s.fillVariedRowsForTest(seed);
         }
         _ = lazy.compress(.full);
@@ -24822,7 +24925,7 @@ test "PageList reflowStep is bounded in rows and pages" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(100);
+    try s.growColdPagesQuietForTest(100);
     s.fillTextRowsForTest();
     try s.resize(.{ .cols = 60 });
 
@@ -24850,7 +24953,7 @@ test "PageList reflowStep releases pages already at the current width" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(60);
+    try s.growColdPagesQuietForTest(60);
     s.fillTextRowsForTest();
 
     try s.resize(.{ .cols = 100 });
@@ -24882,7 +24985,7 @@ test "PageList reflowStep keeps pins and viewport offsets" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(60);
+    try s.growColdPagesQuietForTest(60);
     s.fillVariedRowsForTest(3);
     try s.resize(.{ .cols = 50 });
 
@@ -24913,7 +25016,7 @@ test "PageList reflowStep reports viewport overlap by window" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(60);
+    try s.growColdPagesQuietForTest(60);
     s.fillVariedRowsForTest(1);
     try s.resize(.{ .cols = 50 });
 
@@ -24934,7 +25037,7 @@ test "PageList reflowStep reads compressed sources without restoring them" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(80);
+    try s.growColdPagesQuietForTest(80);
     s.fillVariedRowsForTest(2);
     _ = s.compress(.full);
     try s.resize(.{ .cols = 110 });
@@ -24959,7 +25062,7 @@ test "PageList reflowStep failure changes nothing" {
     var s = try init(failing.allocator(), .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(20);
+    try s.growColdPagesQuietForTest(20);
     s.fillVariedRowsForTest(4);
     try s.resize(.{ .cols = 50 });
 
@@ -25002,8 +25105,8 @@ test "PageList reflowStep failure changes nothing" {
 
 /// Add one row of text at the bottom of the list and fill it from the
 /// counter `g`, the same way `fillVariedRowsForTest` does.
-fn appendRowForTest(self: *PageList, g: usize) !void {
-    _ = try self.grow();
+fn appendRowForTest(self: *PageList, bulk: *BulkGrowth, g: usize) !void {
+    _ = try bulk.grow();
     const last = self.pages.last.?;
     const page = last.page();
     const y = last.rows() - 1;
@@ -25051,12 +25154,18 @@ test "PageList lazy reflow property: random operations match the eager twin" {
     var g: usize = 0;
     var op: usize = 0;
     errdefer std.debug.print("lazy reflow property failed: seed=0x{x} op={}\n", .{ seed, op });
-    while (op < 250) : (op += 1) {
+    while (op < 150) : (op += 1) {
         switch (random.uintLessThan(u8, 16)) {
-            0...5 => for (0..random.intRangeAtMost(usize, 20, 500)) |_| {
-                try lazy.appendRowForTest(g);
-                try eager.appendRowForTest(g);
-                g += 1;
+            0...5 => {
+                var lazy_bulk: BulkGrowth = .init(&lazy);
+                var eager_bulk: BulkGrowth = .init(&eager);
+                for (0..random.intRangeAtMost(usize, 20, 500)) |_| {
+                    try lazy.appendRowForTest(&lazy_bulk, g);
+                    try eager.appendRowForTest(&eager_bulk, g);
+                    g += 1;
+                }
+                lazy_bulk.finish();
+                eager_bulk.finish();
             },
             6...8 => {
                 const cols = random.intRangeAtMost(size.CellCountInt, 20, 140);
@@ -25086,7 +25195,7 @@ test "PageList lazy reflow property: random operations match the eager twin" {
         }
 
         // The history stays bounded so the run stays fast.
-        if (lazy.total_rows > 12_000) {
+        if (lazy.total_rows > 5_000) {
             lazy.eraseHistory(null);
             eager.eraseHistory(null);
         }

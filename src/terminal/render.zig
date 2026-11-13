@@ -6124,7 +6124,9 @@ fn lazyStaleTerminalForTest(
     defer s.deinit();
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(alloc);
+    var bulk: PageList.BulkGrowth = .init(&t.screens.get(.primary).?.pages);
     for (0..12000) |n| {
+        if (n % 10 == 9) bulk.refresh();
         line.clearRetainingCapacity();
         try line.print(alloc, "{d:0>4}", .{n});
         try line.appendSlice(alloc, lead);
@@ -6133,6 +6135,7 @@ fn lazyStaleTerminalForTest(
         try line.appendSlice(alloc, "\r\n");
         s.nextSlice(line.items);
     }
+    bulk.finish();
     try t.resize(alloc, .{ .cols = to, .rows = 4 });
     try testing.expect(t.screens.active.pages.stale_tail != null);
     t.scrollViewport(.top);

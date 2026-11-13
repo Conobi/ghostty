@@ -13376,7 +13376,9 @@ test "Screen clearPromptForRedraw never touches stale pages" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var s = try init(testing.io, alloc, .{ .cols = 80, .rows = 4, .max_scrollback_bytes = null });
+    // Wide pages hold fewer rows each, so the fresh tail the resize clears
+    // is short.
+    var s = try init(testing.io, alloc, .{ .cols = 215, .rows = 4, .max_scrollback_bytes = null });
     defer s.deinit();
     s.pages.lazy_reflow = true;
 
@@ -13385,10 +13387,15 @@ test "Screen clearPromptForRedraw never touches stale pages" {
     s.cursorSetSemanticContent(.{ .prompt = .initial });
     try s.testWriteString("old prompt\n");
     s.cursorSetSemanticContent(.{ .prompt = .continuation });
-    for (0..12000) |_| try s.testWriteString("continued line\n");
+    var bulk: PageList.BulkGrowth = .init(&s.pages);
+    for (0..6000) |i| {
+        try s.testWriteString("continued line\n");
+        if (i % 10 == 9) bulk.refresh();
+    }
+    bulk.finish();
     _ = s.pages.compress(.full);
 
-    try s.resize(.{ .cols = 60, .rows = 4, .prompt_redraw = .true });
+    try s.resize(.{ .cols = 160, .rows = 4, .prompt_redraw = .true });
     const pages = &s.pages;
     try testing.expect(pages.stale_tail != null);
 

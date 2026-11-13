@@ -19929,10 +19929,13 @@ test "Terminal: reflowStep marks the screen dirty when the viewport overlaps" {
     var s = t.vtStream();
     defer s.deinit();
     const fill: [70]u8 = @splat('x');
+    var bulk: PageList.BulkGrowth = .init(&t.screens.get(.primary).?.pages);
     for (0..12000) |n| {
         var buf: [96]u8 = undefined;
         s.nextSlice(std.fmt.bufPrint(&buf, "{d:0>4} {s}\r\n", .{ n, &fill }) catch unreachable);
+        if (n % 10 == 9) bulk.refresh();
     }
+    bulk.finish();
     try t.resize(alloc, .{ .cols = 50, .rows = 4 });
     const primary = t.screens.get(.primary).?;
     try testing.expect(primary.pages.stale_tail != null);

@@ -3537,7 +3537,12 @@ test "scrollback bytes mode and resident budget options" {
     try testing.expectEqual(Result.success, set(t, .scrollback_resident_budget, &budget));
 
     const line = "stored and compressible terminal history line\r\n";
-    for (0..60_000) |_| vt_write(t, line.ptr, line.len);
+    var bulk: PageList.BulkGrowth = .init(&t.?.terminal.screens.get(.primary).?.pages);
+    for (0..60_000) |i| {
+        vt_write(t, line.ptr, line.len);
+        if (i % 10 == 9) bulk.refresh();
+    }
+    bulk.finish();
 
     var stored: usize = 0;
     try testing.expectEqual(Result.success, get(t, .scrollback_stored_bytes, @ptrCast(&stored)));
@@ -8547,7 +8552,12 @@ test "lazy reflow option, state and step" {
     try testing.expect(!state.viewport_stale);
 
     const line = "a line of history that reflows when the width changes\r\n";
-    for (0..30_000) |_| vt_write(t, line.ptr, line.len);
+    var bulk: PageList.BulkGrowth = .init(&t.?.terminal.screens.get(.primary).?.pages);
+    for (0..30_000) |i| {
+        vt_write(t, line.ptr, line.len);
+        if (i % 10 == 9) bulk.refresh();
+    }
+    bulk.finish();
     const before = state.layout_generation;
     try testing.expectEqual(Result.success, resize(t, 40, 24, 8, 16));
     try testing.expectEqual(Result.success, get(t, .reflow_state, @ptrCast(&state)));
