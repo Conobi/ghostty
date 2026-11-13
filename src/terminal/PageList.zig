@@ -179,6 +179,11 @@ const Node = struct {
     /// restored, reused, created or has its layout invalidated.
     incompressible: bool = false,
 
+    /// The `wrap` flag of the page's last row, remembered while the node is
+    /// compressed so the lazy reflow boundary can be tested without decoding
+    /// it. Meaningless while resident: `endsWrapped` reads the page then.
+    ends_wrapped: bool = false,
+
     /// The physical representation of the page contents.
     ///
     /// Both states retain the same `Page.memory` virtual mapping and the same
@@ -375,6 +380,19 @@ const Node = struct {
         return self.metadata().size.cols;
     }
 
+    /// Whether the last row continues on the next node, without decoding a
+    /// compressed page.
+    pub fn endsWrapped(self: *const Node) bool {
+        return switch (self.data) {
+            .resident => |*page_| wrap: {
+                const n = page_.size.rows;
+                if (n == 0) break :wrap false;
+                break :wrap page_.rows.ptr(page_.memory)[n - 1].wrap;
+            },
+            .compressed => self.ends_wrapped,
+        };
+    }
+
     /// Return the page capacity without accessing page memory.
     pub inline fn capacity(self: *const Node) Capacity {
         return self.metadata().capacity;
@@ -497,6 +515,15 @@ else untouched: {
         .fromByteUnits(std.heap.page_size_min),
     );
 };
+
+/// A logical line longer than this many rows stops the search for a hard
+/// line start, so a resize or a step never holds the lock for a whole huge
+/// line; the boundary then sits inside the line (soft).
+pub const max_line_rows: usize = 8192;
+
+/// The youngest nodes a lazy resize always reflows, so the part of the
+/// history a user is most likely to look at is right at once.
+pub const fresh_tail_pages: usize = 8;
 
 /// List of pins, known as "tracked" pins. These are pins that are kept
 /// up to date automatically through page-modifying operations.
@@ -661,6 +688,43 @@ viewport_pin_row_offset: ?usize,
 cols: size.CellCountInt,
 rows: size.CellCountInt,
 
+/// Reflow only the tail on a column resize and leave older pages at their
+/// width for `reflowStep` (see `stale_tail`). Off reproduces upstream's
+/// eager reflow exactly: no stale part ever exists.
+lazy_reflow: bool = false,
+
+/// The youngest node of the stale prefix: every node from the first up to
+/// and including this one may have a width other than `cols`, and the nodes
+/// after it all have exactly `cols`. Null when there is no stale part.
+///
+/// Staleness is positional, so a resize after partial progress does work
+/// proportional to the tail, not to the history. Rows above `stale_rows`
+/// are only written by `reflowStep`, pruning and erasing; the active area
+/// is always in the fresh part.
+stale_tail: ?*List.Node = null,
+
+/// Rows in the stale prefix; zero exactly when `stale_tail` is null.
+stale_rows: usize = 0,
+
+/// True when the boundary falls inside a logical line longer than
+/// `max_line_rows`, so the row before it has `wrap` set. Otherwise the
+/// boundary is a hard line start.
+stale_soft: bool = false,
+
+/// Bumped by every column or row resize and every `reflowStep` that changes
+/// the row count; equal values mean the rows below the boundary kept their
+/// order and content.
+layout_generation: u64 = 0,
+
+/// Bumped by every resize (the rows were laid out again, not just extended
+/// above the boundary).
+resize_generation: u64 = 0,
+
+/// Nodes visited by the lazy resize and step paths, for tests that bound
+/// their cost.
+test_visits: if (builtin.is_test) usize else void =
+    if (builtin.is_test) 0 else {},
+
 /// If this is true then verifyIntegrity will do nothing. This is
 /// only present with runtime safety enabled.
 pause_integrity_checks: if (build_options.slow_runtime_safety) usize else void =
@@ -773,6 +837,10 @@ pub const Options = struct {
     ///
     /// Null is unlimited.
     max_lines: ?usize = null,
+
+    /// Reflow only the tail on a column resize and leave the older history
+    /// to `reflowStep`. Off is upstream's eager reflow.
+    lazy_reflow: bool = false,
 };
 
 /// Initialize the page. The top of the first page in the list is always the
@@ -847,6 +915,7 @@ pub fn init(
     const result: PageList = .{
         .cols = cols,
         .rows = rows,
+        .lazy_reflow = opts.lazy_reflow,
         .pool = pool,
         .counters = counters,
         .pages = page_list,
@@ -994,6 +1063,7 @@ const IntegrityError = error{
     TrackedPinInvalid,
     ViewportPinOffsetMismatch,
     ViewportPinInsufficientRows,
+    StaleStateInvalid,
 };
 
 /// Verify the integrity of the PageList. This is expensive and should
@@ -1053,6 +1123,8 @@ fn verifyIntegrity(self: *const PageList) IntegrityError!void {
         if (!self.pinIsValid(p.*)) return error.TrackedPinInvalid;
     }
 
+    try self.verifyStale(false);
+
     if (self.viewport == .pin) {
         // Verify that our viewport pin row offset is correct.
         const actual_offset: usize = offset: {
@@ -1093,6 +1165,70 @@ fn verifyIntegrity(self: *const PageList) IntegrityError!void {
             return error.ViewportPinInsufficientRows;
         }
     }
+}
+
+/// Checks the lazy reflow boundary against the nodes: the stale prefix has
+/// exactly `stale_rows` rows, every later node has the list's width, and a
+/// boundary inside a line is marked soft. O(pages).
+///
+/// `check_active` also requires the first active row to be in the fresh
+/// part. A resize passes through states where that does not yet hold, so
+/// only callers that know it settled ask for it.
+fn verifyStale(self: *const PageList, comptime check_active: bool) IntegrityError!void {
+    if (comptime !build_options.slow_runtime_safety) return;
+
+    const tail = self.stale_tail orelse {
+        if (self.stale_rows != 0 or self.stale_soft) {
+            log.warn("PageList integrity violation: stale rows without a boundary", .{});
+            return error.StaleStateInvalid;
+        }
+        return;
+    };
+
+    var rows: usize = 0;
+    var node_ = self.pages.first;
+    while (node_) |node| : (node_ = node.next) {
+        rows += node.rows();
+        if (node == tail) break;
+    } else {
+        log.warn("PageList integrity violation: stale tail not in list", .{});
+        return error.StaleStateInvalid;
+    }
+    if (rows != self.stale_rows) {
+        log.warn(
+            "PageList integrity violation: stale_rows mismatch cached={} actual={}",
+            .{ self.stale_rows, rows },
+        );
+        return error.StaleStateInvalid;
+    }
+
+    var fresh = tail.next;
+    while (fresh) |node| : (fresh = node.next) {
+        if (node.cols() != self.cols) {
+            log.warn(
+                "PageList integrity violation: fresh page of width {} in a list of {}",
+                .{ node.cols(), self.cols },
+            );
+            return error.StaleStateInvalid;
+        }
+    }
+
+    if (tail.endsWrapped() and !self.stale_soft) {
+        log.warn("PageList integrity violation: boundary inside a line is not soft", .{});
+        return error.StaleStateInvalid;
+    }
+
+    if (check_active and self.total_rows - self.rows < self.stale_rows) {
+        log.warn("PageList integrity violation: active area reaches the stale prefix", .{});
+        return error.StaleStateInvalid;
+    }
+}
+
+/// Panics unless the lazy reflow boundary is consistent and the active area
+/// is fully reflowed. O(pages); a no-op without slow runtime safety.
+pub fn assertStaleInvariant(self: *const PageList) void {
+    if (comptime !build_options.slow_runtime_safety) return;
+    self.verifyStale(true) catch @panic("PageList stale invariant failed");
 }
 
 /// Fails unless the cached byte counters equal a recount from the nodes.
@@ -1259,6 +1395,11 @@ pub fn reset(self: *PageList) void {
     // Our total rows always goes back to the default
     self.total_rows = self.rows;
 
+    // Every page is fresh again, and every earlier layout is gone.
+    self.clearStale();
+    self.layout_generation += 1;
+    self.resize_generation += 1;
+
     // The pages the hints were measured from are gone.
     self.grow_hints = @splat(null);
     self.grow_hint_next = 0;
@@ -1354,6 +1495,11 @@ pub fn clone(
     var page_serial: u64 = 0;
     var total_rows: usize = 0;
     var page_size: usize = 0;
+
+    // The cloned nodes up to the one that copies the stale tail are stale.
+    var stale_tail: ?*List.Node = null;
+    var stale_rows: usize = 0;
+    var past_tail = self.stale_tail == null;
     while (it.next()) |chunk| {
         // Clone the page. We have to use createPageExt here because
         // we don't know if the source page has a standard size.
@@ -1384,6 +1530,11 @@ pub fn clone(
         dst_page.dirty = src_page.dirty;
 
         total_rows += node.rows();
+        if (!past_tail) {
+            stale_tail = node;
+            stale_rows += node.rows();
+            past_tail = chunk.node == self.stale_tail.?;
+        }
 
         // Remap our tracked pins by changing the page and
         // offsetting the Y position based on the chunk start.
@@ -1418,6 +1569,12 @@ pub fn clone(
         .limits = self.limits,
         .cols = self.cols,
         .rows = self.rows,
+        .lazy_reflow = self.lazy_reflow,
+        .stale_tail = stale_tail,
+        .stale_rows = stale_rows,
+        .stale_soft = if (stale_tail) |t| t.endsWrapped() else false,
+        .layout_generation = self.layout_generation,
+        .resize_generation = self.resize_generation,
         .total_rows = total_rows,
         .tracked_pins = tracked_pins,
         .viewport = .{ .active = {} },
@@ -3970,6 +4127,7 @@ pub fn compact(self: *PageList, node: *List.Node) Allocator.Error!?*List.Node {
 
     // Insert the new page and destroy the old one
     self.pages.insertBefore(node, new_node);
+    self.staleNodeReplaced(node, new_node);
     self.pages.remove(node);
     self.destroyNode(node);
     self.page_compression.markActivity();
@@ -4070,6 +4228,10 @@ pub fn split(
     page.size.rows -= y_end - y_start;
 
     self.pages.insertAfter(original_node, target);
+
+    // Both halves keep the original's width, so a split stale tail still
+    // ends the stale prefix at its new second half.
+    if (self.stale_tail == original_node) self.stale_tail = target;
 }
 
 /// This represents the state necessary to render a scrollbar for this
@@ -4337,6 +4499,8 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
             self.total_rows += first.rows();
             break :prune;
         }
+
+        self.staleHeadRemoved(first);
 
         // If we have a pin viewport cache then we need to update it.
         if (self.viewport == .pin) viewport: {
@@ -5155,6 +5319,7 @@ pub fn increaseCapacity(
 
     // Insert this page and destroy the old page
     self.pages.insertBefore(node, new_node);
+    self.staleNodeReplaced(node, new_node);
     self.pages.remove(node);
     self.destroyNode(node);
     self.page_compression.markActivity();
@@ -5302,6 +5467,16 @@ pub const PageAllocation = struct {
         // quantity affected by inserting rows above the existing first page.
         errdefer comptime unreachable;
         destination.pages.prepend(node);
+
+        // Older history joins the stale prefix; a page of another width starts
+        // one in a list that reflows lazily.
+        if (destination.stale_tail != null) {
+            destination.stale_rows += node.rows();
+        } else if (destination.lazy_reflow and node.cols() != destination.cols) {
+            destination.stale_tail = node;
+            destination.stale_rows = node.rows();
+            destination.stale_soft = node.endsWrapped();
+        }
         node.counters = destination.counters;
         destination.counters.attach(node);
         destination.counters.resetScan();
@@ -5959,6 +6134,7 @@ fn compressPageOutcome(self: *PageList, node: *List.Node) CompressOutcome {
     if (node.isCompressed()) return .failed;
 
     const page = node.page();
+    const ends_wrapped = node.endsWrapped();
 
     // The scratch size is capped just below the representation's break-even
     // point. Codec limits and pages too small to cover the compressed-state
@@ -6043,9 +6219,34 @@ fn compressPageOutcome(self: *PageList, node: *List.Node) CompressOutcome {
 
     // Publish the new state only after both the encoded allocation and the
     // retained-mapping decommit have succeeded.
+    node.ends_wrapped = ends_wrapped;
     node.data = .{ .compressed = compressed };
     if (node.counters) |c| c.compressed(node);
     return .compressed;
+}
+
+/// Forget the stale prefix: every node is at the list's width again.
+fn clearStale(self: *PageList) void {
+    self.stale_tail = null;
+    self.stale_rows = 0;
+    self.stale_soft = false;
+}
+
+/// The first node, which is being removed from the list, leaves the stale
+/// prefix. Call before the node's row count changes.
+fn staleHeadRemoved(self: *PageList, node: *List.Node) void {
+    const tail = self.stale_tail orelse return;
+    if (tail == node) {
+        self.clearStale();
+    } else {
+        self.stale_rows -= node.rows();
+    }
+}
+
+/// A node was replaced by another holding the same rows (compaction, more
+/// capacity); keep the boundary on the replacement.
+fn staleNodeReplaced(self: *PageList, old: *List.Node, new: *List.Node) void {
+    if (self.stale_tail == old) self.stale_tail = new;
 }
 
 /// Destroy the memory of the given node in the PageList linked list
@@ -6669,7 +6870,10 @@ fn eraseRows(
             }
         }
 
-        // Our new size is the amount we scrolled
+        // Our new size is the amount we scrolled. Erased history starts at
+        // the first node, which is stale exactly when a stale prefix exists;
+        // erased active rows are always fresh.
+        if (discard and self.stale_tail != null) self.stale_rows -= chunk.end;
         page.size.rows = @intCast(scroll_amount);
         erased += chunk.end;
     }
@@ -6721,6 +6925,9 @@ fn erasePage(self: *PageList, node: *List.Node) void {
         // This doesn't get marked garbage because the tracked pin
         // movement is sensical.
     }
+
+    // The stale prefix only ever loses its head.
+    if (node.prev == null) self.staleHeadRemoved(node);
 
     // Remove the page from the linked list
     self.pages.remove(node);
@@ -23459,3 +23666,160 @@ test "PageList grow shrinks a mostly unused capacity to its headroom" {
     try testing.expect(next.string_bytes > standard.string_bytes and
         next.string_bytes < 16 * standard.string_bytes);
 }
+
+// ---------------------------------------------------------------------------
+// Lazy reflow
+
+/// Declare the nodes up to `node` stale without changing any width, so tests
+/// can exercise the bookkeeping on its own.
+fn markStaleForTest(self: *PageList, node: *List.Node) void {
+    var rows: usize = 0;
+    var n = self.pages.first;
+    while (n) |x| : (n = x.next) {
+        rows += x.rows();
+        if (x == node) break;
+    }
+    self.stale_tail = node;
+    self.stale_rows = rows;
+    self.stale_soft = node.endsWrapped();
+}
+
+/// The `idx`th node, counting from the first.
+fn nodeAtForTest(self: *const PageList, idx: usize) *List.Node {
+    var n = self.pages.first.?;
+    for (0..idx) |_| n = n.next.?;
+    return n;
+}
+
+fn nodeCountForTest(self: *const PageList) usize {
+    var count: usize = 0;
+    var n = self.pages.first;
+    while (n) |x| : (n = x.next) count += 1;
+    return count;
+}
+
+test "PageList lazy state starts empty and the invariant holds" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try testing.expect(s.stale_tail == null);
+    try testing.expectEqual(@as(usize, 0), s.stale_rows);
+    try testing.expect(!s.lazy_reflow);
+    s.assertStaleInvariant();
+}
+
+test "PageList ends_wrapped follows the last row of each node" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try s.growColdPagesForTest(3);
+
+    const first = s.nodeAtForTest(0);
+    const second = s.nodeAtForTest(1);
+    {
+        const page = first.page();
+        page.rows.ptr(page.memory)[first.rows() - 1].wrap = true;
+        page.getRowAndCell(0, 0).cell.* = .init('x');
+    }
+    {
+        const page = second.page();
+        page.rows.ptr(page.memory)[second.rows() - 1].wrap = false;
+        page.getRowAndCell(0, 0).cell.* = .init('y');
+    }
+    try testing.expect(first.endsWrapped());
+    try testing.expect(!second.endsWrapped());
+
+    try testing.expect(s.compressPage(first));
+    try testing.expect(s.compressPage(second));
+    try testing.expect(first.isCompressed() and second.isCompressed());
+    try testing.expect(first.endsWrapped());
+    try testing.expect(!second.endsWrapped());
+    // Nothing was decoded to answer.
+    try testing.expect(first.isCompressed() and second.isCompressed());
+}
+
+test "PageList stale state follows prune, erase, reset and clone" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try s.growColdPagesForTest(10);
+
+    const n0 = s.nodeAtForTest(0);
+    const n1 = s.nodeAtForTest(1);
+    const n2 = s.nodeAtForTest(2);
+    const n3 = s.nodeAtForTest(3);
+    s.markStaleForTest(n3);
+    s.assertStaleInvariant();
+    try testing.expectEqual(
+        n0.rows() + n1.rows() + n2.rows() + n3.rows(),
+        s.stale_rows,
+    );
+
+    // A clone copies the boundary onto its own nodes.
+    {
+        var copy = try s.clone(testing.allocator, .{ .top = .{ .screen = .{} } });
+        defer copy.deinit();
+        try testing.expect(copy.stale_tail != null);
+        try testing.expectEqual(s.stale_rows, copy.stale_rows);
+        try testing.expect(copy.stale_tail == copy.nodeAtForTest(3));
+        copy.assertIntegrity();
+    }
+
+    // Erasing the two oldest pages drops their rows from the prefix.
+    s.eraseHistory(.{ .history = .{ .y = @intCast(n0.rows() + n1.rows() - 1) } });
+    try testing.expect(s.stale_tail == n3);
+    try testing.expectEqual(n2.rows() + n3.rows(), s.stale_rows);
+    s.assertStaleInvariant();
+
+    // Erasing into the tail page leaves what remains of it.
+    const keep: usize = 5;
+    s.eraseHistory(.{ .history = .{ .y = @intCast(n2.rows() + n3.rows() - keep - 1) } });
+    try testing.expect(s.stale_tail == n3);
+    try testing.expectEqual(keep, s.stale_rows);
+    s.assertStaleInvariant();
+
+    // Erasing through the tail ends the stale part.
+    s.eraseHistory(null);
+    try testing.expect(s.stale_tail == null);
+    try testing.expectEqual(@as(usize, 0), s.stale_rows);
+    s.assertStaleInvariant();
+
+    // Reset clears it too.
+    try s.growColdPagesForTest(4);
+    s.markStaleForTest(s.nodeAtForTest(1));
+    s.reset();
+    try testing.expect(s.stale_tail == null);
+    try testing.expectEqual(@as(usize, 0), s.stale_rows);
+}
+
+test "PageList stale state follows pruning and the prune reuse path" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .max_size = 4 * PagePool.item_size,
+    });
+    defer s.deinit();
+
+    // Fill until the limit starts pruning, then declare the oldest two pages
+    // stale. The head is pruned (and its page reused as the new tail) one
+    // page at a time: the boundary follows and finally goes away.
+    while (s.nodeCountForTest() < 4) _ = try s.grow();
+    const second = s.nodeAtForTest(1);
+    s.markStaleForTest(second);
+    const total_before = s.stale_rows;
+    var pruned_one = false;
+    var guard: usize = 0;
+    while (s.stale_tail != null) : (guard += 1) {
+        try testing.expect(guard < 100_000);
+        const before = s.stale_rows;
+        _ = try s.grow();
+        if (s.stale_tail != null and s.stale_rows < before) pruned_one = true;
+        s.assertIntegrity();
+    }
+    try testing.expect(pruned_one);
+    try testing.expect(total_before > 0);
+    try testing.expectEqual(@as(usize, 0), s.stale_rows);
+    s.assertStaleInvariant();
+}
+

@@ -560,6 +560,16 @@ pub fn setScrollbackResidentBudget(self: *Terminal, budget: ?usize) void {
     self.screens.get(.primary).?.pages.limits.resident_budget = budget;
 }
 
+/// Choose how the primary screen reflows history on a column resize.
+///
+/// On, a resize reflows only the tail of the history and `reflowStep` reflows
+/// the rest later, so the resize costs the same whatever the history size.
+/// Off (the default) reflows everything at once, as upstream does. Turning it
+/// off with a stale part left only changes the next resize.
+pub fn setLazyReflow(self: *Terminal, on: bool) void {
+    self.screens.get(.primary).?.pages.lazy_reflow = on;
+}
+
 /// Change the primary screen's maximum number of physical scrollback lines.
 ///
 /// Null removes the line limit. The alternate screen is intentionally
