@@ -2484,7 +2484,11 @@ fn clearPromptForRedraw(
             },
 
             .true => {
-                const start = start: {
+                // Pages above the lazy reflow boundary are never touched, so
+                // the search for the prompt start stops at the first fresh row.
+                const start = if (self.pages.firstFreshPin()) |fresh|
+                    promptStartIn(self.cursor.page_pin.*, fresh)
+                else start: {
                     var it = self.cursor.page_pin.promptIterator(
                         .left_up,
                         null,
@@ -2510,6 +2514,24 @@ fn clearPromptForRedraw(
                 }
             },
         }
+    }
+}
+
+/// The first row of the prompt the row of `cursor` belongs to, as
+/// `PromptIterator` finds it, but never above `fresh`: a prompt that starts in
+/// stale history is cleared from its first fresh row.
+fn promptStartIn(cursor: PageList.Pin, fresh: PageList.Pin) PageList.Pin {
+    var current = cursor;
+    current.x = 0;
+    var run_top: ?PageList.Pin = null;
+    while (true) {
+        switch (current.rowAndCell().row.semantic_prompt) {
+            .prompt => return current,
+            .prompt_continuation => run_top = current,
+            .none => if (run_top) |top| return top,
+        }
+        if (current.node == fresh.node and current.y == fresh.y) return current;
+        current = current.up(1) orelse return current;
     }
 }
 
@@ -13348,4 +13370,50 @@ fn testInitHistory() !Screen {
     errdefer s.deinit();
     try s.testWriteString("A\nB\nC\n1\n2\n3\n4\n5\n6");
     return s;
+}
+
+test "Screen clearPromptForRedraw never touches stale pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(testing.io, alloc, .{ .cols = 80, .rows = 4, .max_scrollback_bytes = null });
+    defer s.deinit();
+    s.pages.lazy_reflow = true;
+
+    // A long prompt: its first row is far up in history, every other row a
+    // continuation, and the cursor sits at its end.
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("old prompt\n");
+    s.cursorSetSemanticContent(.{ .prompt = .continuation });
+    for (0..12000) |_| try s.testWriteString("continued line\n");
+    _ = s.pages.compress(.full);
+
+    try s.resize(.{ .cols = 60, .rows = 4, .prompt_redraw = .true });
+    const pages = &s.pages;
+    try testing.expect(pages.stale_tail != null);
+
+    // No stale page was decoded or touched.
+    var node = pages.pages.first;
+    while (node) |n| : (node = n.next) {
+        try testing.expect(n.storage() == .compressed);
+        if (n == pages.stale_tail.?) break;
+    }
+
+    const text = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(text);
+    const stale_rows = pages.stale_rows;
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(alloc);
+    try expected.appendSlice(alloc, "old prompt\n");
+    for (1..stale_rows) |_| try expected.appendSlice(alloc, "continued line\n");
+    // The text of the stale rows is untouched (the last row's newline is
+    // trimmed along with the cleared rows after it).
+    const stale_text = expected.items[0 .. expected.items.len - 1];
+    try testing.expect(std.mem.startsWith(u8, text, stale_text));
+
+    // The fresh rows of the prompt were cleared.
+    try testing.expectEqual(
+        @as(usize, 0),
+        std.mem.trim(u8, text[stale_text.len..], "\n ").len,
+    );
 }

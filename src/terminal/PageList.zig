@@ -1649,6 +1649,8 @@ pub const Resize = struct {
 /// TODO: docs
 pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     defer self.assertIntegrity();
+    self.layout_generation +%= 1;
+    self.resize_generation +%= 1;
 
     // Resizing forces all nodes to be decompressed today so we need to
     // reschedule compression.
@@ -1670,10 +1672,19 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     // become invalid. Rather than do something fancy like we do other
     // places and try to update it in place, we just invalidate it because
     // its too easy to get the logic wrong in here.
-    self.viewport_pin_row_offset = null;
+    //
+    // A lazy list keeps it instead: recomputing it walks from the end of
+    // the list to the pin, which is the whole stale history for a viewport
+    // scrolled up. The paths below update it where rows above the pin move.
+    if (self.lazy_reflow and self.viewport == .pin) {
+        _ = self.viewportRowOffset();
+    } else {
+        self.viewport_pin_row_offset = null;
+    }
 
     if (!opts.reflow) {
         try self.resizeWithoutReflow(opts);
+        try self.completeActiveArea();
         // Shrinking the active row count turns former active rows into
         // scrollback even without reflow, which can cross the line limit.
         self.limits.enforce(self, .lines);
@@ -1725,10 +1736,15 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
         .active, .top => {},
     }
 
+    // Rows pulled out of scrollback, or a widening that collapsed the tail,
+    // can leave the first active row in the stale prefix; reflow it now.
+    try self.completeActiveArea();
+
     // Column reflow can change the physical history row count, and a row
     // resize can move the active boundary. Both may expose whole old pages
     // that are now eligible for line-limit pruning.
     self.limits.enforce(self, .lines);
+    self.assertStaleInvariant();
 }
 
 /// Resize the pagelist with reflow by adding or removing columns.
@@ -1805,6 +1821,10 @@ fn resizeCols(
         if (c.untrack) self.untrackPin(c.tracked_pin);
     };
 
+    // A lazy list reflows only its tail; null means the whole list.
+    const tail: ?LazyTail = if (self.lazy_reflow) self.lazyTail() else null;
+    const prefix_rows: usize = if (tail) |t| t.prefix_rows else 0;
+
     // Update our cols. We have to do this early because grow() that we
     // may call below relies on this to calculate the proper page size, but
     // after preserved_cursor so that the cursor pin can resolve coordinates in
@@ -1813,20 +1833,21 @@ fn resizeCols(
 
     // Create the first node that contains our reflow.
     const first_rewritten_node = node: {
-        const page = self.pages.first.?.page();
-        const cap = page.capacity.adjust(
+        const src = if (tail) |t| t.k else self.pages.first.?;
+        const src_cap = src.capacity();
+        const cap = src_cap.adjust(
             .{ .cols = cols },
         ) catch |err| err: {
             comptime assert(@TypeOf(err) == error{OutOfMemory});
 
             // We verify all maxed out page layouts work.
-            var cap = page.capacity;
+            var cap = src_cap;
             cap.cols = cols;
 
             // We're growing columns so we can only get less rows so use
             // the lesser of our capacity and size so we minimize wasted
             // rows.
-            cap.rows = @min(page.size.rows, cap.rows);
+            cap.rows = @min(src.rows(), cap.rows);
             break :err cap;
         };
 
@@ -1837,12 +1858,34 @@ fn resizeCols(
 
     // We need to grab our rowIterator now before we rewrite our
     // linked list below.
-    var it = self.rowIterator(
-        .right_down,
-        .{ .screen = .{} },
-        null,
-    );
+    var it = if (tail) |t|
+        (Pin{ .node = t.k }).rowIterator(.right_down, self.getBottomRight(.screen).?)
+    else
+        self.rowIterator(
+            .right_down,
+            .{ .screen = .{} },
+            null,
+        );
+
+    // The node before the reflowed tail stays and ends the stale prefix.
+    const stale_prev: ?*List.Node = if (tail) |t| t.k.prev else null;
+
+    // Rows above the viewport pin only change if the pin is in the tail.
+    const pin_in_tail = tail != null and self.viewport == .pin and
+        (self.viewport_pin_row_offset orelse 0) >= prefix_rows;
+
+    // The rows the reflow has produced so far, for the error path.
+    var reflowed_rows: usize = 0;
     errdefer {
+        // The list stays valid: the untouched prefix, then what was written.
+        if (tail != null) {
+            self.stale_tail = stale_prev;
+            self.stale_rows = prefix_rows;
+            self.stale_soft = if (stale_prev) |p| p.endsWrapped() else false;
+            self.total_rows = prefix_rows + reflowed_rows;
+            self.viewport_pin_row_offset = null;
+        }
+
         // If an error occurs, we're in a pretty disastrous broken state,
         // but we should still try to clean up our leaked memory. Free
         // any of the remaining orphaned pages from before. If we reflowed
@@ -1864,19 +1907,35 @@ fn resizeCols(
 
     // Set our new page as the only page. This orphans the existing pages
     // in the list, but that's fine since we're gonna delete them anyway.
-    self.pages.first = first_rewritten_node;
-    self.pages.last = first_rewritten_node;
+    // A lazy resize keeps the prefix and puts the new page after it.
+    if (stale_prev) |prev| {
+        prev.next = null;
+        self.pages.last = prev;
+        self.pages.append(first_rewritten_node);
+    } else {
+        self.pages.first = first_rewritten_node;
+        self.pages.last = first_rewritten_node;
+    }
 
     // Reflow all our rows.
     {
-        var sweep: ColdSweep = .{ .threshold = @max(self.rows, opts.rows orelse self.rows) };
+        var sweep: ColdSweep = .{
+            .threshold = @max(self.rows, opts.rows orelse self.rows),
+            .next = if (tail != null) first_rewritten_node else null,
+            .rows_before = prefix_rows,
+        };
         var reflow_cursor: ReflowCursor = .init(first_rewritten_node);
+        // A tail that starts inside a line continues the row before it.
+        if (stale_prev) |prev| if (prev.endsWrapped()) {
+            reflow_cursor.page_row.wrap_continuation = true;
+        };
         while (it.next()) |row| {
             try reflow_cursor.reflowRow(
                 self,
                 row,
                 if (preserved_cursor) |c| c.tracked_pin else null,
             );
+            if (row.y == 0) self.visit();
 
             // Once we're done reflowing a page, we're done with it, so
             // make it available for reuse (or destroy it). Making it
@@ -1895,24 +1954,39 @@ fn resizeCols(
                 self.recycle_node = row.node;
             }
 
-            sweep.advance(self, reflow_cursor.node, reflow_cursor.total_rows);
+            reflowed_rows = reflow_cursor.total_rows;
+            sweep.advance(self, reflow_cursor.node, prefix_rows + reflow_cursor.total_rows);
         }
 
         // At the end of the reflow, setup our total row cache
         // log.warn("total old={} new={}", .{ self.total_rows, reflow_cursor.total_rows });
-        self.total_rows = reflow_cursor.total_rows;
+        self.total_rows = prefix_rows + reflow_cursor.total_rows;
+    }
+
+    // The prefix before the tail is now stale, whatever its width was, and
+    // the rows above the viewport pin changed only if the pin was reflowed.
+    if (tail != null) {
+        const prev = stale_prev.?;
+        self.stale_tail = prev;
+        self.stale_rows = prefix_rows;
+        self.stale_soft = prev.endsWrapped();
+        if (pin_in_tail) self.viewport_pin_row_offset = self.rowsAbove(
+            prev.next,
+            self.viewport_pin.*,
+            prefix_rows,
+        );
+    } else {
+        // Every page was reflowed, so no stale part is left (it can only
+        // exist here if lazy reflow was switched off meanwhile).
+        self.clearStale();
+        self.viewport_pin_row_offset = null;
     }
 
     // If our total rows is less than our active rows, we need to grow.
     // This can happen if you're growing columns such that enough active
     // rows unwrap that we no longer have enough.
-    var node_it = self.pages.first;
-    var total: usize = 0;
-    while (node_it) |node| : (node_it = node.next) {
-        total += node.rows();
-        if (total >= self.rows) break;
-    } else {
-        for (total..self.rows) |_| _ = try self.grow();
+    if (self.total_rows < self.rows) {
+        for (self.total_rows..self.rows) |_| _ = try self.grow();
     }
 
     // Reflow can unwrap enough rows that a history viewport pin lands in the
@@ -1974,6 +2048,400 @@ fn resizeCols(
             req_rows -= 1;
         }
     }
+}
+
+/// The first row of the fresh part, or null when the whole list is fresh.
+pub fn firstFreshPin(self: *const PageList) ?Pin {
+    const tail = self.stale_tail orelse return null;
+    return .{ .node = tail.next.? };
+}
+
+/// Iterate the pages that have the list's width: all of them, or those after
+/// the stale prefix.
+fn freshPageIterator(self: *const PageList) PageIterator {
+    const tail = self.stale_tail orelse
+        return self.pageIterator(.right_down, .{ .screen = .{} }, null);
+    const top: Pin = .{ .node = tail.next.? };
+    return top.pageIterator(.right_down, self.getBottomRight(.screen).?);
+}
+
+/// A sweep that starts after the stale prefix, whose pages are already cold.
+fn freshSweep(self: *const PageList, threshold: usize) ColdSweep {
+    const tail = self.stale_tail orelse return .{ .threshold = threshold };
+    return .{
+        .threshold = threshold,
+        .next = tail.next,
+        .rows_before = self.stale_rows,
+    };
+}
+
+/// Reflow stale pages from the tail of the stale prefix until the first
+/// active row is in the fresh part again.
+fn completeActiveArea(self: *PageList) Allocator.Error!void {
+    var reflowed = false;
+    while (self.stale_tail != null and
+        self.total_rows -| self.rows < self.stale_rows)
+    {
+        // Pages that need no copy join the fresh part for free, as many as
+        // the active area needs.
+        while (self.stale_tail) |tail| {
+            if (self.total_rows -| self.rows >= self.stale_rows) break;
+            if (!self.isReleasable(tail)) break;
+            self.releaseOne(tail);
+        }
+        if (self.stale_tail == null or
+            self.total_rows -| self.rows >= self.stale_rows) break;
+
+        const deficit = self.stale_rows - (self.total_rows -| self.rows);
+        const j = self.chunkStart(deficit, std.math.maxInt(usize));
+        _ = try self.reflowChunk(j);
+        reflowed = true;
+    }
+    if (reflowed) self.resize_generation +%= 1;
+}
+
+/// Move the boundary above the stale tail `tail`, which is releasable.
+fn releaseOne(self: *PageList, tail: *List.Node) void {
+    self.visit();
+    self.stale_rows -= tail.rows();
+    self.stale_tail = tail.prev;
+    self.stale_soft = false;
+    if (tail.prev == null) self.stale_rows = 0;
+}
+
+/// Whether the stale node `node` can join the fresh part as it is: it has
+/// the list's width and starts a line, so nothing older continues into it
+/// at another width.
+fn isReleasable(self: *const PageList, node: *List.Node) bool {
+    if (node.cols() != self.cols) return false;
+    const prev = node.prev orelse return true;
+    return !prev.endsWrapped();
+}
+
+/// The oldest node of a chunk that ends at the stale tail and covers at least
+/// `max_rows` rows or `max_pages` pages, extended to a hard line start.
+fn chunkStart(self: *PageList, max_rows: usize, max_pages: usize) *List.Node {
+    var j = self.stale_tail.?;
+    var rows: usize = j.rows();
+    var pages: usize = 1;
+    self.visit();
+    while (j.prev) |prev| {
+        if (rows >= max_rows or pages >= max_pages) break;
+        // Older pages that need no copy are released by a later step.
+        if (self.isReleasable(prev)) break;
+        j = prev;
+        rows += j.rows();
+        pages += 1;
+        self.visit();
+    }
+
+    var extra: usize = 0;
+    while (j.prev) |prev| {
+        if (!prev.endsWrapped()) break;
+        if (extra + prev.rows() > max_line_rows) break;
+        extra += prev.rows();
+        j = prev;
+        self.visit();
+    }
+    return j;
+}
+
+/// What reflowing one chunk consumed and produced, and whether it moved what
+/// the viewport shows.
+const ChunkStats = struct {
+    old_rows: usize,
+    new_rows: usize,
+    viewport_changed: bool,
+};
+
+/// A tracked pin's place before a chunk is reflowed, to undo the remapping.
+const PinSnapshot = struct {
+    pin: *Pin,
+    node: *List.Node,
+    x: size.CellCountInt,
+    y: size.CellCountInt,
+};
+
+/// Reflow the stale nodes from `j` to the stale tail in one piece.
+///
+/// The output pages are inserted in front of `j` while the sources stay in
+/// the list, so on an error removing the output and restoring the pins puts
+/// everything back. Sources are read without restoring them. On success the
+/// sources are destroyed and the boundary moves to the node before `j`.
+fn reflowChunk(self: *PageList, j: *List.Node) Allocator.Error!ChunkStats {
+    const alloc = self.pool.alloc;
+    const tail = self.stale_tail.?;
+    const before = j.prev;
+    const after = tail.next.?;
+
+    // The viewport's offset is kept, never recomputed by a walk, so it must
+    // exist before anything moves.
+    if (self.viewport == .pin) _ = self.viewportRowOffset();
+
+    var old_rows: usize = 0;
+    {
+        var n: ?*List.Node = j;
+        while (n) |node| : (n = node.next) {
+            self.visit();
+            old_rows += node.rows();
+            if (node == tail) break;
+        }
+    }
+    const rows_before = self.stale_rows - old_rows;
+
+    // Where the viewport window starts, before anything moves.
+    const window_before: usize = switch (self.viewport) {
+        .top => 0,
+        .active => self.total_rows - self.rows,
+        .pin => self.viewport_pin_row_offset.?,
+    };
+    const viewport_in_chunk = switch (self.viewport) {
+        .top => before == null,
+        .active => false,
+        .pin => window_before >= rows_before and window_before < rows_before + old_rows,
+    };
+
+    const snapshot = try alloc.alloc(PinSnapshot, self.tracked_pins.count());
+    defer alloc.free(snapshot);
+    for (self.tracked_pins.keys(), snapshot) |p, *snap| snap.* = .{
+        .pin = p,
+        .node = p.node,
+        .x = p.x,
+        .y = p.y,
+    };
+
+    const first_out = try self.createPage(.{ .cap = reflowCapacity(
+        j.capacity(),
+        j.rows(),
+        self.cols,
+    ) });
+    first_out.page().size.rows = 1;
+    self.pages.insertBefore(j, first_out);
+
+    // The output is every node between `before` and `j`.
+    errdefer {
+        var n = j.prev;
+        while (n != before) {
+            const node = n.?;
+            n = node.prev;
+            self.pages.remove(node);
+            self.destroyNode(node);
+        }
+        for (snapshot) |snap| {
+            snap.pin.node = snap.node;
+            snap.pin.x = snap.x;
+            snap.pin.y = snap.y;
+        }
+    }
+
+    var scratch: ReadScratch = .{};
+    defer scratch.deinit(alloc);
+
+    var cursor: ReflowCursor = .init(first_out);
+    // A chunk that starts inside a line continues the row before it.
+    if (before) |b| if (b.endsWrapped()) {
+        cursor.page_row.wrap_continuation = true;
+    };
+    var last_source: ?*const Page = null;
+    var swept: ?*List.Node = first_out;
+    var node_: ?*List.Node = j;
+    while (node_) |node| : (node_ = node.next) {
+        self.visit();
+        const source = try node.readPreserving(&scratch, alloc);
+        last_source = source;
+        cursor.sourceChanged();
+        for (0..node.rows()) |y| {
+            try cursor.reflowRowFrom(
+                self,
+                .{ .node = node, .y = @intCast(y) },
+                source,
+                null,
+            );
+        }
+
+        // Finished output is cold: compress it so a step never holds more
+        // than a few pages. The viewport's pages stay resident.
+        if (!viewport_in_chunk) swept = self.compressFinished(swept, cursor.node);
+        if (node == tail) break;
+    }
+
+    // What the last source row left pending: the blank rows after it are
+    // real (the break after it belongs to the row that follows the chunk).
+    // A chunk that ends inside a line ends with a wrapped row.
+    const cap = if (cursor.cap_memo) |memo|
+        memo.cap
+    else
+        cursor.computeAndMemoizeCap(last_source.?);
+    if (tail.endsWrapped()) {
+        cursor.page_row.wrap = true;
+    } else while (cursor.new_rows > 1) : (cursor.new_rows -= 1) {
+        try cursor.cursorScrollOrNewPage(self, cap);
+    }
+    const new_rows = cursor.total_rows;
+
+    // Nothing below fails: swap the output in and the sources out.
+    errdefer comptime unreachable;
+
+    const out_last = j.prev.?;
+    out_last.next = after;
+    after.prev = out_last;
+    tail.next = null;
+    j.prev = null;
+    var n: ?*List.Node = j;
+    while (n) |node| {
+        n = node.next;
+        self.destroyNode(node);
+    }
+
+    self.stale_tail = before;
+    self.stale_rows = rows_before;
+    self.stale_soft = if (before) |b| b.endsWrapped() else false;
+    self.total_rows = self.total_rows - old_rows + new_rows;
+    self.layout_generation +%= 1;
+
+    const delta: isize = @as(isize, @intCast(new_rows)) - @as(isize, @intCast(old_rows));
+    var window_after: usize = window_before;
+    switch (self.viewport) {
+        .top => {},
+        .active => window_after = self.total_rows - self.rows,
+        .pin => {
+            const offset = &self.viewport_pin_row_offset.?;
+            if (window_before >= rows_before + old_rows) {
+                offset.* = @intCast(@as(isize, @intCast(offset.*)) + delta);
+            } else if (window_before >= rows_before) {
+                offset.* = self.rowsAbove(
+                    self.firstAfter(before),
+                    self.viewport_pin.*,
+                    rows_before,
+                ) orelse unreachable;
+            }
+            window_after = offset.*;
+        },
+    }
+
+    // Compress what the sweep above left, except the viewport's pages.
+    const viewport: ViewportNodes = .init(self);
+    var rest = swept;
+    while (rest) |node| : (rest = node.next) {
+        if (node == after) break;
+        if (!node.isCompressed() and !viewport.holds(node)) _ = self.compressPage(node);
+    }
+
+    return .{
+        .old_rows = old_rows,
+        .new_rows = new_rows,
+        .viewport_changed = overlaps(window_before, self.rows, rows_before, old_rows) or
+            overlaps(window_after, self.rows, rows_before, new_rows),
+    };
+}
+
+/// The first node after `before`, or of the list when there is none.
+fn firstAfter(self: *const PageList, before: ?*List.Node) ?*List.Node {
+    return if (before) |b| b.next else self.pages.first;
+}
+
+/// Whether two row ranges, given by start and length, share a row.
+fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) bool {
+    return a < b + b_len and b < a + a_len;
+}
+
+/// Compress the output pages that are finished: every one before the node
+/// being written and the node before it (a row may still move back into it).
+/// Returns where to resume.
+fn compressFinished(
+    self: *PageList,
+    start: ?*List.Node,
+    frontier: *List.Node,
+) ?*List.Node {
+    if (!terminal_mem.canReclaim(.strict)) return start;
+    var node_ = start;
+    while (node_) |node| : (node_ = node.next) {
+        if (node == frontier or node.next == frontier) break;
+        _ = self.compressPage(node);
+    }
+    return node_;
+}
+
+/// The capacity of a page that receives rows reflowed from one with
+/// `src_cap` and `src_rows` rows, at `cols` columns.
+fn reflowCapacity(
+    src_cap: Capacity,
+    src_rows: size.CellCountInt,
+    cols: size.CellCountInt,
+) Capacity {
+    return src_cap.adjust(.{ .cols = cols }) catch |err| err: {
+        comptime assert(@TypeOf(err) == error{OutOfMemory});
+        var cap = src_cap;
+        cap.cols = cols;
+        cap.rows = @min(src_rows, cap.rows);
+        break :err cap;
+    };
+}
+
+/// The part of a lazy list a column resize reflows.
+const LazyTail = struct {
+    /// The first node to reflow; everything before it stays as it is.
+    k: *List.Node,
+
+    /// Rows in the nodes before `k`.
+    prefix_rows: usize,
+};
+
+/// Count a node visit, for tests that bound the cost of a resize or step.
+inline fn visit(self: *PageList) void {
+    if (comptime builtin.is_test) self.test_visits += 1;
+}
+
+/// Pick the first node a lazy column resize reflows, or null when that is
+/// the whole list.
+///
+/// It is the first of the last `fresh_tail_pages` nodes, or older if the
+/// first active row is, never older than the fresh part, and moved to the
+/// nearest hard line start within `max_line_rows` rows. Beyond that the
+/// boundary stays inside the line. Touches only the nodes it considers.
+fn lazyTail(self: *PageList) ?LazyTail {
+    const first_fresh = if (self.stale_tail) |t| t.next.? else self.pages.first.?;
+    const active_node = self.getTopLeft(.active).node;
+
+    var k = self.pages.last.?;
+    var tail_rows: usize = k.rows();
+    var count: usize = 1;
+    var passed_active = k == active_node;
+    self.visit();
+    while (k != first_fresh and (count < fresh_tail_pages or !passed_active)) {
+        k = k.prev.?;
+        count += 1;
+        tail_rows += k.rows();
+        if (k == active_node) passed_active = true;
+        self.visit();
+    }
+
+    var extra: usize = 0;
+    while (k != first_fresh) {
+        const prev = k.prev.?;
+        if (!prev.endsWrapped()) break;
+        if (extra + prev.rows() > max_line_rows) break;
+        extra += prev.rows();
+        tail_rows += prev.rows();
+        k = prev;
+        self.visit();
+    }
+
+    if (k == self.pages.first.?) return null;
+    return .{ .k = k, .prefix_rows = self.total_rows - tail_rows };
+}
+
+/// Rows above `p` when `p` is in the chain starting at `first`, whose own
+/// first row has `base` rows above it; null if it is not in the chain.
+fn rowsAbove(self: *PageList, first: ?*List.Node, p: Pin, base: usize) ?usize {
+    var offset = base;
+    var node_ = first;
+    while (node_) |node| : (node_ = node.next) {
+        self.visit();
+        if (node == p.node) return offset + p.y;
+        offset += node.rows();
+    }
+    return null;
 }
 
 // We use a cursor to track where we are in the src/dst. This is very
@@ -2052,8 +2520,23 @@ const ReflowCursor = struct {
         row: Pin,
         cursor_pin: ?*Pin,
     ) Allocator.Error!void {
-        const src_page: *Page = row.node.page();
-        const src_row = row.rowAndCell().row;
+        return self.reflowRowFrom(list, row, row.node.page(), cursor_pin);
+    }
+
+    /// Reflow the provided row, read from `src_page` (the page of `row.node`,
+    /// possibly decoded into a scratch buffer), in to this cursor.
+    ///
+    /// The caller calls `sourceChanged` whenever `src_page` is a different
+    /// page than for the previous row, because the style and capacity caches
+    /// are keyed by its address.
+    fn reflowRowFrom(
+        self: *ReflowCursor,
+        list: *PageList,
+        row: Pin,
+        src_page: *const Page,
+        cursor_pin: ?*Pin,
+    ) Allocator.Error!void {
+        const src_row = &src_page.rows.ptr(src_page.memory)[row.y];
         const src_y = row.y;
         const cells = src_row.cells.ptr(src_page.memory)[0..src_page.size.cols];
 
@@ -2247,6 +2730,12 @@ const ReflowCursor = struct {
         if (!src_row.wrap) {
             self.new_rows += 1;
         }
+    }
+
+    /// Forget what was learned about the previous source page.
+    fn sourceChanged(self: *ReflowCursor) void {
+        self.style_cache = .invalid;
+        self.cap_memo = null;
     }
 
     /// Compute and memoize the new-page capacity for the given source
@@ -3213,9 +3702,12 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
             // resize the columns, and clear any cells that are beyond
             // the new size.
             .lt => {
-                var sweep: ColdSweep = .{ .threshold = @max(self.rows, opts.rows orelse self.rows) };
-                var it = self.pageIterator(.right_down, .{ .screen = .{} }, null);
+                // Only the fresh part changes: stale pages keep their width
+                // and reflow later from it, so a pin inside one keeps its x.
+                var sweep = self.freshSweep(@max(self.rows, opts.rows orelse self.rows));
+                var it = self.freshPageIterator();
                 while (it.next()) |chunk| {
+                    self.visit();
                     const page = chunk.node.page();
                     defer page.assertIntegrity();
                     const rows = page.rows.ptr(page.memory);
@@ -3224,18 +3716,19 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                         // If the cut splits a wide char, clear its head too.
                         const cells = row.cells.ptr(page.memory);
                         const start = if (cells[cols - 1].wide == .wide) cols - 1 else cols;
-                        page.clearCells(row, start, self.cols);
+                        page.clearCells(row, start, page.size.cols);
                     }
 
                     page.size.cols = cols;
-                    sweep.advance(self, chunk.node.next, self.total_rows);
-                }
 
-                // Update all our tracked pins. If they have an X
-                // beyond the edge, clamp it.
-                const pin_keys = self.tracked_pins.keys();
-                for (pin_keys) |p| {
-                    if (p.x >= cols) p.x = cols - 1;
+                    // Update our tracked pins on this page. If they have
+                    // an X beyond the edge, clamp it.
+                    const pin_keys = self.tracked_pins.keys();
+                    for (pin_keys) |p| {
+                        if (p.node == chunk.node and p.x >= cols) p.x = cols - 1;
+                    }
+
+                    sweep.advance(self, chunk.node.next, self.total_rows);
                 }
 
                 self.cols = cols;
@@ -3248,9 +3741,10 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                 // See the comment in the while loop when setting self.cols
                 const old_cols = self.cols;
 
-                var sweep: ColdSweep = .{ .threshold = @max(self.rows, opts.rows orelse self.rows) };
-                var it = self.pageIterator(.right_down, .{ .screen = .{} }, null);
+                var sweep = self.freshSweep(@max(self.rows, opts.rows orelse self.rows));
+                var it = self.freshPageIterator();
                 while (it.next()) |chunk| {
+                    self.visit();
                     // The chunk's node may be replaced, so keep its successor.
                     const following = chunk.node.next;
 
@@ -3368,7 +3862,7 @@ fn resizeWithoutReflowGrowCols(
     cols: size.CellCountInt,
     chunk: PageIterator.Chunk,
 ) Allocator.Error!void {
-    assert(cols > self.cols);
+    assert(cols > chunk.node.cols());
     const page = chunk.node.page();
 
     // Update our col count
@@ -3385,7 +3879,7 @@ fn resizeWithoutReflowGrowCols(
         const rows = page.rows.ptr(page.memory)[0..page.size.rows];
         for (rows) |*row| {
             const cells = page.getCells(row);
-            if (cells[old_cols - 1].wide == .spacer_head) break :fast;
+            if (cells[page.size.cols - 1].wide == .spacer_head) break :fast;
         }
 
         page.size.cols = cols;
@@ -3443,6 +3937,9 @@ fn resizeWithoutReflowGrowCols(
     // This can fail for many reasons (can't fit styles/graphemes, etc.) so
     // if it fails then we give up and drop back into creating new pages.
     if (prev) |prev_node| prev: {
+        // The last stale page has another width; the rows can't join it.
+        if (prev_node == self.stale_tail) break :prev;
+
         const prev_page = prev_node.page();
 
         // We only want scenarios where we have excess capacity.
@@ -23698,6 +24195,64 @@ fn nodeCountForTest(self: *const PageList) usize {
     return count;
 }
 
+/// Fill every row with text: plain rows of varying length, an occasional
+/// blank row, and three-row wrapped lines (also across pages). `seed` varies
+/// the pattern.
+fn fillVariedRowsForTest(self: *PageList, seed: usize) void {
+    var g: usize = seed;
+    var node = self.pages.first;
+    while (node) |n| : (node = n.next) {
+        // Pages hold a multiple of the pattern's period of rows, so skip a
+        // row to keep page ends from all looking alike.
+        g += 1;
+        const page = n.page();
+        const cols: usize = n.cols();
+        for (0..n.rows()) |y| {
+            const rac = page.getRowAndCell(0, y);
+            const row = rac.row;
+            row.wrap = false;
+            row.wrap_continuation = false;
+            var len: usize = 1 + (g *% 13) % cols;
+            switch (g % 13) {
+                0 => {
+                    len = cols;
+                    row.wrap = true;
+                },
+                1 => {
+                    len = cols;
+                    row.wrap = true;
+                    row.wrap_continuation = true;
+                },
+                2 => row.wrap_continuation = true,
+                6 => if (g % 5 == 1) {
+                    len = 0;
+                },
+                else => {},
+            }
+            const letter: u21 = 'a' + @as(u21, @intCast(g % 26));
+            if (len > 0) row.blank = false;
+            for (0..len) |x| page.getRowAndCell(x, y).cell.* = .init(letter);
+            g += 1;
+        }
+    }
+
+    // The list never ends inside a line.
+    const last = self.pages.last.?;
+    const page = last.page();
+    const row = page.getRowAndCell(0, last.rows() - 1).row;
+    row.wrap = false;
+}
+
+/// The whole screen as text, with soft wraps joined or not.
+fn dumpForTest(self: *PageList, alloc: Allocator, unwrap: bool) ![]u8 {
+    const formatter = @import("formatter.zig");
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    var f = formatter.PageListFormatter.init(self, .{ .emit = .plain, .unwrap = unwrap });
+    try f.format(&out.writer);
+    return try out.toOwnedSlice();
+}
+
 test "PageList lazy state starts empty and the invariant holds" {
     const testing = std.testing;
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
@@ -23820,6 +24375,234 @@ test "PageList stale state follows pruning and the prune reuse path" {
     try testing.expect(pruned_one);
     try testing.expect(total_before > 0);
     try testing.expectEqual(@as(usize, 0), s.stale_rows);
+    s.assertStaleInvariant();
+}
+
+test "PageList no-reflow column change leaves stale pages and their pins alone" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesForTest(30);
+    s.fillTextRowsForTest();
+    try s.resize(.{ .cols = 40 });
+    try testing.expect(s.stale_tail != null);
+    const stale_tail = s.stale_tail.?;
+
+    const stale_pin = try s.trackPin(.{ .node = s.nodeAtForTest(0), .y = 3, .x = 70 });
+    defer s.untrackPin(stale_pin);
+    const fresh_pin = try s.trackPin(.{ .node = s.pages.last.?, .y = 0, .x = 39 });
+    defer s.untrackPin(fresh_pin);
+    const total = s.total_rows;
+    const stale_rows = s.stale_rows;
+
+    // Narrower, without reflow.
+    try s.resize(.{ .cols = 20, .reflow = false });
+    try testing.expectEqual(total, s.total_rows);
+    try testing.expectEqual(stale_rows, s.stale_rows);
+    try testing.expect(s.stale_tail == stale_tail);
+    try testing.expectEqual(@as(size.CellCountInt, 70), stale_pin.x);
+    try testing.expectEqual(@as(size.CellCountInt, 19), fresh_pin.x);
+    {
+        var n: ?*List.Node = s.pages.first;
+        while (n) |x| : (n = x.next) {
+            const stale = s.stale_tail != null and s.nodeIsStaleForTest(x);
+            try testing.expectEqual(@as(size.CellCountInt, if (stale) 80 else 20), x.cols());
+        }
+    }
+
+    // Wider, without reflow.
+    try s.resize(.{ .cols = 100, .reflow = false });
+    try testing.expect(s.stale_tail == stale_tail);
+    try testing.expectEqual(@as(size.CellCountInt, 70), stale_pin.x);
+    {
+        var n: ?*List.Node = s.pages.first;
+        while (n) |x| : (n = x.next) {
+            const stale = s.nodeIsStaleForTest(x);
+            try testing.expectEqual(@as(size.CellCountInt, if (stale) 80 else 100), x.cols());
+        }
+    }
+    s.assertStaleInvariant();
+}
+
+/// Whether `node` is in the stale prefix.
+fn nodeIsStaleForTest(self: *const PageList, node: *List.Node) bool {
+    const tail = self.stale_tail orelse return false;
+    var n = self.pages.first;
+    while (n) |x| : (n = x.next) {
+        if (x == node) return true;
+        if (x == tail) return false;
+    }
+    return false;
+}
+
+test "PageList grow loop after reflow does not walk from the first node" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesForTest(120);
+    s.fillTextRowsForTest();
+    _ = s.compress(.full);
+
+    s.test_visits = 0;
+    try s.resize(.{ .cols = 60 });
+    try testing.expect(s.test_visits <= fresh_tail_pages + 64);
+    // The walk cost does not depend on the history size.
+    s.test_visits = 0;
+    try s.resize(.{ .cols = 50 });
+    try testing.expect(s.test_visits <= fresh_tail_pages + 64);
+}
+
+test "PageList lazy resize reflows only the tail" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesForTest(200);
+    s.fillTextRowsForTest();
+    _ = s.compress(.full);
+    const compressed_before = s.memoryStats().compressed_pages;
+    const rows_before = s.total_rows;
+    const generation = s.layout_generation;
+
+    s.test_visits = 0;
+    try s.resize(.{ .cols = 60 });
+
+    try testing.expect(s.stale_tail != null);
+    try testing.expect(s.layout_generation != generation);
+    try testing.expect(s.test_visits <= fresh_tail_pages + 64);
+    s.assertStaleInvariant();
+
+    var stale_rows: usize = 0;
+    var fresh_rows: usize = 0;
+    var compressed_stale: usize = 0;
+    var in_stale = true;
+    var n = s.pages.first;
+    while (n) |x| : (n = x.next) {
+        if (in_stale) {
+            try testing.expectEqual(@as(size.CellCountInt, 80), x.cols());
+            stale_rows += x.rows();
+            if (x.isCompressed()) compressed_stale += 1;
+            if (x == s.stale_tail.?) in_stale = false;
+        } else {
+            try testing.expectEqual(@as(size.CellCountInt, 60), x.cols());
+            fresh_rows += x.rows();
+        }
+    }
+    try testing.expectEqual(s.stale_rows, stale_rows);
+    try testing.expectEqual(s.total_rows, stale_rows + fresh_rows);
+    // Every old page before the boundary is still compressed: none decoded.
+    try testing.expect(compressed_stale >= compressed_before - fresh_tail_pages - 2);
+    // Single-cell rows keep their count.
+    try testing.expectEqual(rows_before, s.total_rows);
+}
+
+test "PageList lazy resize picks a hard line start through the previous row's wrap" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesForTest(40);
+    s.fillTextRowsForTest();
+
+    // One logical line begins in the node that would be the boundary's
+    // predecessor and runs over the next three nodes.
+    const count = s.nodeCountForTest();
+    const start = count - 9;
+    for (start..start + 3) |idx| {
+        const node = s.nodeAtForTest(idx);
+        const page = node.page();
+        page.rows.ptr(page.memory)[node.rows() - 1].wrap = true;
+        const next = s.nodeAtForTest(idx + 1);
+        const next_page = next.page();
+        next_page.rows.ptr(next_page.memory)[0].wrap_continuation = true;
+    }
+    const expected_tail = s.nodeAtForTest(start - 1);
+    try testing.expect(!expected_tail.endsWrapped());
+
+    try s.resize(.{ .cols = 60 });
+    try testing.expect(s.stale_tail == expected_tail);
+    try testing.expect(!s.stale_tail.?.endsWrapped());
+    try testing.expect(!s.stale_soft);
+    s.assertStaleInvariant();
+}
+
+test "PageList lazy resize keeps the active area fresh" {
+    const testing = std.testing;
+
+    // Widening collapses pairs of rows, so the tail shrinks below the stale
+    // prefix's share of the active area.
+    {
+        var s = try init(testing.allocator, .{ .cols = 40, .rows = 24 });
+        defer s.deinit();
+        s.lazy_reflow = true;
+        for (0..40) |_| {
+            const node = try s.createPage(.{ .cap = .{ .cols = 40, .rows = 2 } });
+            node.page().size.rows = 2;
+            s.pages.append(node);
+            s.total_rows += 2;
+            const page = node.page();
+            const first = page.getRowAndCell(0, 0);
+            first.row.wrap = true;
+            for (0..40) |x| page.getRowAndCell(x, 0).cell.* = .init('a');
+            const second = page.getRowAndCell(0, 1);
+            second.row.wrap_continuation = true;
+            for (0..10) |x| page.getRowAndCell(x, 1).cell.* = .init('b');
+        }
+        const before = try s.dumpForTest(testing.allocator, true);
+        defer testing.allocator.free(before);
+
+        try s.resize(.{ .cols = 80 });
+        s.assertStaleInvariant();
+        try testing.expect(s.total_rows - s.rows >= s.stale_rows);
+        const after = try s.dumpForTest(testing.allocator, true);
+        defer testing.allocator.free(after);
+        try testing.expectEqualStrings(before, after);
+    }
+
+    // Pulling scrollback into a much taller active area.
+    {
+        var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+        defer s.deinit();
+        s.lazy_reflow = true;
+        try s.growColdPagesForTest(60);
+        s.fillTextRowsForTest();
+        try s.resize(.{ .cols = 60 });
+        try testing.expect(s.stale_tail != null);
+        try s.resize(.{ .rows = 3000 });
+        s.assertStaleInvariant();
+        try testing.expect(s.total_rows - s.rows >= s.stale_rows);
+    }
+}
+
+test "PageList lazy resize viewport offset" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesForTest(60);
+    s.fillTextRowsForTest();
+
+    // Pinned in what will become the stale prefix.
+    s.scroll(.{ .row = 3000 });
+    try testing.expectEqual(@as(usize, 3000), s.viewportRowOffset());
+    try s.resize(.{ .cols = 60 });
+    try testing.expect(s.stale_tail != null);
+    try testing.expect(s.viewport_pin_row_offset != null);
+    try testing.expectEqual(@as(usize, 3000), s.viewport_pin_row_offset.?);
+    const cached = s.viewport_pin_row_offset.?;
+    s.viewport_pin_row_offset = null;
+    try testing.expectEqual(cached, s.viewportRowOffset());
+
+    // Pinned in the fresh part: the offset is the recomputed walk.
+    s.scroll(.{ .row = s.total_rows - s.rows - 300 });
+    try testing.expect(s.viewport == .pin);
+    try s.resize(.{ .cols = 70 });
+    try testing.expect(s.viewport_pin_row_offset != null);
+    const kept = s.viewport_pin_row_offset.?;
+    s.viewport_pin_row_offset = null;
+    try testing.expectEqual(kept, s.viewportRowOffset());
     s.assertStaleInvariant();
 }
 
