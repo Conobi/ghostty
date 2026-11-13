@@ -2075,6 +2075,58 @@ fn freshSweep(self: *const PageList, threshold: usize) ColdSweep {
     };
 }
 
+/// What `reflowStep` did.
+pub const ReflowStepResult = struct {
+    /// Stale rows remain, so another step has work to do.
+    pending: bool = false,
+
+    /// Rows of the stale pages the step consumed.
+    rows_reflowed: usize = 0,
+
+    /// Change in the total row count; the scrollbar's total moved by this.
+    rows_delta: i64 = 0,
+
+    /// The viewport window overlapped the rows the step replaced, before or
+    /// after it, so what the viewport shows may have moved or re-wrapped.
+    viewport_changed: bool = false,
+};
+
+/// How many pages a step may release without a copy per page it may reflow;
+/// a release only moves the boundary, so it is far cheaper.
+const release_factor: usize = 32;
+
+/// Reflow the youngest stale pages to the list's width: about `max_rows`
+/// rows or `max_pages` pages, then on to the nearest hard line start (within
+/// `max_line_rows` rows, beyond which the step ends inside the line).
+///
+/// Atomic: when it returns an error nothing changed. Not thread-safe with any
+/// other access. Does not count as terminal activity for compression.
+pub fn reflowStep(
+    self: *PageList,
+    max_rows: usize,
+    max_pages: usize,
+) Allocator.Error!ReflowStepResult {
+    defer self.assertIntegrity();
+    var result: ReflowStepResult = .{};
+    if (self.stale_tail == null) return result;
+
+    // Pages already at the list's width that start a line need no copy.
+    const budget = @max(max_pages, 1) *| release_factor;
+    if (self.releaseCurrentWidth(budget)) {
+        result.pending = true;
+        return result;
+    }
+    if (self.stale_tail == null) return result;
+
+    const j = self.chunkStart(@max(max_rows, 1), @max(max_pages, 1));
+    const stats = try self.reflowChunk(j);
+    result.pending = self.stale_tail != null;
+    result.rows_reflowed = stats.old_rows;
+    result.rows_delta = @as(i64, @intCast(stats.new_rows)) - @as(i64, @intCast(stats.old_rows));
+    result.viewport_changed = stats.viewport_changed;
+    return result;
+}
+
 /// Reflow stale pages from the tail of the stale prefix until the first
 /// active row is in the fresh part again.
 fn completeActiveArea(self: *PageList) Allocator.Error!void {
@@ -2098,6 +2150,21 @@ fn completeActiveArea(self: *PageList) Allocator.Error!void {
         reflowed = true;
     }
     if (reflowed) self.resize_generation +%= 1;
+}
+
+/// Move the boundary over stale pages that are already at the list's width
+/// and start a line, at most `limit` of them. Returns whether it stopped at
+/// the limit with such pages left.
+fn releaseCurrentWidth(self: *PageList, limit: usize) bool {
+    var released: usize = 0;
+    while (self.stale_tail) |tail| {
+        if (!self.isReleasable(tail)) return false;
+        if (released >= limit) return true;
+
+        released += 1;
+        self.releaseOne(tail);
+    }
+    return false;
 }
 
 /// Move the boundary above the stale tail `tail`, which is releasable.
@@ -24253,6 +24320,22 @@ fn dumpForTest(self: *PageList, alloc: Allocator, unwrap: bool) ![]u8 {
     return try out.toOwnedSlice();
 }
 
+/// Step until nothing is stale, with random limits.
+fn drainForTest(self: *PageList, random: std.Random) !void {
+    var guard: usize = 0;
+    while (true) : (guard += 1) {
+        try std.testing.expect(guard < 200_000);
+        const result = try self.reflowStep(
+            random.intRangeAtMost(usize, 1, 4000),
+            random.intRangeAtMost(usize, 1, 6),
+        );
+        self.assertStaleInvariant();
+        if (!result.pending) break;
+    }
+    try std.testing.expect(self.stale_tail == null);
+    try std.testing.expectEqual(@as(usize, 0), self.stale_rows);
+}
+
 test "PageList lazy state starts empty and the invariant holds" {
     const testing = std.testing;
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
@@ -24528,6 +24611,66 @@ test "PageList lazy resize picks a hard line start through the previous row's wr
     s.assertStaleInvariant();
 }
 
+test "PageList lazy resize keeps a soft boundary inside a very long line" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+
+    // A single logical line three times the cap, in every cell 'x'.
+    while (s.total_rows < 3 * max_line_rows + 4 * 215) _ = try s.grow();
+    {
+        var node = s.pages.first;
+        while (node) |n| : (node = n.next) {
+            const page = n.page();
+            for (0..n.rows()) |y| {
+                const rac = page.getRowAndCell(0, y);
+                rac.row.wrap = true;
+                rac.row.wrap_continuation = y > 0 or n != s.pages.first.?;
+                for (0..n.cols()) |x| page.getRowAndCell(x, y).cell.* = .init('x');
+            }
+        }
+        const last = s.pages.last.?;
+        last.page().getRowAndCell(0, last.rows() - 1).row.wrap = false;
+    }
+    const before = try s.dumpForTest(testing.allocator, true);
+    defer testing.allocator.free(before);
+    _ = s.compress(.full);
+
+    try s.resize(.{ .cols = 60 });
+    s.assertStaleInvariant();
+    try testing.expect(s.stale_tail != null);
+    try testing.expect(s.stale_soft);
+    try testing.expect(s.stale_tail.?.endsWrapped());
+
+    // The reflowed tail holds at most the cap and the fresh pages (the cap
+    // counts rows of the old width: a quarter more at 60 columns).
+    const fresh_rows = s.total_rows - s.stale_rows;
+    const page_rows: usize = s.pages.last.?.capacity().rows;
+    try testing.expect(fresh_rows <= (max_line_rows + 10 * page_rows) * 80 / 60);
+
+    const after = try s.dumpForTest(testing.allocator, true);
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+
+    // Draining reflows the rest of the line in chunks that end inside it.
+    // Each chunk end is a short wrapped row, whose blank cells the
+    // formatter prints as spaces; the text itself is unchanged.
+    var prng = std.Random.DefaultPrng.init(0x534f4654);
+    try drainForTest(&s, prng.random());
+    const drained = try s.dumpForTest(testing.allocator, true);
+    defer testing.allocator.free(drained);
+    const stripped = try testing.allocator.dupe(u8, drained);
+    defer testing.allocator.free(stripped);
+    var kept: usize = 0;
+    for (drained) |c| {
+        if (c == ' ') continue;
+        stripped[kept] = c;
+        kept += 1;
+    }
+    try testing.expectEqualStrings(before, stripped[0..kept]);
+}
+
 test "PageList lazy resize keeps the active area fresh" {
     const testing = std.testing;
 
@@ -24604,5 +24747,249 @@ test "PageList lazy resize viewport offset" {
     s.viewport_pin_row_offset = null;
     try testing.expectEqual(kept, s.viewportRowOffset());
     s.assertStaleInvariant();
+}
+
+test "PageList lazy resize after half a reflow does not walk fresh nodes" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesForTest(160);
+    s.fillTextRowsForTest();
+    _ = s.compress(.full);
+    try s.resize(.{ .cols = 60 });
+
+    const half = s.stale_rows / 2;
+    while (s.stale_rows > half) _ = try s.reflowStep(2000, 6);
+    try testing.expect(s.stale_tail != null);
+
+    s.test_visits = 0;
+    try s.resize(.{ .cols = 70 });
+    try testing.expect(s.test_visits <= fresh_tail_pages + 64);
+    s.assertStaleInvariant();
+}
+
+test "PageList reflowStep drains to the eager result" {
+    const testing = std.testing;
+    var prng = std.Random.DefaultPrng.init(0x5445_5050_4153_5343);
+    const random = prng.random();
+
+    inline for (.{ .{ 80, 50 }, .{ 80, 130 }, .{ 120, 7 }, .{ 40, 41 } }, 0..) |widths, seed| {
+        var lazy = try init(testing.allocator, .{ .cols = widths[0], .rows = 24 });
+        defer lazy.deinit();
+        var eager = try init(testing.allocator, .{ .cols = widths[0], .rows = 24 });
+        defer eager.deinit();
+        lazy.lazy_reflow = true;
+        for ([_]*PageList{ &lazy, &eager }) |s| {
+            try s.growColdPagesForTest(30);
+            s.fillVariedRowsForTest(seed);
+        }
+        _ = lazy.compress(.full);
+
+        try lazy.resize(.{ .cols = widths[1] });
+        try eager.resize(.{ .cols = widths[1] });
+        // Draining never cuts a line: the boundary stays a hard line start.
+        while (lazy.stale_tail != null) {
+            try testing.expect(!lazy.stale_tail.?.endsWrapped());
+            _ = try lazy.reflowStep(
+                random.intRangeAtMost(usize, 1, 4000),
+                random.intRangeAtMost(usize, 1, 6),
+            );
+            lazy.assertStaleInvariant();
+        }
+
+        for ([_]bool{ true, false }) |unwrap| {
+            const want = try eager.dumpForTest(testing.allocator, unwrap);
+            defer testing.allocator.free(want);
+            const got = try lazy.dumpForTest(testing.allocator, unwrap);
+            defer testing.allocator.free(got);
+            try testing.expectEqualStrings(want, got);
+        }
+        try testing.expectEqual(eager.total_rows, lazy.total_rows);
+        try lazy.expectCountersForTest();
+    }
+}
+
+test "PageList reflowStep is bounded in rows and pages" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesForTest(100);
+    s.fillTextRowsForTest();
+    try s.resize(.{ .cols = 60 });
+
+    const page_rows: usize = s.nodeAtForTest(0).rows();
+    const before = s.stale_rows;
+    s.test_visits = 0;
+    const result = try s.reflowStep(100_000, 3);
+    try testing.expect(result.pending);
+    try testing.expect(result.rows_reflowed <= 3 * page_rows);
+    try testing.expect(result.rows_reflowed > 0);
+    try testing.expectEqual(before - result.rows_reflowed, s.stale_rows);
+    // Source pages plus the chunk walk, not the history.
+    try testing.expect(s.test_visits <= 16);
+
+    // A row bound smaller than a page still takes a whole page.
+    const small = try s.reflowStep(1, 100);
+    try testing.expect(small.rows_reflowed <= page_rows);
+    try testing.expect(small.rows_reflowed > 0);
+}
+
+test "PageList reflowStep releases pages already at the current width" {
+    const testing = std.testing;
+    var prng = std.Random.DefaultPrng.init(0x52454c45);
+    const random = prng.random();
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesForTest(60);
+    s.fillTextRowsForTest();
+
+    try s.resize(.{ .cols = 100 });
+    const first_stale = s.stale_tail.?;
+    // The nodes now stale at 80 columns, oldest first.
+    var old_nodes: std.ArrayList(*List.Node) = .empty;
+    defer old_nodes.deinit(testing.allocator);
+    {
+        var n = s.pages.first;
+        while (n) |x| : (n = x.next) {
+            try old_nodes.append(testing.allocator, x);
+            if (x == first_stale) break;
+        }
+    }
+    try s.resize(.{ .cols = 80 });
+    try drainForTest(&s, random);
+
+    // The old pages are still the list's first pages, never copied.
+    var n = s.pages.first;
+    for (old_nodes.items) |expected| {
+        try testing.expect(n.? == expected);
+        n = n.?.next;
+    }
+    s.assertStaleInvariant();
+}
+
+test "PageList reflowStep keeps pins and viewport offsets" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesForTest(60);
+    s.fillVariedRowsForTest(3);
+    try s.resize(.{ .cols = 50 });
+
+    // A pin on a recognisable cell in the first chunk, found from the tail.
+    const tail = s.stale_tail.?;
+    const page = tail.page();
+    const y: size.CellCountInt = 2;
+    page.getRowAndCell(0, y).cell.* = .init('Q');
+    const tracked = try s.trackPin(.{ .node = tail, .y = y, .x = 0 });
+    defer s.untrackPin(tracked);
+
+    // Viewports older than, inside, and newer than the chunk.
+    const rows_above_tail = s.stale_rows - tail.rows();
+    for ([_]usize{ 10, rows_above_tail + 3, s.total_rows - s.rows - 5 }) |offset| {
+        s.scroll(.{ .row = offset });
+        if (s.viewport != .pin) continue;
+        _ = try s.reflowStep(1, 1);
+        try testing.expectEqual(@as(u21, 'Q'), tracked.rowAndCell().cell.content.codepoint.data);
+        const cached = s.viewport_pin_row_offset.?;
+        s.viewport_pin_row_offset = null;
+        try testing.expectEqual(cached, s.viewportRowOffset());
+        s.assertStaleInvariant();
+    }
+}
+
+test "PageList reflowStep reports viewport overlap by window" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesForTest(60);
+    s.fillVariedRowsForTest(1);
+    try s.resize(.{ .cols = 50 });
+
+    // The viewport at the top is far above the youngest stale pages.
+    s.scroll(.top);
+    const above = try s.reflowStep(1, 1);
+    try testing.expect(!above.viewport_changed);
+    try testing.expect(above.rows_delta != 0);
+
+    // Scrolled into the stale rows just above the boundary: overlap.
+    s.scroll(.{ .row = s.stale_rows - 10 });
+    const inside = try s.reflowStep(1, 1);
+    try testing.expect(inside.viewport_changed);
+}
+
+test "PageList reflowStep reads compressed sources without restoring them" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesForTest(80);
+    s.fillVariedRowsForTest(2);
+    _ = s.compress(.full);
+    try s.resize(.{ .cols = 110 });
+    const compressed = s.memoryStats().compressed_pages;
+
+    // The peak counts pages resident at once: the output chunk, no sources.
+    const max_pages: usize = 4;
+    for (0..8) |_| {
+        s.counters.resident_peak = s.counters.resident_size;
+        const base = s.counters.resident_size;
+        _ = try s.reflowStep(2000, max_pages);
+        try testing.expect(s.counters.resident_peak - base <= (max_pages + 2) * PagePool.item_size);
+    }
+    // Pages ahead of the chunks were never decoded.
+    try testing.expect(s.memoryStats().compressed_pages >= compressed - 8 * (max_pages + 2));
+    try s.expectCountersForTest();
+}
+
+test "PageList reflowStep failure changes nothing" {
+    const testing = std.testing;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var s = try init(failing.allocator(), .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesForTest(20);
+    s.fillVariedRowsForTest(4);
+    try s.resize(.{ .cols = 50 });
+
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        try testing.expect(fail_after < 400);
+        const before_text = try s.dumpForTest(testing.allocator, false);
+        defer testing.allocator.free(before_text);
+        const total = s.total_rows;
+        const stale_rows = s.stale_rows;
+        const tail = s.stale_tail;
+        const generation = s.layout_generation;
+        const first = s.pages.first;
+        const counters = s.recountCounters();
+
+        failing.fail_index = failing.alloc_index + fail_after;
+        const result = s.reflowStep(2000, 3);
+        failing.fail_index = std.math.maxInt(usize);
+        if (result) |_| {
+            if (s.stale_tail == null) break;
+            if (fail_after > 40) break;
+            continue;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+        }
+
+        try testing.expectEqual(total, s.total_rows);
+        try testing.expectEqual(stale_rows, s.stale_rows);
+        try testing.expect(s.stale_tail == tail);
+        try testing.expectEqual(generation, s.layout_generation);
+        try testing.expect(s.pages.first == first);
+        try testing.expectEqual(counters.stored_size, s.recountCounters().stored_size);
+        const after_text = try s.dumpForTest(testing.allocator, false);
+        defer testing.allocator.free(after_text);
+        try testing.expectEqualStrings(before_text, after_text);
+        s.assertStaleInvariant();
+        try s.expectCountersForTest();
+    }
 }
 

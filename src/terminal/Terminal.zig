@@ -570,6 +570,27 @@ pub fn setLazyReflow(self: *Terminal, on: bool) void {
     self.screens.get(.primary).?.pages.lazy_reflow = on;
 }
 
+/// Reflow up to `max_rows` rows or `max_pages` pages of the history left
+/// stale by a lazy resize, youngest first.
+///
+/// The step is atomic: an error changes nothing. The primary screen's pages
+/// are reflowed even while the alternate screen is shown. When the step moves
+/// what the viewport shows, the next render rebuilds and image placements are
+/// marked dirty.
+pub fn reflowStep(
+    self: *Terminal,
+    max_rows: usize,
+    max_pages: usize,
+) Allocator.Error!PageList.ReflowStepResult {
+    const primary = self.screens.get(.primary).?;
+    const result = try primary.pages.reflowStep(max_rows, max_pages);
+    if (result.viewport_changed) {
+        if (self.screens.active == primary) self.flags.dirty.clear = true;
+        if (comptime build_options.kitty_graphics) primary.kitty_images.markDirty();
+    }
+    return result;
+}
+
 /// Change the primary screen's maximum number of physical scrollback lines.
 ///
 /// Null removes the line limit. The alternate screen is intentionally
@@ -19897,4 +19918,36 @@ fn testSelectionCoords(t: *Terminal) ![2]point.Coordinate {
         s.pages.pointFromPin(.screen, sel.start()).?.screen,
         s.pages.pointFromPin(.screen, sel.end()).?.screen,
     };
+}
+
+test "Terminal: reflowStep marks the screen dirty when the viewport overlaps" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 80, .rows = 4, .max_scrollback_bytes = null });
+    defer t.deinit(alloc);
+    t.setLazyReflow(true);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    const fill: [70]u8 = @splat('x');
+    for (0..12000) |n| {
+        var buf: [96]u8 = undefined;
+        s.nextSlice(std.fmt.bufPrint(&buf, "{d:0>4} {s}\r\n", .{ n, &fill }) catch unreachable);
+    }
+    try t.resize(alloc, .{ .cols = 50, .rows = 4 });
+    const primary = t.screens.get(.primary).?;
+    try testing.expect(primary.pages.stale_tail != null);
+
+    // A chunk far above the viewport leaves the screen alone.
+    t.flags.dirty.clear = false;
+    t.scrollViewport(.top);
+    const above = try t.reflowStep(100, 1);
+    try testing.expect(!above.viewport_changed);
+    try testing.expect(!t.flags.dirty.clear);
+
+    // One that overlaps it asks for a full rebuild.
+    t.scrollViewport(.{ .row = primary.pages.stale_rows - 3 });
+    t.flags.dirty.clear = false;
+    const inside = try t.reflowStep(100, 1);
+    try testing.expect(inside.viewport_changed);
+    try testing.expect(t.flags.dirty.clear);
 }
