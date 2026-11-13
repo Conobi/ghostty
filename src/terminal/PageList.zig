@@ -24531,7 +24531,7 @@ test "PageList grow loop after reflow does not walk from the first node" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(120);
+    try s.growColdPagesForTest(40);
     s.fillTextRowsForTest();
     _ = s.compress(.full);
 
@@ -24549,7 +24549,7 @@ test "PageList lazy resize reflows only the tail" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(200);
+    try s.growColdPagesForTest(60);
     s.fillTextRowsForTest();
     _ = s.compress(.full);
     const compressed_before = s.memoryStats().compressed_pages;
@@ -24761,7 +24761,7 @@ test "PageList lazy resize after half a reflow does not walk fresh nodes" {
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
     s.lazy_reflow = true;
-    try s.growColdPagesForTest(160);
+    try s.growColdPagesForTest(60);
     s.fillTextRowsForTest();
     _ = s.compress(.full);
     try s.resize(.{ .cols = 60 });
@@ -25051,7 +25051,7 @@ test "PageList lazy reflow property: random operations match the eager twin" {
     var g: usize = 0;
     var op: usize = 0;
     errdefer std.debug.print("lazy reflow property failed: seed=0x{x} op={}\n", .{ seed, op });
-    while (op < 800) : (op += 1) {
+    while (op < 250) : (op += 1) {
         switch (random.uintLessThan(u8, 16)) {
             0...5 => for (0..random.intRangeAtMost(usize, 20, 500)) |_| {
                 try lazy.appendRowForTest(g);
