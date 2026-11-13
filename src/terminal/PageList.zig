@@ -25000,3 +25000,112 @@ test "PageList reflowStep failure changes nothing" {
     }
 }
 
+/// Add one row of text at the bottom of the list and fill it from the
+/// counter `g`, the same way `fillVariedRowsForTest` does.
+fn appendRowForTest(self: *PageList, g: usize) !void {
+    _ = try self.grow();
+    const last = self.pages.last.?;
+    const page = last.page();
+    const y = last.rows() - 1;
+    const cols: usize = last.cols();
+    const rac = page.getRowAndCell(0, y);
+    const row = rac.row;
+    row.wrap = false;
+    row.wrap_continuation = false;
+    var len: usize = 1 + (g *% 13) % cols;
+    switch (g % 13) {
+        0 => {
+            len = cols;
+            row.wrap = true;
+        },
+        1 => {
+            len = cols;
+            row.wrap = true;
+            row.wrap_continuation = true;
+        },
+        2 => row.wrap_continuation = true,
+        6 => if (g % 5 == 1) {
+            len = 0;
+        },
+        else => {},
+    }
+    const letter: u21 = 'a' + @as(u21, @intCast(g % 26));
+    if (len > 0) row.blank = false;
+    for (0..len) |x| page.getRowAndCell(x, y).cell.* = .init(letter);
+}
+
+test "PageList lazy reflow property: random operations match the eager twin" {
+    const testing = std.testing;
+    const seed: u64 = 0x4C41_5A59_5245_464C;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+
+    var lazy = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer lazy.deinit();
+    var eager = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer eager.deinit();
+    lazy.lazy_reflow = true;
+    lazy.limits.bytes_mode = .stored;
+    lazy.limits.resident_budget = 8 * PagePool.item_size;
+
+    var g: usize = 0;
+    var op: usize = 0;
+    errdefer std.debug.print("lazy reflow property failed: seed=0x{x} op={}\n", .{ seed, op });
+    while (op < 800) : (op += 1) {
+        switch (random.uintLessThan(u8, 16)) {
+            0...5 => for (0..random.intRangeAtMost(usize, 20, 500)) |_| {
+                try lazy.appendRowForTest(g);
+                try eager.appendRowForTest(g);
+                g += 1;
+            },
+            6...8 => {
+                const cols = random.intRangeAtMost(size.CellCountInt, 20, 140);
+                try lazy.resize(.{ .cols = cols });
+                try eager.resize(.{ .cols = cols });
+            },
+            9 => {
+                const rows = random.intRangeAtMost(size.CellCountInt, 8, 60);
+                try lazy.resize(.{ .rows = rows });
+                try eager.resize(.{ .rows = rows });
+            },
+            10...12 => _ = try lazy.reflowStep(
+                random.intRangeAtMost(usize, 1, 4000),
+                random.intRangeAtMost(usize, 1, 6),
+            ),
+            13 => if (random.boolean()) {
+                _ = lazy.compress(.incremental);
+            } else {
+                lazy.scroll(.{ .row = random.intRangeAtMost(usize, 0, lazy.total_rows - 1) });
+            },
+            14 => if (random.uintLessThan(u8, 8) == 0) {
+                lazy.eraseHistory(null);
+                eager.eraseHistory(null);
+            },
+            15 => lazy.scroll(if (random.boolean()) .top else .active),
+            else => unreachable,
+        }
+
+        // The history stays bounded so the run stays fast.
+        if (lazy.total_rows > 12_000) {
+            lazy.eraseHistory(null);
+            eager.eraseHistory(null);
+        }
+
+        lazy.assertStaleInvariant();
+        try lazy.expectCountersForTest();
+        try testing.expectEqual(lazy.totalRows(), lazy.total_rows);
+        try testing.expectEqual(lazy.total_rows, lazy.scrollbar().total);
+        if (lazy.viewport == .pin) {
+            const cached = lazy.viewportRowOffset();
+            lazy.viewport_pin_row_offset = null;
+            try testing.expectEqual(cached, lazy.viewportRowOffset());
+        }
+    }
+
+    try drainForTest(&lazy, random);
+    const want = try eager.dumpForTest(testing.allocator, true);
+    defer testing.allocator.free(want);
+    const got = try lazy.dumpForTest(testing.allocator, true);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(want, got);
+}
