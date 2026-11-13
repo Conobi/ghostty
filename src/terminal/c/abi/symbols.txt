@@ -184,6 +184,7 @@ ghostty_terminal_grid_ref_track
 ghostty_terminal_new
 ghostty_terminal_paste
 ghostty_terminal_point_from_grid_ref
+ghostty_terminal_reflow_step
 ghostty_terminal_reset
 ghostty_terminal_resize
 ghostty_terminal_screen_rows_wrapped_preserving

@@ -4915,6 +4915,13 @@ fn viewportRowOffset(self: *PageList) usize {
     };
 }
 
+/// Whether the viewport shows at least one stale row. O(1): the viewport
+/// offset is cached whenever a stale part exists.
+pub fn viewportStale(self: *PageList) bool {
+    if (self.stale_tail == null) return false;
+    return self.viewportRowOffset() < self.stale_rows;
+}
+
 /// This fixes up the viewport data when rows are removed from the
 /// PageList. This will update a viewport to `active` if row removal
 /// puts the viewport into the active area, to `top` if the viewport

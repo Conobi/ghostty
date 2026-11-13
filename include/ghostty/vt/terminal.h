@@ -552,6 +552,94 @@ typedef struct {
   uint64_t alternate_image_bytes;
 } GhosttyTerminalMemoryUsage;
 
+/**
+ * Whether stale history remains after a ghostty_terminal_reflow_step() call.
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** Stale history remains: call ghostty_terminal_reflow_step() again. */
+  GHOSTTY_TERMINAL_REFLOW_STEP_STATE_PENDING = 0,
+
+  /** No stale history remains. */
+  GHOSTTY_TERMINAL_REFLOW_STEP_STATE_IDLE = 1,
+  GHOSTTY_TERMINAL_REFLOW_STEP_STATE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyTerminalReflowStepState;
+
+/**
+ * What one ghostty_terminal_reflow_step() call did.
+ *
+ * This is a sized struct. Initialize it with GHOSTTY_INIT_SIZED() before
+ * passing it to ghostty_terminal_reflow_step(). See @ref sized-structs.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Size of this struct in bytes. Set by you. */
+  size_t size;
+
+  /** Whether stale history remains after the step. */
+  GhosttyTerminalReflowStepState state;
+
+  /** Rows of stale history the step consumed. */
+  uint64_t rows_reflowed;
+
+  /**
+   * Change in the primary screen's total row count (see
+   * `GhosttyTerminalScrollbar.total`): the rows the step produced minus the
+   * rows it consumed. Reflowing to a narrower width produces more rows.
+   */
+  int64_t rows_delta;
+
+  /**
+   * Whether the step replaced rows the viewport shows, or rows that were
+   * shown before it. When true, what the viewport shows may have moved or
+   * re-wrapped and should be redrawn. When false but `rows_delta` is not
+   * zero, only the scrollbar's total changed.
+   */
+  bool viewport_changed;
+} GhosttyTerminalReflowResult;
+
+/**
+ * The lazy reflow state of a terminal's primary screen.
+ *
+ * Read with ghostty_terminal_get() and
+ * `GHOSTTY_TERMINAL_DATA_REFLOW_STATE`.
+ *
+ * This is a sized struct. Initialize it with GHOSTTY_INIT_SIZED() before
+ * passing it to ghostty_terminal_get(). See @ref sized-structs.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Size of this struct in bytes. Set by you. */
+  size_t size;
+
+  /**
+   * Rows at the top of the history that still have the width they had
+   * before a column resize. Zero when nothing is stale.
+   */
+  uint64_t stale_rows;
+
+  /**
+   * Changes whenever a resize laid the rows out again. If it is equal to an
+   * earlier reading, the rows below the stale ones have the same content in
+   * the same order.
+   */
+  uint64_t resize_generation;
+
+  /**
+   * Changes whenever the row count or layout changed: with every resize and
+   * with every reflow step that reflowed rows. If it differs from an earlier
+   * reading while `resize_generation` is equal, only rows above the earlier
+   * stale rows were added or removed.
+   */
+  uint64_t layout_generation;
+
+  /** Whether the viewport shows at least one stale row. */
+  bool viewport_stale;
+} GhosttyTerminalReflowState;
+
 /** @} */
 
 /** @addtogroup effects
@@ -2710,6 +2798,26 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: size_t*
    */
   GHOSTTY_TERMINAL_OPT_SCROLLBACK_RESIDENT_BUDGET = 50,
+
+  /**
+   * Reflow only the tail of the history when the width changes.
+   *
+   * By default a resize that changes the column count reflows the whole
+   * history at once, which takes time proportional to its size. When this is
+   * true, the resize reflows only the newest pages and leaves the older
+   * history at its old width: the viewport shows those rows clipped or
+   * padded to the new width, and ghostty_terminal_reflow_step() reflows them
+   * later, newest first, in bounded steps. The resize then costs the same
+   * whatever the history size. Text, copying and search are unaffected; row
+   * breaks in the older history are those of the old width until it is
+   * reflowed.
+   *
+   * Set to NULL to turn it off (the default). Turning it off while history
+   * is stale makes the next resize reflow all of it.
+   *
+   * Input type: bool*
+   */
+  GHOSTTY_TERMINAL_OPT_LAZY_REFLOW = 51,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
@@ -3160,6 +3268,21 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: size_t *
    */
   GHOSTTY_TERMINAL_DATA_SCROLLBACK_STORED_BYTES = 43,
+
+  /**
+   * How much of the primary screen's history a lazy resize left to be
+   * reflowed (see `GHOSTTY_TERMINAL_OPT_LAZY_REFLOW`). See
+   * GhosttyTerminalReflowState.
+   *
+   * Set the struct's `size` field before the call, for example with
+   * GHOSTTY_INIT_SIZED(). If `size` is too small, this returns
+   * GHOSTTY_INVALID_VALUE and leaves the struct unchanged.
+   *
+   * This is O(1).
+   *
+   * Output type: GhosttyTerminalReflowState *
+   */
+  GHOSTTY_TERMINAL_DATA_REFLOW_STATE = 44,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
@@ -3579,6 +3702,43 @@ GHOSTTY_API GhosttyResult ghostty_terminal_compress(
     GhosttyTerminal terminal,
     GhosttyTerminalCompressionMode mode,
     GhosttyTerminalCompressionResult* out_result);
+
+/**
+ * Reflow some of the history a lazy resize left stale.
+ *
+ * See `GHOSTTY_TERMINAL_OPT_LAZY_REFLOW`. One step reflows the newest stale
+ * pages: until about `max_rows` rows or `max_pages` pages are covered, then
+ * on to the nearest line start (a line longer than 8192 rows is split at
+ * that point instead). The work, and so the time the terminal is held, is
+ * bounded by those limits. Call it while the terminal is idle, until it
+ * reports `GHOSTTY_TERMINAL_REFLOW_STEP_STATE_IDLE`.
+ *
+ * A step either completes or fails with GHOSTTY_OUT_OF_MEMORY and changes
+ * nothing. With nothing stale it does nothing and reports idle. It acts on
+ * the primary screen whichever screen is shown, and does not count as the
+ * activity ghostty_terminal_compression_activity() reports.
+ *
+ * This function is not thread-safe with other operations on the same
+ * terminal. You must serialize it with writes, rendering, searches,
+ * and other terminal access.
+ *
+ * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param max_rows Rows to cover, 1 to 65536 (outside that returns
+ *        GHOSTTY_INVALID_VALUE)
+ * @param max_pages Pages to cover, 1 to 64 (outside that returns
+ *        GHOSTTY_INVALID_VALUE)
+ * @param[out] out_result Receives what the step did; its `size` field must be
+ *        set (NULL or a too-small size returns GHOSTTY_INVALID_VALUE)
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if an argument is
+ *         invalid, or GHOSTTY_OUT_OF_MEMORY if the step could not allocate
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_reflow_step(
+    GhosttyTerminal terminal,
+    size_t max_rows,
+    size_t max_pages,
+    GhosttyTerminalReflowResult* out_result);
 
 /**
  * Read the soft-wrap flags of a range of rows without restoring history.

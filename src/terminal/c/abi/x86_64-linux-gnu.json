@@ -1533,6 +1533,70 @@
         }
       }
     },
+    "GhosttyTerminalReflowResult": {
+      "kind": "struct",
+      "size": 40,
+      "align": 8,
+      "fields": {
+        "size": {
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        "state": {
+          "offset": 8,
+          "size": 4,
+          "type": "GhosttyTerminalReflowStepState"
+        },
+        "rows_reflowed": {
+          "offset": 16,
+          "size": 8,
+          "type": "u64"
+        },
+        "rows_delta": {
+          "offset": 24,
+          "size": 8,
+          "type": "i64"
+        },
+        "viewport_changed": {
+          "offset": 32,
+          "size": 1,
+          "type": "bool"
+        }
+      }
+    },
+    "GhosttyTerminalReflowState": {
+      "kind": "struct",
+      "size": 40,
+      "align": 8,
+      "fields": {
+        "size": {
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        "stale_rows": {
+          "offset": 8,
+          "size": 8,
+          "type": "u64"
+        },
+        "resize_generation": {
+          "offset": 16,
+          "size": 8,
+          "type": "u64"
+        },
+        "layout_generation": {
+          "offset": 24,
+          "size": 8,
+          "type": "u64"
+        },
+        "viewport_stale": {
+          "offset": 32,
+          "size": 1,
+          "type": "bool"
+        }
+      }
+    },
     "GhosttyTerminalProgressReport": {
       "kind": "struct",
       "size": 8,
@@ -4319,6 +4383,7 @@
         "MOUSE_SHAPE": 41,
         "MEMORY_USAGE": 42,
         "SCROLLBACK_STORED_BYTES": 43,
+        "REFLOW_STATE": 44,
         "MAX_VALUE": 2147483647
       },
       "keys": {
@@ -4497,6 +4562,10 @@
         "SCROLLBACK_STORED_BYTES": {
           "direction": "out",
           "type": "u64"
+        },
+        "REFLOW_STATE": {
+          "direction": "out",
+          "type": "GhosttyTerminalReflowState"
         }
       }
     },
@@ -4558,6 +4627,7 @@
         "RESIZE_WINDOW": 48,
         "SCROLLBACK_BYTES_MODE": 49,
         "SCROLLBACK_RESIDENT_BUDGET": 50,
+        "LAZY_REFLOW": 51,
         "MAX_VALUE": 2147483647
       },
       "keys": {
@@ -4762,6 +4832,10 @@
         "SCROLLBACK_RESIDENT_BUDGET": {
           "direction": "in",
           "type": "u64"
+        },
+        "LAZY_REFLOW": {
+          "direction": "in",
+          "type": "bool"
         }
       }
     },
@@ -4777,6 +4851,18 @@
         "ERROR": 2,
         "INDETERMINATE": 3,
         "PAUSE": 4,
+        "MAX_VALUE": 2147483647
+      }
+    },
+    "GhosttyTerminalReflowStepState": {
+      "kind": "enum",
+      "size": 4,
+      "align": 4,
+      "underlying": "i32",
+      "prefix": "GHOSTTY_TERMINAL_REFLOW_STEP_STATE_",
+      "values": {
+        "PENDING": 0,
+        "IDLE": 1,
         "MAX_VALUE": 2147483647
       }
     },

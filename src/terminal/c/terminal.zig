@@ -1452,6 +1452,28 @@ pub fn compress(
     return .success;
 }
 
+pub fn reflow_step(
+    terminal_: Terminal,
+    max_rows: usize,
+    max_pages: usize,
+    out_result_: ?*TerminalReflowResult,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const out_result = out_result_ orelse return .invalid_value;
+    if (max_rows < 1 or max_rows > reflow_step_max_rows) return .invalid_value;
+    if (max_pages < 1 or max_pages > reflow_step_max_pages) return .invalid_value;
+    if (!lib.sizedCheck(.output, out_result)) return .invalid_value;
+
+    const result = t.reflowStep(max_rows, max_pages) catch return .out_of_memory;
+    lib.sizedWrite(out_result, .{
+        .state = if (result.pending) .pending else .idle,
+        .rows_reflowed = result.rows_reflowed,
+        .rows_delta = result.rows_delta,
+        .viewport_changed = result.viewport_changed,
+    });
+    return .success;
+}
+
 pub fn screen_rows_wrapped_preserving(
     terminal_: Terminal,
     y: u32,
@@ -1557,6 +1579,7 @@ pub const Option = enum(c_int) {
     resize_window = 48,
     scrollback_bytes_mode = 49,
     scrollback_resident_budget = 50,
+    lazy_reflow = 51,
 
     _,
 
@@ -1594,6 +1617,7 @@ pub const Option = enum(c_int) {
             .title_report,
             .xt_checksum_report,
             .resize_pull_scrollback,
+            .lazy_reflow,
             => ?*const bool,
             .kitty_image_medium_temp_file => ?*const lib.String,
             .apc_max_bytes,
@@ -1844,6 +1868,7 @@ fn setTyped(
         .scrollback_resident_budget => wrapper.terminal.setScrollbackResidentBudget(
             if (value) |ptr| ptr.* else null,
         ),
+        .lazy_reflow => wrapper.terminal.setLazyReflow(if (value) |ptr| ptr.* else false),
         .continuation_max_bytes => setContinuationMaxBytes(
             wrapper,
             if (value) |ptr| ptr.* else default_continuation_max_bytes,
@@ -2003,6 +2028,55 @@ pub const TerminalMemoryUsage = extern struct {
     }
 };
 
+/// C: GhosttyTerminalReflowStepState
+///
+/// The declaration order is part of the libghostty-vt C ABI.
+pub const ReflowStepState = lib.Enum(lib.target, &.{
+    "pending",
+    "idle",
+});
+
+/// C: GhosttyTerminalReflowResult
+///
+/// This is a sized struct, so new fields may only be added to the end.
+pub const TerminalReflowResult = extern struct {
+    size: usize = @sizeOf(TerminalReflowResult),
+    state: ReflowStepState = .idle,
+    rows_reflowed: u64 = 0,
+    rows_delta: i64 = 0,
+    viewport_changed: bool = false,
+
+    pub const sized_base = "viewport_changed";
+};
+
+/// C: GhosttyTerminalReflowState
+///
+/// This is a sized struct, so new fields may only be added to the end.
+pub const TerminalReflowState = extern struct {
+    size: usize = @sizeOf(TerminalReflowState),
+    stale_rows: u64 = 0,
+    resize_generation: u64 = 0,
+    layout_generation: u64 = 0,
+    viewport_stale: bool = false,
+
+    pub const sized_base = "viewport_stale";
+
+    /// Read the primary screen's lazy reflow state.
+    fn init(t: *ZigTerminal) TerminalReflowState {
+        const pages = &t.screens.get(.primary).?.pages;
+        return .{
+            .stale_rows = pages.stale_rows,
+            .resize_generation = pages.resize_generation,
+            .layout_generation = pages.layout_generation,
+            .viewport_stale = pages.viewportStale(),
+        };
+    }
+};
+
+/// The largest `max_rows` and `max_pages` `reflow_step` accepts.
+const reflow_step_max_rows: usize = 65_536;
+const reflow_step_max_pages: usize = 64;
+
 /// C: GhosttyTerminalData
 pub const TerminalData = enum(c_int) {
     invalid = 0,
@@ -2049,6 +2123,7 @@ pub const TerminalData = enum(c_int) {
     mouse_shape = 41,
     memory_usage = 42,
     scrollback_stored_bytes = 43,
+    reflow_state = 44,
 
     _,
 
@@ -2097,6 +2172,7 @@ pub const TerminalData = enum(c_int) {
             .selection => selection_c.CSelection,
             .mode => ModeConfig,
             .memory_usage => TerminalMemoryUsage,
+            .reflow_state => TerminalReflowState,
             _ => void,
         };
     }
@@ -2234,6 +2310,10 @@ fn getTyped(
         },
         .cursor_at_prompt => out.* = t.cursorIsAtPrompt(),
         .memory_usage => {
+            if (!lib.sizedCheck(.output, out)) return .invalid_value;
+            lib.sizedWrite(out, .init(t));
+        },
+        .reflow_state => {
             if (!lib.sizedCheck(.output, out)) return .invalid_value;
             lib.sizedWrite(out, .init(t));
         },
@@ -8444,4 +8524,100 @@ test "get mouse_shape" {
     vt_write(t, "\x07", 1);
     try testing.expectEqual(Result.success, get(t, .mouse_shape, @ptrCast(&shape)));
     try testing.expectEqual(mouse.Shape.wait, shape);
+}
+
+test "lazy reflow option, state and step" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer free(t);
+    var on: bool = true;
+    var unlimited: usize = std.math.maxInt(usize);
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_bytes, &unlimited));
+    try testing.expectEqual(Result.success, set(t, .lazy_reflow, &on));
+    try testing.expect(t.?.terminal.screens.get(.primary).?.pages.lazy_reflow);
+
+    // Nothing is stale yet: the step is idle and does nothing.
+    var idle: TerminalReflowResult = .{ .state = .pending };
+    try testing.expectEqual(Result.success, reflow_step(t, 100, 2, &idle));
+    try testing.expectEqual(ReflowStepState.idle, idle.state);
+    try testing.expectEqual(@as(u64, 0), idle.rows_reflowed);
+    var state: TerminalReflowState = .{};
+    try testing.expectEqual(Result.success, get(t, .reflow_state, @ptrCast(&state)));
+    try testing.expectEqual(@as(u64, 0), state.stale_rows);
+    try testing.expect(!state.viewport_stale);
+
+    const line = "a line of history that reflows when the width changes\r\n";
+    for (0..30_000) |_| vt_write(t, line.ptr, line.len);
+    const before = state.layout_generation;
+    try testing.expectEqual(Result.success, resize(t, 40, 24, 8, 16));
+    try testing.expectEqual(Result.success, get(t, .reflow_state, @ptrCast(&state)));
+    try testing.expect(state.stale_rows > 0);
+    try testing.expect(state.layout_generation != before);
+    try testing.expect(state.resize_generation > 0);
+
+    var result: TerminalReflowResult = .{};
+    var steps: usize = 0;
+    while (true) : (steps += 1) {
+        try testing.expect(steps < 10_000);
+        try testing.expectEqual(Result.success, reflow_step(t, 2000, 6, &result));
+        if (result.state == .idle) break;
+    }
+    try testing.expectEqual(Result.success, get(t, .reflow_state, @ptrCast(&state)));
+    try testing.expectEqual(@as(u64, 0), state.stale_rows);
+
+    // NULL restores the default.
+    try testing.expectEqual(Result.success, set(t, .lazy_reflow, null));
+    try testing.expect(!t.?.terminal.screens.get(.primary).?.pages.lazy_reflow);
+}
+
+test "reflow_step and the reflow state reject hostile arguments" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer free(t);
+
+    var result: TerminalReflowResult = .{};
+    try testing.expectEqual(Result.invalid_value, reflow_step(null, 100, 2, &result));
+    try testing.expectEqual(Result.invalid_value, reflow_step(t, 100, 2, null));
+    try testing.expectEqual(Result.invalid_value, reflow_step(t, 0, 2, &result));
+    try testing.expectEqual(Result.invalid_value, reflow_step(t, 100, 0, &result));
+    try testing.expectEqual(Result.invalid_value, reflow_step(t, 65_537, 2, &result));
+    try testing.expectEqual(Result.invalid_value, reflow_step(t, 100, 65, &result));
+    try testing.expectEqual(Result.invalid_value, reflow_step(t, std.math.maxInt(usize), 2, &result));
+    try testing.expectEqual(Result.invalid_value, reflow_step(t, 100, std.math.maxInt(usize), &result));
+    // The limits themselves are accepted.
+    try testing.expectEqual(Result.success, reflow_step(t, 1, 1, &result));
+    try testing.expectEqual(Result.success, reflow_step(t, 65_536, 64, &result));
+
+    // A struct too small for the first layout is refused and left alone.
+    var small: TerminalReflowResult = .{
+        .size = @offsetOf(TerminalReflowResult, "viewport_changed"),
+        .rows_reflowed = 77,
+    };
+    try testing.expectEqual(Result.invalid_value, reflow_step(t, 100, 2, &small));
+    try testing.expectEqual(@offsetOf(TerminalReflowResult, "viewport_changed"), small.size);
+    try testing.expectEqual(@as(u64, 77), small.rows_reflowed);
+    var tiny: TerminalReflowResult = .{ .size = 0 };
+    try testing.expectEqual(Result.invalid_value, reflow_step(t, 100, 2, &tiny));
+
+    var small_state: TerminalReflowState = .{
+        .size = @offsetOf(TerminalReflowState, "viewport_stale"),
+        .stale_rows = 5,
+    };
+    try testing.expectEqual(Result.invalid_value, get(t, .reflow_state, @ptrCast(&small_state)));
+    try testing.expectEqual(@as(u64, 5), small_state.stale_rows);
+    try testing.expectEqual(Result.invalid_value, get(null, .reflow_state, @ptrCast(&small_state)));
+    try testing.expectEqual(Result.invalid_value, get(t, .reflow_state, null));
+
+    // A caller built against a newer layout gets the known prefix only.
+    const Larger = extern struct {
+        state: TerminalReflowState,
+        extra: u64,
+    };
+    var large: Larger = .{
+        .state = .{ .size = @sizeOf(Larger) },
+        .extra = 0xDEADBEEF,
+    };
+    try testing.expectEqual(Result.success, get(t, .reflow_state, @ptrCast(&large)));
+    try testing.expectEqual(@sizeOf(Larger), large.state.size);
+    try testing.expectEqual(@as(u64, 0xDEADBEEF), large.extra);
 }
