@@ -2487,7 +2487,7 @@ fn clearPromptForRedraw(
                 // Pages above the lazy reflow boundary are never touched, so
                 // the search for the prompt start stops at the first fresh row.
                 const start = if (self.pages.firstFreshPin()) |fresh|
-                    promptStartIn(self.cursor.page_pin.*, fresh)
+                    promptStartIn(self.cursor.page_pin.*, fresh) orelse break :prompt
                 else start: {
                     var it = self.cursor.page_pin.promptIterator(
                         .left_up,
@@ -2519,8 +2519,10 @@ fn clearPromptForRedraw(
 
 /// The first row of the prompt the row of `cursor` belongs to, as
 /// `PromptIterator` finds it, but never above `fresh`: a prompt that starts in
-/// stale history is cleared from its first fresh row.
-fn promptStartIn(cursor: PageList.Pin, fresh: PageList.Pin) PageList.Pin {
+/// stale history is cleared from its first fresh row. Null when the search
+/// reaches `fresh` (or the top) without meeting a prompt row, so nothing is
+/// cleared.
+fn promptStartIn(cursor: PageList.Pin, fresh: PageList.Pin) ?PageList.Pin {
     var current = cursor;
     current.x = 0;
     var run_top: ?PageList.Pin = null;
@@ -2530,8 +2532,8 @@ fn promptStartIn(cursor: PageList.Pin, fresh: PageList.Pin) PageList.Pin {
             .prompt_continuation => run_top = current,
             .none => if (run_top) |top| return top,
         }
-        if (current.node == fresh.node and current.y == fresh.y) return current;
-        current = current.up(1) orelse return current;
+        if (current.node == fresh.node and current.y == fresh.y) return run_top;
+        current = current.up(1) orelse return run_top;
     }
 }
 
@@ -13370,6 +13372,36 @@ fn testInitHistory() !Screen {
     errdefer s.deinit();
     try s.testWriteString("A\nB\nC\n1\n2\n3\n4\n5\n6");
     return s;
+}
+
+test "Screen clearPromptForRedraw clears nothing when no prompt row is found" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(testing.io, alloc, .{ .cols = 215, .rows = 4, .max_scrollback_bytes = null });
+    defer s.deinit();
+    s.pages.lazy_reflow = true;
+
+    // Plain output only: no row is marked as a prompt, but the cursor says
+    // it is on input, so the search walks up to the first fresh row.
+    var bulk: PageList.BulkGrowth = .init(&s.pages);
+    for (0..6000) |i| {
+        try s.testWriteString("plain line\n");
+        if (i % 10 == 9) bulk.refresh();
+    }
+    bulk.finish();
+    _ = s.pages.compress(.full);
+    s.cursor.semantic_content = .input;
+
+    const before = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(before);
+
+    try s.resize(.{ .cols = 160, .rows = 4, .prompt_redraw = .true });
+    try testing.expect(s.pages.stale_tail != null);
+
+    const after = try s.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(after);
+    try testing.expectEqualStrings(before, after);
 }
 
 test "Screen clearPromptForRedraw never touches stale pages" {
