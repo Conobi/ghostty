@@ -25445,6 +25445,9 @@ test "PageList reflowStep output stays compressible by the incremental pass" {
     // leaves resident, behind the scan position.
     try s.resize(.{ .cols = 60 });
     s.scroll(.top);
+    // The resize reset the scan; let it pass every page again.
+    while (s.compressOldestResident()) {}
+    try testing.expect(s.counters.cursor == s.getTopLeft(.active).node);
     var random = std.Random.DefaultPrng.init(0x5343414E);
     try drainForTest(&s, random.random());
 
