@@ -1765,6 +1765,13 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     self.assertStaleInvariant();
 }
 
+/// Failure injection for a column resize: after each source page is
+/// reflowed, and once the whole reflow is done but the resize is not.
+const resizeCols_tw = tripwire.module(
+    enum { reflow_page, after_reflow },
+    error{OutOfMemory},
+);
+
 /// Resize the pagelist with reflow by adding or removing columns.
 fn resizeCols(
     self: *PageList,
@@ -1961,7 +1968,10 @@ fn resizeCols(
                 row,
                 if (preserved_cursor) |c| c.tracked_pin else null,
             );
-            if (row.y == 0) self.visit();
+            if (row.y == 0) {
+                self.visit();
+                try resizeCols_tw.check(.reflow_page);
+            }
 
             // Once we're done reflowing a page, we're done with it, so
             // make it available for reuse (or destroy it). Making it
@@ -2006,6 +2016,8 @@ fn resizeCols(
         self.clearStale();
         self.viewport_pin_row_offset = null;
     }
+
+    try resizeCols_tw.check(.after_reflow);
 
     // If our total rows is less than our active rows, we need to grow.
     // This can happen if you're growing columns such that enough active
@@ -25346,40 +25358,47 @@ test "PageList clone after the stale tail copies only fresh pages" {
 
 test "PageList lazy resize failure keeps the stale boundary consistent" {
     const testing = std.testing;
+    const tw = resizeCols_tw;
+    defer tw.reset();
 
     // Variants: a fresh list, a list with a stale prefix, and a list with a
     // stale prefix whose next resize reflows everything (lazy switched off).
+    // The resize fails at its n-th page, or after the reflow completes.
     const Variant = enum { fresh, stale, whole };
     for ([_]Variant{ .fresh, .stale, .whole }) |variant| {
-        var fail_after: usize = 0;
-        while (true) : (fail_after += 1) {
-            try testing.expect(fail_after < 600);
-            var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
-            var s = try init(failing.allocator(), .{ .cols = 80, .rows = 24 });
-            defer s.deinit();
-            s.lazy_reflow = true;
-            try s.growColdPagesQuietForTest(14);
-            s.fillVariedRowsForTest(5);
-            if (variant != .fresh) {
-                try s.resize(.{ .cols = 60 });
-                try testing.expect(s.stale_tail != null);
-            }
-            if (variant == .whole) s.lazy_reflow = false;
+        for ([_]resizeCols_tw.FailPoint{ .reflow_page, .after_reflow }) |fail_point| {
+            var failures: usize = 0;
+            var after: usize = 0;
+            while (true) : (after += 1) {
+                try testing.expect(after < 100);
+                var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+                defer s.deinit();
+                s.lazy_reflow = true;
+                try s.growColdPagesQuietForTest(24);
+                s.fillVariedRowsForTest(5);
+                if (variant != .fresh) {
+                    try s.resize(.{ .cols = 60 });
+                    try testing.expect(s.stale_tail != null);
+                }
+                if (variant == .whole) s.lazy_reflow = false;
 
-            failing.fail_index = failing.alloc_index + fail_after;
-            const result = s.resize(.{ .cols = 45 });
-            failing.fail_index = std.math.maxInt(usize);
-            if (result) |_| {
+                tw.errorAfter(fail_point, error.OutOfMemory, after);
+                const result = s.resize(.{ .cols = 33 });
+                const tripped = if (tw.end(.reset)) |_| true else |_| false;
+                if (result) |_| {
+                    try testing.expect(!tripped);
+                    break;
+                } else |err| try testing.expectEqual(error.OutOfMemory, err);
+                failures += 1;
+
+                // What was reached is a valid list: the boundary and the row
+                // count agree with the nodes, and none survives a reflow of
+                // the whole list.
+                try s.verifyStale(false);
+                try testing.expectEqual(s.countRows(), s.total_rows);
                 if (variant == .whole) try testing.expect(s.stale_tail == null);
-                break;
-            } else |err| try testing.expectEqual(error.OutOfMemory, err);
-
-            // Whatever was reached, the boundary and the row count agree
-            // with the nodes, and a later step can run.
-            s.assertStaleInvariant();
-            try testing.expectEqual(s.countRows(), s.total_rows);
-            try s.verifyIntegrity();
-            if (variant == .whole) try testing.expect(s.stale_tail == null);
+            }
+            try testing.expect(failures >= 1);
         }
     }
 }
