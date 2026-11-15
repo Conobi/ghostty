@@ -43,9 +43,14 @@ pub const CGridRef = extern struct {
         };
     }
 
+    /// The pin, or null when the ref has no node or its coordinates lie
+    /// outside that node: C callers can forge or outlive a ref, and the
+    /// cell accessors index the page without a bounds check.
     pub fn toPin(self: CGridRef) ?PageList.Pin {
+        const node = self.node orelse return null;
+        if (self.y >= node.rows() or self.x >= node.cols()) return null;
         return .{
-            .node = self.node orelse return null,
+            .node = node,
             .x = self.x,
             .y = self.y,
         };
@@ -212,6 +217,49 @@ test "grid_ref_graphemes null node" {
     const ref = CGridRef{};
     var len: usize = undefined;
     try testing.expectEqual(Result.invalid_value, grid_ref_graphemes(&ref, null, 0, &len));
+}
+
+test "grid_ref rejects forged coordinates outside the node" {
+    var terminal: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &terminal,
+        80,
+        24,
+    ));
+    defer terminal_c.free(terminal);
+
+    var ref: CGridRef = undefined;
+    try testing.expectEqual(Result.success, terminal_c.grid_ref(
+        terminal,
+        point.Point.cval(.{ .active = .{ .x = 0, .y = 0 } }),
+        &ref,
+    ));
+    const node = ref.node.?;
+
+    var cell: cell_c.CCell = undefined;
+    var row: row_c.CRow = undefined;
+    var written: usize = undefined;
+    var moved: CGridRef = undefined;
+
+    // One past the last row and column: the page's memory continues there,
+    // so reading it would not crash, only return garbage.
+    var bad_y = ref;
+    bad_y.y = node.rows();
+    try testing.expectEqual(Result.invalid_value, grid_ref_cell(&bad_y, &cell));
+    try testing.expectEqual(Result.invalid_value, grid_ref_row(&bad_y, &row));
+    try testing.expectEqual(Result.invalid_value, grid_ref_graphemes(&bad_y, null, 0, &written));
+    try testing.expectEqual(Result.invalid_value, grid_ref_down(&bad_y, 0, &moved));
+
+    var bad_x = ref;
+    bad_x.x = node.cols();
+    try testing.expectEqual(Result.invalid_value, grid_ref_cell(&bad_x, &cell));
+
+    // The last valid cell still works.
+    var last = ref;
+    last.y = node.rows() - 1;
+    last.x = node.cols() - 1;
+    try testing.expectEqual(Result.success, grid_ref_cell(&last, &cell));
 }
 
 test "grid_ref_graphemes buffer" {
