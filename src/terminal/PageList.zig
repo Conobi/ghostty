@@ -10299,6 +10299,22 @@ fn growColdPagesQuietForTest(self: *PageList, count: usize) !void {
     }
 }
 
+/// Fails unless every node's `endsWrapped` equals the wrap flag of its last
+/// row as read from the page itself, decoding compressed pages to check the
+/// cached copy.
+fn expectEndsWrappedForTest(self: *const PageList) !void {
+    const alloc = std.testing.allocator;
+    var scratch: ReadScratch = .{};
+    defer scratch.deinit(alloc);
+    var n = self.pages.first;
+    while (n) |node| : (n = node.next) {
+        const page_ = try node.readPreserving(&scratch, alloc);
+        const rows = page_.rows.ptr(page_.memory);
+        const truth = page_.size.rows > 0 and rows[page_.size.rows - 1].wrap;
+        try std.testing.expectEqual(truth, node.endsWrapped());
+    }
+}
+
 /// Fails unless the counters equal a recount from the nodes.
 fn expectCountersForTest(self: *const PageList) !void {
     const want = self.recountCounters();
@@ -25109,9 +25125,16 @@ test "PageList reflowStep failure changes nothing" {
     s.fillVariedRowsForTest(4);
     try s.resize(.{ .cols = 50 });
 
+    // A pin on a recognisable cell inside the chunk the steps reflow first.
+    const marked = s.stale_tail.?;
+    marked.page().getRowAndCell(0, 2).cell.* = .init('Q');
+    const marked_pin = try s.trackPin(.{ .node = marked, .y = 2, .x = 0 });
+    defer s.untrackPin(marked_pin);
+
     var fail_after: usize = 0;
     while (true) : (fail_after += 1) {
         try testing.expect(fail_after < 400);
+        const pin_before = marked_pin.*;
         const before_text = try s.dumpForTest(testing.allocator, false);
         defer testing.allocator.free(before_text);
         const total = s.total_rows;
@@ -25125,6 +25148,8 @@ test "PageList reflowStep failure changes nothing" {
         const result = s.reflowStep(2000, 3);
         failing.fail_index = std.math.maxInt(usize);
         if (result) |_| {
+            // A success moves the pin with its cell.
+            try testing.expectEqual(@as(u21, 'Q'), marked_pin.rowAndCell().cell.content.codepoint.data);
             if (s.stale_tail == null) break;
             if (fail_after > 40) break;
             continue;
@@ -25132,6 +25157,11 @@ test "PageList reflowStep failure changes nothing" {
             try testing.expectEqual(error.OutOfMemory, err);
         }
 
+        // A failure puts the pin back exactly where it was.
+        try testing.expect(marked_pin.node == pin_before.node);
+        try testing.expectEqual(pin_before.y, marked_pin.y);
+        try testing.expectEqual(pin_before.x, marked_pin.x);
+        try testing.expectEqual(@as(u21, 'Q'), marked_pin.rowAndCell().cell.content.codepoint.data);
         try testing.expectEqual(total, s.total_rows);
         try testing.expectEqual(stale_rows, s.stale_rows);
         try testing.expect(s.stale_tail == tail);
@@ -25245,6 +25275,7 @@ test "PageList lazy reflow property: random operations match the eager twin" {
 
         lazy.assertStaleInvariant();
         try lazy.expectCountersForTest();
+        try lazy.expectEndsWrappedForTest();
         try testing.expectEqual(lazy.totalRows(), lazy.total_rows);
         try testing.expectEqual(lazy.total_rows, lazy.scrollbar().total);
         if (lazy.viewport == .pin) {
@@ -25255,6 +25286,7 @@ test "PageList lazy reflow property: random operations match the eager twin" {
     }
 
     try drainForTest(&lazy, random);
+    try lazy.expectEndsWrappedForTest();
     const want = try eager.dumpForTest(testing.allocator, true);
     defer testing.allocator.free(want);
     const got = try lazy.dumpForTest(testing.allocator, true);
