@@ -1499,7 +1499,17 @@ pub fn clone(
     // The cloned nodes up to the one that copies the stale tail are stale.
     var stale_tail: ?*List.Node = null;
     var stale_rows: usize = 0;
-    var past_tail = self.stale_tail == null;
+    // A clone starting after the stale tail copies only fresh pages.
+    var in_stale = in_stale: {
+        const tail = self.stale_tail orelse break :in_stale false;
+        var probe = it;
+        const first = probe.next() orelse break :in_stale false;
+        var n: ?*List.Node = first.node;
+        while (n) |x| : (n = x.next) {
+            if (x == tail) break :in_stale true;
+        }
+        break :in_stale false;
+    };
     while (it.next()) |chunk| {
         // Clone the page. We have to use createPageExt here because
         // we don't know if the source page has a standard size.
@@ -1530,10 +1540,10 @@ pub fn clone(
         dst_page.dirty = src_page.dirty;
 
         total_rows += node.rows();
-        if (!past_tail) {
+        if (in_stale) {
             stale_tail = node;
             stale_rows += node.rows();
-            past_tail = chunk.node == self.stale_tail.?;
+            in_stale = chunk.node != self.stale_tail.?;
         }
 
         // Remap our tracked pins by changing the page and
@@ -25217,4 +25227,65 @@ test "PageList lazy reflow property: random operations match the eager twin" {
     const got = try lazy.dumpForTest(testing.allocator, true);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(want, got);
+}
+
+test "PageList clone after the stale tail copies only fresh pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x434C4F4E);
+    var s = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesQuietForTest(40);
+    s.fillVariedRowsForTest(3);
+    try s.resize(.{ .cols = 50 });
+    try testing.expect(s.stale_tail != null);
+
+    // From the active area, and from the first fresh row: nothing is stale,
+    // and a step has nothing to do (it used to reach an unreachable).
+    const tops = [_]point.Point{
+        .{ .active = .{} },
+        .{ .screen = .{ .y = @intCast(s.stale_rows) } },
+        .{ .screen = .{ .y = @intCast(s.stale_rows + 7) } },
+    };
+    for (tops) |top| {
+        var copy = try s.clone(alloc, .{ .top = top });
+        defer copy.deinit();
+        try testing.expect(copy.stale_tail == null);
+        try testing.expectEqual(@as(usize, 0), copy.stale_rows);
+        try testing.expect(!copy.stale_soft);
+        copy.assertStaleInvariant();
+        copy.assertIntegrity();
+        const result = try copy.reflowStep(1000, 4);
+        try testing.expect(!result.pending);
+        try testing.expectEqual(@as(usize, 0), result.rows_reflowed);
+    }
+
+    // From inside the stale part: only the rows up to the tail are stale, and
+    // the copy drains to the same text.
+    // (Starting at a hard line start, so that the copy's first line is whole.)
+    var skip: u32 = 3;
+    while (s.pin(.{ .screen = .{ .y = skip } }).?.rowAndCell().row.wrap_continuation) skip += 1;
+    var copy = try s.clone(alloc, .{ .top = .{ .screen = .{ .y = skip } } });
+    defer copy.deinit();
+    try testing.expect(copy.stale_tail != null);
+    try testing.expectEqual(s.stale_rows - skip, copy.stale_rows);
+    copy.assertStaleInvariant();
+
+    // The lines before the copy's first row, in the source.
+    var lines: usize = 0;
+    for (0..skip) |y| {
+        const row = s.pin(.{ .screen = .{ .y = @intCast(y) } }).?.rowAndCell().row;
+        if (!row.wrap_continuation) lines += 1;
+    }
+
+    try drainForTest(&copy, prng.random());
+    try drainForTest(&s, prng.random());
+    const whole = try s.dumpForTest(alloc, true);
+    defer alloc.free(whole);
+    const after = try copy.dumpForTest(alloc, true);
+    defer alloc.free(after);
+    var offset: usize = 0;
+    for (0..lines) |_| offset = std.mem.indexOfScalarPos(u8, whole, offset, '\n').? + 1;
+    try testing.expectEqualStrings(whole[offset..], after);
 }
