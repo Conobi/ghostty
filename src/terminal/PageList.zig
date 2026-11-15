@@ -2375,6 +2375,8 @@ fn reflowChunk(self: *PageList, j: *List.Node) Allocator.Error!ChunkStats {
     self.stale_soft = if (before) |b| b.endsWrapped() else false;
     self.total_rows = self.total_rows - old_rows + new_rows;
     self.layout_generation +%= 1;
+    // The output sits wherever the scan has already passed.
+    self.counters.resetScan();
 
     const delta: isize = @as(isize, @intCast(new_rows)) - @as(isize, @intCast(old_rows));
     var window_after: usize = window_before;
@@ -25288,4 +25290,45 @@ test "PageList clone after the stale tail copies only fresh pages" {
     var offset: usize = 0;
     for (0..lines) |_| offset = std.mem.indexOfScalarPos(u8, whole, offset, '\n').? + 1;
     try testing.expectEqualStrings(whole[offset..], after);
+}
+
+test "PageList reflowStep output stays compressible by the incremental pass" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesQuietForTest(30);
+    s.fillVariedRowsForTest(5);
+
+    // The scan has passed every history page: all are compressed.
+    s.limits.resident_budget = PagePool.item_size;
+    while (s.compressOldestResident()) {}
+    try testing.expect(s.counters.cursor == s.getTopLeft(.active).node);
+
+    // Steps run with the viewport on the first history pages, which a step
+    // leaves resident, behind the scan position.
+    try s.resize(.{ .cols = 60 });
+    s.scroll(.top);
+    var random = std.Random.DefaultPrng.init(0x5343414E);
+    try drainForTest(&s, random.random());
+
+    s.scroll(.active);
+    const active = s.getTopLeft(.active).node;
+    var resident_history: usize = 0;
+    var n = s.pages.first;
+    while (n) |node| : (n = node.next) {
+        if (node == active) break;
+        if (node.storage() == .resident) resident_history += 1;
+    }
+    try testing.expect(resident_history > 0);
+
+    // The incremental pass reaches them and brings the history to the budget.
+    while (s.compressOldestResident()) {}
+    n = s.pages.first;
+    while (n) |node| : (n = node.next) {
+        if (node == active) break;
+        try testing.expect(node.storage() == .compressed or node.incompressible);
+    }
+    try testing.expect(s.counters.resident_size <= s.limits.resident_budget.? + 4 * PagePool.item_size);
+    try s.expectCountersForTest();
 }
