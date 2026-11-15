@@ -952,6 +952,12 @@ pub const RenderState = struct {
         // below behaves exactly as it does without overscan.
         const above_req: usize = self.overscan_request.above;
         const below_req: usize = self.overscan_request.below;
+        // A lazy reflow step must know which rows we capture to tell when it
+        // moves them.
+        t.screens.get(.primary).?.pages.render_overscan = .{
+            .above = self.overscan_request.above,
+            .below = self.overscan_request.below,
+        };
         const row_data_len: usize = above_req + s.pages.rows + below_req;
 
         // The first captured row and how many rows above the viewport

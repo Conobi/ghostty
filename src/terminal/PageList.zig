@@ -703,6 +703,14 @@ lazy_reflow: bool = false,
 /// is always in the fresh part.
 stale_tail: ?*List.Node = null,
 
+/// Rows above and below the viewport that the renderer captures (the render
+/// state's overscan request, recorded by its updates). A reflow step that
+/// touches them counts as moving what the viewport shows.
+render_overscan: struct {
+    above: size.CellCountInt = 0,
+    below: size.CellCountInt = 0,
+} = .{},
+
 /// Rows in the stale prefix; zero exactly when `stale_tail` is null.
 stale_rows: usize = 0,
 
@@ -2424,14 +2432,22 @@ fn reflowChunk(self: *PageList, j: *List.Node) Allocator.Error!ChunkStats {
     return .{
         .old_rows = old_rows,
         .new_rows = new_rows,
-        .viewport_changed = overlaps(window_before, self.rows, rows_before, old_rows) or
-            overlaps(window_after, self.rows, rows_before, new_rows),
+        .viewport_changed = self.windowOverlaps(window_before, rows_before, old_rows) or
+            self.windowOverlaps(window_after, rows_before, new_rows),
     };
 }
 
 /// The first node after `before`, or of the list when there is none.
 fn firstAfter(self: *const PageList, before: ?*List.Node) ?*List.Node {
     return if (before) |b| b.next else self.pages.first;
+}
+
+/// Whether the rows a renderer captures, the viewport window starting at row
+/// `window` plus `render_overscan`, share a row with the `len` rows from `start`.
+fn windowOverlaps(self: *const PageList, window: usize, start: usize, len: usize) bool {
+    const above: usize = self.render_overscan.above;
+    const below: usize = self.render_overscan.below;
+    return overlaps(window -| above, self.rows + above + below, start, len);
 }
 
 /// Whether two row ranges, given by start and length, share a row.
@@ -25345,6 +25361,50 @@ test "PageList lazy resize failure keeps the stale boundary consistent" {
             if (variant == .whole) try testing.expect(s.stale_tail == null);
         }
     }
+}
+
+/// Rows above the chunk `reflowStep(max_rows, max_pages)` would reflow next.
+fn rowsBeforeChunkForTest(self: *PageList, max_rows: usize, max_pages: usize) usize {
+    const j = self.chunkStart(max_rows, max_pages);
+    var rows: usize = 0;
+    var n = self.pages.first;
+    while (n != j) : (n = n.?.next) rows += n.?.rows();
+    return rows;
+}
+
+test "PageList reflowStep reports viewport overlap including the render overscan" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesQuietForTest(60);
+    s.fillVariedRowsForTest(1);
+    try s.resize(.{ .cols = 50 });
+
+    // The window ends just above the chunk: no overlap, until overscan
+    // below reaches into it.
+    var rows_before = s.rowsBeforeChunkForTest(1, 1);
+    s.scroll(.{ .row = rows_before - s.rows - 1 });
+    try testing.expect(s.viewport == .pin);
+    var step = try s.reflowStep(1, 1);
+    try testing.expect(!step.viewport_changed);
+
+    rows_before = s.rowsBeforeChunkForTest(1, 1);
+    s.scroll(.{ .row = rows_before - s.rows - 1 });
+    s.render_overscan = .{ .below = 3 };
+    step = try s.reflowStep(1, 1);
+    try testing.expect(step.viewport_changed);
+
+    // The window starts just below the chunk: the same with overscan above.
+    s.render_overscan = .{};
+    s.scroll(.{ .row = s.stale_rows + 2 });
+    step = try s.reflowStep(1, 1);
+    try testing.expect(!step.viewport_changed);
+
+    s.scroll(.{ .row = s.stale_rows + 2 });
+    s.render_overscan = .{ .above = 4 };
+    step = try s.reflowStep(1, 1);
+    try testing.expect(step.viewport_changed);
 }
 
 test "PageList reflowStep output stays compressible by the incremental pass" {
