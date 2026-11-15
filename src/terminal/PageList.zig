@@ -25455,27 +25455,33 @@ test "PageList reflowStep output stays compressible by the incremental pass" {
     try s.growColdPagesQuietForTest(30);
     s.fillVariedRowsForTest(5);
 
-    // The scan has passed every history page: all are compressed.
-    s.limits.resident_budget = PagePool.item_size;
-    while (s.compressOldestResident()) {}
-    try testing.expect(s.counters.cursor == s.getTopLeft(.active).node);
-
-    // Steps run with the viewport on the first history pages, which a step
-    // leaves resident, behind the scan position.
-    try s.resize(.{ .cols = 60 });
-    s.scroll(.top);
-    // The resize reset the scan; let it pass every page again.
-    while (s.compressOldestResident()) {}
-    try testing.expect(s.counters.cursor == s.getTopLeft(.active).node);
-    var random = std.Random.DefaultPrng.init(0x5343414E);
-    try drainForTest(&s, random.random());
-
-    s.scroll(.active);
+    // The scan skips the history, so its pages stay resident: destroying a
+    // compressed page would restore it, which itself resets the scan.
     const active = s.getTopLeft(.active).node;
-    var resident_history: usize = 0;
     var n = s.pages.first;
     while (n) |node| : (n = node.next) {
         if (node == active) break;
+        node.incompressible = true;
+    }
+    s.limits.resident_budget = PagePool.item_size;
+    while (s.compressOldestResident()) {}
+    try testing.expect(s.counters.cursor == active);
+
+    // The resize resets the scan: pass over the history again, so that it
+    // sits behind the pages the steps are about to create.
+    try s.resize(.{ .cols = 60 });
+    while (s.compressOldestResident()) {}
+    const scanned = s.getTopLeft(.active).node;
+    try testing.expect(s.counters.cursor == scanned);
+    var random = std.Random.DefaultPrng.init(0x5343414E);
+    try drainForTest(&s, random.random());
+    try testing.expect(s.counters.cursor == null);
+
+    // A step leaves its output resident, behind the scan position.
+    var resident_history: usize = 0;
+    n = s.pages.first;
+    while (n) |node| : (n = node.next) {
+        if (node == s.getTopLeft(.active).node) break;
         if (node.storage() == .resident) resident_history += 1;
     }
     try testing.expect(resident_history > 0);
@@ -25484,7 +25490,7 @@ test "PageList reflowStep output stays compressible by the incremental pass" {
     while (s.compressOldestResident()) {}
     n = s.pages.first;
     while (n) |node| : (n = node.next) {
-        if (node == active) break;
+        if (node == s.getTopLeft(.active).node) break;
         try testing.expect(node.storage() == .compressed or node.incompressible);
     }
     try testing.expect(s.counters.resident_size <= s.limits.resident_budget.? + 4 * PagePool.item_size);
