@@ -1839,6 +1839,7 @@ fn resizeCols(
     // may call below relies on this to calculate the proper page size, but
     // after preserved_cursor so that the cursor pin can resolve coordinates in
     // the old active coordinate space.
+    const old_cols = self.cols;
     self.cols = cols;
 
     // Create the first node that contains our reflow.
@@ -1861,7 +1862,11 @@ fn resizeCols(
             break :err cap;
         };
 
-        const node = try self.createPage(.{ .cap = cap });
+        // Nothing has moved yet, so a failure leaves the old width.
+        const node = self.createPage(.{ .cap = cap }) catch |err| {
+            self.cols = old_cols;
+            return err;
+        };
         node.page().size.rows = 1;
         break :node node;
     };
@@ -1884,17 +1889,20 @@ fn resizeCols(
     const pin_in_tail = tail != null and self.viewport == .pin and
         (self.viewport_pin_row_offset orelse 0) >= prefix_rows;
 
-    // The rows the reflow has produced so far, for the error path.
-    var reflowed_rows: usize = 0;
     errdefer {
         // The list stays valid: the untouched prefix, then what was written.
+        // Without a lazy tail the old prefix is destroyed below, so no stale
+        // boundary may survive. The row count is read back from the nodes:
+        // the failing row, or a later grow, may have changed it.
         if (tail != null) {
             self.stale_tail = stale_prev;
             self.stale_rows = prefix_rows;
             self.stale_soft = if (stale_prev) |p| p.endsWrapped() else false;
-            self.total_rows = prefix_rows + reflowed_rows;
-            self.viewport_pin_row_offset = null;
+        } else {
+            self.clearStale();
         }
+        self.viewport_pin_row_offset = null;
+        self.total_rows = self.countRows();
 
         // If an error occurs, we're in a pretty disastrous broken state,
         // but we should still try to clean up our leaked memory. Free
@@ -1964,7 +1972,6 @@ fn resizeCols(
                 self.recycle_node = row.node;
             }
 
-            reflowed_rows = reflow_cursor.total_rows;
             sweep.advance(self, reflow_cursor.node, prefix_rows + reflow_cursor.total_rows);
         }
 
@@ -2058,6 +2065,14 @@ fn resizeCols(
             req_rows -= 1;
         }
     }
+}
+
+/// The rows of every node, counted rather than read from `total_rows`.
+fn countRows(self: *const PageList) usize {
+    var n: usize = 0;
+    var node_ = self.pages.first;
+    while (node_) |node| : (node_ = node.next) n += node.rows();
+    return n;
 }
 
 /// The first row of the fresh part, or null when the whole list is fresh.
@@ -25290,6 +25305,46 @@ test "PageList clone after the stale tail copies only fresh pages" {
     var offset: usize = 0;
     for (0..lines) |_| offset = std.mem.indexOfScalarPos(u8, whole, offset, '\n').? + 1;
     try testing.expectEqualStrings(whole[offset..], after);
+}
+
+test "PageList lazy resize failure keeps the stale boundary consistent" {
+    const testing = std.testing;
+
+    // Variants: a fresh list, a list with a stale prefix, and a list with a
+    // stale prefix whose next resize reflows everything (lazy switched off).
+    const Variant = enum { fresh, stale, whole };
+    for ([_]Variant{ .fresh, .stale, .whole }) |variant| {
+        var fail_after: usize = 0;
+        while (true) : (fail_after += 1) {
+            try testing.expect(fail_after < 600);
+            var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+            var s = try init(failing.allocator(), .{ .cols = 80, .rows = 24 });
+            defer s.deinit();
+            s.lazy_reflow = true;
+            try s.growColdPagesQuietForTest(14);
+            s.fillVariedRowsForTest(5);
+            if (variant != .fresh) {
+                try s.resize(.{ .cols = 60 });
+                try testing.expect(s.stale_tail != null);
+            }
+            if (variant == .whole) s.lazy_reflow = false;
+
+            failing.fail_index = failing.alloc_index + fail_after;
+            const result = s.resize(.{ .cols = 45 });
+            failing.fail_index = std.math.maxInt(usize);
+            if (result) |_| {
+                if (variant == .whole) try testing.expect(s.stale_tail == null);
+                break;
+            } else |err| try testing.expectEqual(error.OutOfMemory, err);
+
+            // Whatever was reached, the boundary and the row count agree
+            // with the nodes, and a later step can run.
+            s.assertStaleInvariant();
+            try testing.expectEqual(s.countRows(), s.total_rows);
+            try s.verifyIntegrity();
+            if (variant == .whole) try testing.expect(s.stale_tail == null);
+        }
+    }
 }
 
 test "PageList reflowStep output stays compressible by the incremental pass" {
