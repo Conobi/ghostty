@@ -174,6 +174,12 @@ pub fn NodeIndex(comptime Ptr: type) type {
         // Sums over all entries, dropped included.
         tot_rows: u64 = 0,
         tot_lines: u64 = 0,
+        // A compaction in progress: the live entries are being copied down
+        // by `move_shift` (a whole number of blocks), `moved` of them so far.
+        // Readers keep using the old place until the last chunk lands.
+        move_shift: usize = 0,
+        moved: usize = 0,
+        moving: bool = false,
 
         /// Free the arrays.
         pub fn deinit(self: *Self, alloc: Allocator) void {
@@ -233,6 +239,7 @@ pub fn NodeIndex(comptime Ptr: type) type {
         pub fn truncate(self: *Self, from: usize) void {
             if (from >= self.len()) return;
             const new_len = self.head + from;
+            self.cancelMoveFrom(new_len);
             self.nodes.shrinkRetainingCapacity(new_len);
             self.rows_.shrinkRetainingCapacity(new_len);
             self.lines_.shrinkRetainingCapacity(new_len);
@@ -309,6 +316,8 @@ pub fn NodeIndex(comptime Ptr: type) type {
         pub fn splice(self: *Self, alloc: Allocator, pos: usize, remove: usize, new_entries: []const Entry) Allocator.Error!void {
             std.debug.assert(pos + remove <= self.len());
             const s = self.head + pos;
+            self.cancelMoveFrom(s);
+            if (remove == new_entries.len) return self.overwrite(s, new_entries);
             const new_len = self.nodes.items.len - remove + new_entries.len;
             try self.nodes.ensureTotalCapacity(alloc, new_len);
             try self.rows_.ensureTotalCapacity(alloc, new_len);
@@ -328,7 +337,35 @@ pub fn NodeIndex(comptime Ptr: type) type {
             self.recomputeFrom(s);
         }
 
-        /// Drop the first `n` live entries in O(n).
+        /// Replace as many entries as given, in place, at array index `s`: no
+        /// memmove, and the block sums shift by the change instead of being
+        /// rebuilt (a lazy reflow step often keeps the node count).
+        fn overwrite(self: *Self, s: usize, new_entries: []const Entry) void {
+            var d_rows: i64 = 0;
+            var d_lines: i64 = 0;
+            for (new_entries, s..) |e, i| {
+                d_rows += @as(i64, e.rows) - self.rows_.items[i];
+                d_lines += @as(i64, e.lines) - self.lines_.items[i];
+                self.nodes.items[i] = e.node;
+                self.rows_.items[i] = e.rows;
+                self.lines_.items[i] = e.lines;
+                // A block that starts inside the range sees the change so far.
+                if ((i + 1) % block_entries == 0 and (i + 1) / block_entries < self.pre_rows.items.len) {
+                    const b = (i + 1) / block_entries;
+                    self.pre_rows.items[b] = @intCast(@as(i64, @intCast(self.pre_rows.items[b])) + d_rows);
+                    self.pre_lines.items[b] = @intCast(@as(i64, @intCast(self.pre_lines.items[b])) + d_lines);
+                }
+            }
+            // Blocks starting beyond it see all of it.
+            const first = (s + new_entries.len) / block_entries + 1;
+            for (self.pre_rows.items[@min(first, self.pre_rows.items.len)..]) |*v| v.* = @intCast(@as(i64, @intCast(v.*)) + d_rows);
+            for (self.pre_lines.items[@min(first, self.pre_lines.items.len)..]) |*v| v.* = @intCast(@as(i64, @intCast(v.*)) + d_lines);
+            self.tot_rows = @intCast(@as(i64, @intCast(self.tot_rows)) + d_rows);
+            self.tot_lines = @intCast(@as(i64, @intCast(self.tot_lines)) + d_lines);
+        }
+
+        /// Drop the first `n` live entries in O(n). Dead entries are reclaimed
+        /// in bounded chunks over the next calls, never in one long move.
         pub fn dropFront(self: *Self, n: usize) void {
             std.debug.assert(n <= self.len());
             for (self.head..self.head + n) |i| {
@@ -336,24 +373,87 @@ pub fn NodeIndex(comptime Ptr: type) type {
                 self.base_lines += self.lines_.items[i];
             }
             self.head += n;
+            if (self.moving) return self.moveChunk();
             // Compact once more than half of the arrays is dead.
-            if (self.head > 0 and self.head * 2 > self.nodes.items.len) self.compact();
+            if (self.head * 2 <= self.nodes.items.len or self.head < block_entries) return;
+            const shift = self.head / block_entries * block_entries;
+            const live = self.nodes.items.len - shift;
+            // Small, or so dead that the memory matters more: move it at once.
+            if (live <= move_chunk or self.head > 3 * self.len()) return self.compactNow();
+            // The copy must land in dead entries only: no overlap with the
+            // live range, or readers would see torn entries.
+            if (live > self.head) return;
+            self.move_shift = shift;
+            self.moved = 0;
+            self.moving = true;
+            self.moveChunk();
         }
 
-        fn compact(self: *Self) void {
-            const h = self.head;
-            const live = self.nodes.items.len - h;
-            @memmove(self.nodes.items[0..live], self.nodes.items[h..][0..live]);
-            @memmove(self.rows_.items[0..live], self.rows_.items[h..][0..live]);
-            @memmove(self.lines_.items[0..live], self.lines_.items[h..][0..live]);
-            self.nodes.items.len = live;
-            self.rows_.items.len = live;
-            self.lines_.items.len = live;
-            self.head = 0;
-            self.base_rows = 0;
-            self.base_lines = 0;
-            // Shrinking never needs capacity: the new block count is lower.
-            self.recomputeFrom(0);
+        /// Entries copied per call while compacting: about 100 KB, a few µs (small in tests, so they reach it).
+        const move_chunk = if (@import("builtin").is_test) 64 else 8192;
+
+        /// Forget a partial copy that an edit starting at array index `start`
+        /// made stale: only the entries already copied matter.
+        fn cancelMoveFrom(self: *Self, start: usize) void {
+            if (self.moving and start < self.move_shift + self.moved) self.moving = false;
+        }
+
+        /// Copy the next chunk of the live entries down; the last one ends
+        /// the compaction.
+        fn moveChunk(self: *Self) void {
+            const end = self.nodes.items.len;
+            const from = self.move_shift + self.moved;
+            // An append since the start may have grown the live range into
+            // the destination: start over rather than corrupt it.
+            if (end - self.move_shift > self.head) {
+                self.moving = false;
+                return;
+            }
+            const c = @min(move_chunk, end - from);
+            @memcpy(self.nodes.items[self.moved..][0..c], self.nodes.items[from..][0..c]);
+            @memcpy(self.rows_.items[self.moved..][0..c], self.rows_.items[from..][0..c]);
+            @memcpy(self.lines_.items[self.moved..][0..c], self.lines_.items[from..][0..c]);
+            self.moved += c;
+            if (from + c >= end) {
+                self.moving = false;
+                self.finishCompact(self.move_shift);
+            }
+        }
+
+        /// Move every live entry down at once.
+        fn compactNow(self: *Self) void {
+            const shift = self.head / block_entries * block_entries;
+            if (shift == 0) return;
+            const n = self.nodes.items.len - shift;
+            @memmove(self.nodes.items[0..n], self.nodes.items[shift..][0..n]);
+            @memmove(self.rows_.items[0..n], self.rows_.items[shift..][0..n]);
+            @memmove(self.lines_.items[0..n], self.lines_.items[shift..][0..n]);
+            self.finishCompact(shift);
+        }
+
+        /// The entries are already `shift` (a whole number of blocks) lower:
+        /// switch over. Block sums only lose the removed blocks, O(blocks)
+        /// instead of a rebuild over every entry.
+        fn finishCompact(self: *Self, shift: usize) void {
+            const k = shift / block_entries;
+            const n = self.nodes.items.len - shift;
+            self.nodes.items.len = n;
+            self.rows_.items.len = n;
+            self.lines_.items.len = n;
+            const cut_rows = self.pre_rows.items[k];
+            const cut_lines = self.pre_lines.items[k];
+            const blocks = self.pre_rows.items.len - k;
+            for (0..blocks) |b| {
+                self.pre_rows.items[b] = self.pre_rows.items[b + k] - cut_rows;
+                self.pre_lines.items[b] = self.pre_lines.items[b + k] - cut_lines;
+            }
+            self.pre_rows.items.len = blocks;
+            self.pre_lines.items.len = blocks;
+            self.head -= shift;
+            self.base_rows -= cut_rows;
+            self.base_lines -= cut_lines;
+            self.tot_rows -= cut_rows;
+            self.tot_lines -= cut_lines;
         }
 
         /// The entry holding the k-th (0-based, among live entries) line end.
@@ -762,6 +862,118 @@ test "LineIndex NodeIndex append truncate splice dropFront and find agree with a
     try index.append(alloc, 7, 3, 2);
     try testing.expectEqual(@as(u64, 3), index.totalRows());
     try testing.expectEqual(@as(usize, 0), index.findLine(1).?.index);
+}
+
+test "LineIndex NodeIndex same-length splices and block-aligned compaction agree with a naive prefix sum" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xc0de);
+    const rnd = prng.random();
+    var index: TestIndex = .{};
+    defer index.deinit(alloc);
+    var model: std.ArrayList(TestIndex.Entry) = .empty;
+    defer model.deinit(alloc);
+
+    var id: u32 = 0;
+    const gen = struct {
+        fn entry(r: std.Random, next: *u32) TestIndex.Entry {
+            next.* += 1;
+            const rows = r.intRangeAtMost(u16, 1, 9);
+            return .{ .node = next.*, .rows = rows, .lines = r.intRangeAtMost(u16, 0, rows) };
+        }
+    };
+    for (0..3000) |_| {
+        const e = gen.entry(rnd, &id);
+        try index.append(alloc, e.node, e.rows, e.lines);
+        try model.append(alloc, e);
+    }
+    for (0..60) |_| {
+        // Same-length splices, sometimes spanning several blocks.
+        const n = if (rnd.boolean()) rnd.intRangeAtMost(usize, 0, 4) else rnd.intRangeAtMost(usize, 250, 600);
+        const pos = rnd.intRangeAtMost(usize, 0, model.items.len - n);
+        const fresh = try alloc.alloc(TestIndex.Entry, n);
+        defer alloc.free(fresh);
+        for (fresh) |*f| f.* = gen.entry(rnd, &id);
+        try index.splice(alloc, pos, n, fresh);
+        try model.replaceRange(alloc, pos, n, fresh);
+        try expectIndexMatches(&index, model.items);
+
+        // Drops that cross the compaction threshold, then refill.
+        if (rnd.uintLessThan(u8, 4) == 0) {
+            const d = rnd.intRangeAtMost(usize, 0, model.items.len / 2 + 300);
+            const drop = @min(d, model.items.len);
+            index.dropFront(drop);
+            model.replaceRangeAssumeCapacity(0, drop, &.{});
+            for (0..700) |_| {
+                const e = gen.entry(rnd, &id);
+                try index.append(alloc, e.node, e.rows, e.lines);
+                try model.append(alloc, e);
+            }
+            try expectIndexMatches(&index, model.items);
+        }
+    }
+}
+
+test "LineIndex NodeIndex chunked compaction survives edits while it runs" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xfeed);
+    const rnd = prng.random();
+    var index: TestIndex = .{};
+    defer index.deinit(alloc);
+    var model: std.ArrayList(TestIndex.Entry) = .empty;
+    defer model.deinit(alloc);
+
+    var id: u32 = 0;
+    const gen = struct {
+        fn entry(r: std.Random, next: *u32) TestIndex.Entry {
+            next.* += 1;
+            const rows = r.intRangeAtMost(u16, 1, 9);
+            return .{ .node = next.*, .rows = rows, .lines = r.intRangeAtMost(u16, 0, rows) };
+        }
+    };
+    for (0..2_500) |_| {
+        const e = gen.entry(rnd, &id);
+        try index.append(alloc, e.node, e.rows, e.lines);
+        try model.append(alloc, e);
+    }
+    var saw_moving = false;
+    for (0..150) |_| {
+        switch (rnd.uintLessThan(u8, 5)) {
+            0, 1 => { // drop a little: advances a running compaction
+                const d = @min(rnd.intRangeAtMost(usize, 0, 120), model.items.len / 2);
+                index.dropFront(d);
+                model.replaceRangeAssumeCapacity(0, d, &.{});
+            },
+            2 => { // append
+                for (0..rnd.intRangeAtMost(usize, 20, 150)) |_| {
+                    const e = gen.entry(rnd, &id);
+                    try index.append(alloc, e.node, e.rows, e.lines);
+                    try model.append(alloc, e);
+                }
+            },
+            3 => { // splice, same length or not, anywhere
+                const pos = rnd.intRangeAtMost(usize, 0, model.items.len - 6);
+                const remove = rnd.intRangeAtMost(usize, 0, 5);
+                var fresh: [6]TestIndex.Entry = undefined;
+                const add = if (rnd.boolean()) remove else rnd.intRangeAtMost(usize, 0, 6);
+                for (fresh[0..add]) |*f| f.* = gen.entry(rnd, &id);
+                try index.splice(alloc, pos, remove, fresh[0..add]);
+                try model.replaceRange(alloc, pos, remove, fresh[0..add]);
+            },
+            else => { // truncate a little, then refill
+                const from = model.items.len - rnd.intRangeAtMost(usize, 0, 30);
+                index.truncate(from);
+                model.shrinkRetainingCapacity(from);
+                for (0..60) |_| {
+                    const e = gen.entry(rnd, &id);
+                    try index.append(alloc, e.node, e.rows, e.lines);
+                    try model.append(alloc, e);
+                }
+            },
+        }
+        saw_moving = saw_moving or index.moving;
+        try expectIndexMatches(&index, model.items);
+    }
+    try testing.expect(saw_moving);
 }
 
 test "LineIndex EditLog since reports overflow after 16 unread edits" {
