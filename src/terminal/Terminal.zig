@@ -19954,3 +19954,82 @@ test "Terminal: reflowStep marks the screen dirty when the viewport overlaps" {
     try testing.expect(inside.viewport_changed);
     try testing.expect(t.flags.dirty.clear);
 }
+
+test "Terminal LineIndex prompt redraw through the stream logs a rewrite edit" {
+    const testing_ = std.testing;
+    const alloc = testing_.allocator;
+    const LineIndex = @import("LineIndex.zig");
+    var t = try init(testing_.io, alloc, .{ .cols = 10, .rows = 3, .max_scrollback_bytes = null });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // A finished command, then a prompt of four rows whose first row has
+    // scrolled into history, all through OSC 133.
+    s.nextSlice("\x1b]133;A\x1b\\$ ls\x1b]133;B\x1b\\\x1b]133;C\x1b\\\r\nout1\r\nout2\r\n");
+    s.nextSlice("\x1b]133;A\x1b\\p1\r\n");
+    s.nextSlice("\x1b]133;P;k=c\x1b\\p2\r\n");
+    s.nextSlice("\x1b]133;P;k=c\x1b\\p3\r\n");
+    s.nextSlice("\x1b]133;P;k=c\x1b\\> \x1b]133;B\x1b\\echo");
+
+    const pages = &t.screens.active.pages;
+    var before = pages.lineState();
+    while (!before.index_ready) before = pages.lineState();
+    // Row of "p1": four rows (p1 p2 p3 and the input line) are at or below it.
+    const p1_row = pages.total_rows - 4;
+    try testing_.expect(p1_row < before.history_rows);
+    const p1_line = pages.rowLine(p1_row).?;
+
+    try t.resize(alloc, .{ .cols = 20, .rows = 3 });
+
+    var out: [4]LineIndex.LineEdit = undefined;
+    const got = pages.edit_log.since(before.edit_seq, &out);
+    try testing_.expectEqual(@as(usize, 1), got.n);
+    try testing_.expectEqual(LineIndex.EditKind.rewrite, out[0].kind);
+    try testing_.expectEqual(p1_line, out[0].first_line);
+    try testing_.expect(out[0].old_lines >= 1);
+}
+
+test "Terminal LineIndex prompt redraw with history on several pages logs a rewrite edit" {
+    const testing_ = std.testing;
+    const alloc = testing_.allocator;
+    const LineIndex = @import("LineIndex.zig");
+    var t = try init(testing_.io, alloc, .{ .cols = 10, .rows = 3, .max_scrollback_bytes = null });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Enough history for several pages, then a prompt of four rows.
+    {
+        var bulk: PageList.BulkGrowth = .init(&t.screens.active.pages);
+        defer bulk.finish();
+        for (0..30_000) |i| {
+            var buf: [24]u8 = undefined;
+            s.nextSlice(std.fmt.bufPrint(&buf, "line {d}\r\n", .{i}) catch unreachable);
+            if (i % 50 == 49) bulk.refresh();
+        }
+    }
+    s.nextSlice("\x1b]133;A\x1b\\p1\r\n");
+    s.nextSlice("\x1b]133;P;k=c\x1b\\p2\r\n");
+    s.nextSlice("\x1b]133;P;k=c\x1b\\p3\r\n");
+    s.nextSlice("\x1b]133;P;k=c\x1b\\> \x1b]133;B\x1b\\echo");
+
+    const pages = &t.screens.active.pages;
+    var before = pages.lineState();
+    while (!before.index_ready) before = pages.lineState();
+    try testing_.expect(pages.line_index.len() >= 2);
+    const p1_row = pages.total_rows - 4;
+    const p1_line = pages.rowLine(p1_row).?;
+
+    try t.resize(alloc, .{ .cols = 20, .rows = 3 });
+
+    var out: [8]LineIndex.LineEdit = undefined;
+    const got = pages.edit_log.since(before.edit_seq, &out);
+    var rewrites: usize = 0;
+    for (out[0..got.n]) |e| {
+        if (e.kind != .rewrite) continue;
+        rewrites += 1;
+        try testing_.expectEqual(p1_line, e.first_line);
+    }
+    try testing_.expectEqual(@as(usize, 1), rewrites);
+}

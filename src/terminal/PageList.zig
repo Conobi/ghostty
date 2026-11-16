@@ -5969,18 +5969,60 @@ fn lineChunkReplaced(
     }
 }
 
+/// Line ends in the rows above row `row` (from the top of the list), by a
+/// walk over the nodes: slow, and independent of the index. Null when a
+/// compressed page cannot be read.
+fn lineEndsAbove(self: *PageList, row: u64) ?u64 {
+    var lines: u64 = 0;
+    var rows_before: u64 = 0;
+    var bits: [line_bitmap_words]u64 = undefined;
+    var it = self.pages.first;
+    while (it) |n| : (it = n.next) {
+        if (rows_before >= row) break;
+        if (rows_before + n.rows() <= row) {
+            lines += self.nodeLineEnds(n) orelse return null;
+            rows_before += n.rows();
+            continue;
+        }
+        const scan = self.scanLineEnds(n, &bits) orelse return null;
+        lines += LineIndex.rankBits(scan.bits, @intCast(row - rows_before));
+        break;
+    }
+    return lines;
+}
+
 /// The rows from `start` down are about to be cleared (a prompt the shell
 /// redraws). Wrap flags stay, so ids and counts hold; readers must read the
 /// history lines it touches again.
+///
+/// A reflow that came first (a resize clears the prompt after reflowing)
+/// has cut the index, so the lines are then counted by walking the list:
+/// readers may have seen them before the cut.
 pub fn lineRewritten(self: *PageList, start: Pin) void {
     var below: usize = 0;
     var it: ?*List.Node = start.node;
     while (it) |n| : (it = n.next) below += n.rows();
     below -= start.y;
     const row: u64 = self.total_rows - below;
-    if (row >= self.total_rows - self.rows) return;
-    const first = self.rowLine(row) orelse return;
-    const end = self.lineBase() + self.completeLines();
+    const history = self.total_rows - self.rows;
+    if (row >= history) return;
+
+    const base = self.lineBase();
+    var first: u64 = undefined;
+    var end: u64 = undefined;
+    if (self.rowLine(row)) |f| {
+        first = f;
+        end = base + self.completeLines();
+    } else {
+        const above = self.lineEndsAbove(row);
+        const through = self.lineEndsAbove(history);
+        if (above == null or through == null) {
+            self.edit_log.markLost();
+            return;
+        }
+        first = base + above.?;
+        end = base + through.?;
+    }
     if (first >= end) return;
     _ = self.edit_log.push(.rewrite, first, end - first, end - first);
 }
