@@ -87,7 +87,12 @@ pub fn grid_ref_down(
     if (comptime !(lib.feature(.grid_introspection) or lib.feature(.selection))) return .unsupported;
     const ref = ref_ orelse return .invalid_value;
     const out = out_ orelse return .invalid_value;
-    const p = ref.toPin() orelse return .invalid_value;
+    // Only the row must lie in the node: the column is clamped below, as the
+    // header promises, so a caller can ask for "the last column" of rows
+    // whose pages are narrower (a lazy reflow's stale history).
+    const node = ref.node orelse return .invalid_value;
+    if (ref.y >= node.rows()) return .invalid_value;
+    const p: PageList.Pin = .{ .node = node, .x = ref.x, .y = ref.y };
     var moved = p.down(rows) orelse return .invalid_value;
     moved.x = @min(moved.x, moved.node.cols() - 1);
     out.* = CGridRef.fromPin(moved);
@@ -254,6 +259,11 @@ test "grid_ref rejects forged coordinates outside the node" {
     var bad_x = ref;
     bad_x.x = node.cols();
     try testing.expectEqual(Result.invalid_value, grid_ref_cell(&bad_x, &cell));
+
+    // Moving down only needs a valid row: the column is clamped.
+    bad_x.x = std.math.maxInt(u16);
+    try testing.expectEqual(Result.success, grid_ref_down(&bad_x, 0, &moved));
+    try testing.expectEqual(node.cols() - 1, moved.x);
 
     // The last valid cell still works.
     var last = ref;
