@@ -322,6 +322,12 @@ comptime {
         @export(&c.terminal_compression_activity, .{ .name = "ghostty_terminal_compression_activity" });
         @export(&c.terminal_compress, .{ .name = "ghostty_terminal_compress" });
         @export(&c.terminal_reflow_step, .{ .name = "ghostty_terminal_reflow_step" });
+        @export(&c.terminal_line_edits, .{ .name = "ghostty_terminal_line_edits" });
+        @export(&c.terminal_line_rows, .{ .name = "ghostty_terminal_line_rows" });
+        @export(&c.terminal_row_line, .{ .name = "ghostty_terminal_row_line" });
+        @export(&c.terminal_lines_rows, .{ .name = "ghostty_terminal_lines_rows" });
+        @export(&c.terminal_read_lines, .{ .name = "ghostty_terminal_read_lines" });
+        @export(&c.terminal_locate_bytes, .{ .name = "ghostty_terminal_locate_bytes" });
         @export(&c.terminal_screen_rows_wrapped_preserving, .{ .name = "ghostty_terminal_screen_rows_wrapped_preserving" });
         @export(&c.terminal_grid_ref_rows_wrapped_preserving, .{ .name = "ghostty_terminal_grid_ref_rows_wrapped_preserving" });
         @export(&c.terminal_get, .{ .name = "ghostty_terminal_get" });

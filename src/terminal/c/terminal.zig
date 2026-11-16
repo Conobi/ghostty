@@ -12,6 +12,8 @@ const StreamBoundary = @import("../stream.zig").Boundary;
 const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
 const PageList = @import("../PageList.zig");
+const LineIndex = @import("../LineIndex.zig");
+const formatter_core = @import("../formatter.zig");
 const apc = @import("../apc.zig");
 const kitty = @import("../kitty/key.zig");
 const kitty_gfx_c = @import("kitty_graphics.zig");
@@ -1474,6 +1476,160 @@ pub fn reflow_step(
     return .success;
 }
 
+/// The primary screen's pages: every line call acts on them, whichever
+/// screen is active.
+fn primaryPages(t: *ZigTerminal) *PageList {
+    return &t.screens.get(.primary).?.pages;
+}
+
+pub fn line_edits(
+    terminal_: Terminal,
+    since_seq: u64,
+    out_: ?[*]LineEdit,
+    cap: usize,
+    out_n_: ?*usize,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const out_n = out_n_ orelse return .invalid_value;
+    if (cap > 0 and out_ == null) return .invalid_value;
+
+    var tmp: [LineIndex.edit_ring]LineIndex.LineEdit = undefined;
+    const got = primaryPages(t).edit_log.since(since_seq, tmp[0..@min(cap, tmp.len)]);
+    if (out_) |out| for (tmp[0..got.n], 0..) |e, i| {
+        out[i] = .{
+            .seq = e.seq,
+            .kind = switch (e.kind) {
+                .recount => .recount,
+                .rewrite => .rewrite,
+            },
+            .first_line = e.first_line,
+            .old_lines = e.old_lines,
+            .new_lines = e.new_lines,
+        };
+    };
+    out_n.* = got.n;
+    return .success;
+}
+
+pub fn line_rows(
+    terminal_: Terminal,
+    line: u64,
+    out_: ?*LineRows,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const out = out_ orelse return .invalid_value;
+    const pages = primaryPages(t);
+    const rows = pages.lineRows(line) orelse return .no_value;
+    out.* = .{
+        .start_row = pages.rows_pruned + rows.start_row,
+        .end_row = pages.rows_pruned + rows.end_row,
+    };
+    return .success;
+}
+
+pub fn row_line(
+    terminal_: Terminal,
+    row: u64,
+    out_: ?*u64,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const out = out_ orelse return .invalid_value;
+    const pages = primaryPages(t);
+    if (row < pages.rows_pruned) return .no_value;
+    out.* = pages.rowLine(row - pages.rows_pruned) orelse return .no_value;
+    return .success;
+}
+
+pub fn lines_rows(
+    terminal_: Terminal,
+    lines_: ?[*]const u64,
+    n: usize,
+    out_: ?[*]u64,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    if (n == 0) return .success;
+    const lines = lines_ orelse return .invalid_value;
+    const out = out_ orelse return .invalid_value;
+    const pages = primaryPages(t);
+    _ = pages.linesRows(lines[0..n], out[0..n], 0, n);
+    for (out[0..n]) |*row| {
+        if (row.* != PageList.line_unknown) row.* += pages.rows_pruned;
+    }
+    return .success;
+}
+
+pub fn read_lines(
+    terminal_: Terminal,
+    first_line: u64,
+    resume_: ?*const LineResume,
+    max_lines: usize,
+    max_bytes: usize,
+    writer: c_io.Writer,
+    out_: ?*LineRead,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const out = out_ orelse return .invalid_value;
+    if (!writer.valid()) return .invalid_value;
+
+    var buffer: [c_io.WriterAdapter.recommended_buffer_len]u8 = undefined;
+    var adapter: c_io.WriterAdapter = .initBuffered(writer, &buffer);
+    const resume_at: LineResume = if (resume_) |r| r.* else .{};
+    const read = formatter_core.readLines(
+        primaryPages(t),
+        first_line,
+        resume_at,
+        max_lines,
+        max_bytes,
+        adapter.writer(),
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return .out_of_memory,
+        error.WriteFailed => return if (adapter.invalid_write) .limit_exceeded else .io_error,
+    };
+    adapter.writer().flush() catch return .io_error;
+
+    out.* = .{
+        .first_line_read = read.first_line_read,
+        .lines = read.lines,
+        .bytes = read.bytes,
+        .next_line = read.next_line,
+        .rows_formatted = read.rows_formatted,
+        .next = read.resumePoint(),
+        .reached_end = read.reached_end,
+        .last_unterminated = read.last_unterminated,
+    };
+    return .success;
+}
+
+pub fn locate_bytes(
+    terminal_: Terminal,
+    line: u64,
+    offsets_: ?[*]const u64,
+    n: usize,
+    resume_: ?*const LocateResume,
+    max_rows: usize,
+    out_cells_: ?[*]LineCell,
+    out_result_: ?*LocateResult,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const out_result = out_result_ orelse return .invalid_value;
+    if (n > 0 and (offsets_ == null or out_cells_ == null)) return .invalid_value;
+    const offsets: []const u64 = if (offsets_) |o| o[0..n] else &.{};
+    const cells: []LineCell = if (out_cells_) |c| c[0..n] else &.{};
+
+    out_result.* = formatter_core.locateBytes(
+        primaryPages(t),
+        line,
+        offsets,
+        if (resume_) |r| r.* else .{},
+        max_rows,
+        cells,
+    ) catch |err| return switch (err) {
+        error.LineNotFound => .no_value,
+        error.OutOfMemory, error.WriteFailed => .out_of_memory,
+    };
+    return .success;
+}
+
 pub fn screen_rows_wrapped_preserving(
     terminal_: Terminal,
     y: u32,
@@ -2073,6 +2229,84 @@ pub const TerminalReflowState = extern struct {
     }
 };
 
+/// What a line edit changed.
+///
+/// The declaration order is part of the libghostty-vt C ABI.
+pub const LineEditKind = lib.Enum(lib.target, &.{
+    "recount",
+    "rewrite",
+});
+
+/// C: GhosttyLineEdit
+pub const LineEdit = extern struct {
+    seq: u64,
+    kind: LineEditKind,
+    first_line: u64,
+    old_lines: u64,
+    new_lines: u64,
+};
+
+/// C: GhosttyTerminalLineState
+///
+/// This is a sized struct, so new fields may only be added to the end.
+pub const TerminalLineState = extern struct {
+    size: usize = @sizeOf(TerminalLineState),
+    first_line: u64 = 0,
+    end_line: u64 = 0,
+    rows_pruned: u64 = 0,
+    history_rows: u64 = 0,
+    edit_seq: u64 = 0,
+    edits_overflowed: bool = false,
+    index_ready: bool = false,
+
+    pub const sized_base = "index_ready";
+
+    /// Read the primary screen's line counters, extending its index by a
+    /// bounded number of pages.
+    fn init(t: *ZigTerminal) TerminalLineState {
+        const st = t.screens.get(.primary).?.pages.lineState();
+        return .{
+            .first_line = st.first_line,
+            .end_line = st.end_line,
+            .rows_pruned = st.rows_pruned,
+            .history_rows = st.history_rows,
+            .edit_seq = st.edit_seq,
+            .edits_overflowed = st.edits_overflowed,
+            .index_ready = st.index_ready,
+        };
+    }
+};
+
+/// C: GhosttyLineRows
+pub const LineRows = extern struct {
+    start_row: u64,
+    end_row: u64,
+};
+
+/// C: GhosttyLineResume
+pub const LineResume = formatter_core.ReadResume;
+
+/// C: GhosttyLineRead
+pub const LineRead = extern struct {
+    first_line_read: u64,
+    lines: u64,
+    bytes: u64,
+    next_line: u64,
+    rows_formatted: u64,
+    next: LineResume,
+    reached_end: bool,
+    last_unterminated: bool,
+};
+
+/// C: GhosttyLineCell
+pub const LineCell = formatter_core.LineCell;
+
+/// C: GhosttyLocateResume
+pub const LocateResume = formatter_core.LocateResume;
+
+/// C: GhosttyLocateResult
+pub const LocateResult = formatter_core.LocateResult;
+
 /// The largest `max_rows` and `max_pages` `reflow_step` accepts.
 const reflow_step_max_rows: usize = 65_536;
 const reflow_step_max_pages: usize = 64;
@@ -2124,6 +2358,7 @@ pub const TerminalData = enum(c_int) {
     memory_usage = 42,
     scrollback_stored_bytes = 43,
     reflow_state = 44,
+    line_state = 45,
 
     _,
 
@@ -2173,6 +2408,7 @@ pub const TerminalData = enum(c_int) {
             .mode => ModeConfig,
             .memory_usage => TerminalMemoryUsage,
             .reflow_state => TerminalReflowState,
+            .line_state => TerminalLineState,
             _ => void,
         };
     }
@@ -2314,6 +2550,10 @@ fn getTyped(
             lib.sizedWrite(out, .init(t));
         },
         .reflow_state => {
+            if (!lib.sizedCheck(.output, out)) return .invalid_value;
+            lib.sizedWrite(out, .init(t));
+        },
+        .line_state => {
             if (!lib.sizedCheck(.output, out)) return .invalid_value;
             lib.sizedWrite(out, .init(t));
         },
@@ -8630,4 +8870,303 @@ test "reflow_step and the reflow state reject hostile arguments" {
     try testing.expectEqual(Result.success, get(t, .reflow_state, @ptrCast(&large)));
     try testing.expectEqual(@sizeOf(Larger), large.state.size);
     try testing.expectEqual(@as(u64, 0xDEADBEEF), large.extra);
+}
+
+/// A terminal whose history holds `n` numbered lines, scrollback unlimited.
+fn lineTestTerminal(n: usize) !Terminal {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 4));
+    errdefer free(t);
+    var unlimited: usize = std.math.maxInt(usize);
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_bytes, &unlimited));
+    for (0..n) |i| {
+        var buf: [32]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "line {d}\r\n", .{i});
+        vt_write(t, line.ptr, line.len);
+    }
+    return t;
+}
+
+/// `line_state` until the index reaches the active area.
+fn lineStateReady(t: Terminal) !TerminalLineState {
+    var state: TerminalLineState = .{};
+    for (0..10_000) |_| {
+        try testing.expectEqual(Result.success, get(t, .line_state, @ptrCast(&state)));
+        if (state.index_ready) return state;
+    }
+    return error.IndexNeverReady;
+}
+
+test "line_state size handling and growth" {
+    const t = try lineTestTerminal(10);
+    defer free(t);
+
+    var state: TerminalLineState = .{};
+    try testing.expectEqual(Result.success, get(t, .line_state, @ptrCast(&state)));
+    try testing.expectEqual(@sizeOf(TerminalLineState), state.size);
+
+    // A struct too small for the first released layout is refused untouched.
+    var small: TerminalLineState = .{
+        .size = @offsetOf(TerminalLineState, "index_ready"),
+        .first_line = 7,
+    };
+    try testing.expectEqual(Result.invalid_value, get(t, .line_state, @ptrCast(&small)));
+    try testing.expectEqual(@as(u64, 7), small.first_line);
+    try testing.expectEqual(Result.invalid_value, get(null, .line_state, @ptrCast(&small)));
+    try testing.expectEqual(Result.invalid_value, get(t, .line_state, null));
+
+    // A caller with a larger struct gets the known fields only.
+    var large: extern struct {
+        state: TerminalLineState,
+        tail: u64,
+    } = .{ .state = .{ .size = @sizeOf(TerminalLineState) + 8 }, .tail = 0xabcd };
+    try testing.expectEqual(Result.success, get(t, .line_state, @ptrCast(&large)));
+    try testing.expectEqual(@as(u64, 0xabcd), large.tail);
+}
+
+test "line_state tracks output" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 20, 4));
+    defer free(t);
+    var unlimited: usize = std.math.maxInt(usize);
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_bytes, &unlimited));
+
+    var state = try lineStateReady(t);
+    try testing.expectEqual(state.first_line, state.end_line);
+    try testing.expectEqual(@as(u64, 0), state.history_rows);
+    try testing.expect(!state.edits_overflowed);
+
+    for (0..50) |_| vt_write(t, "a line\r\n", 8);
+    const next = try lineStateReady(t);
+    try testing.expectEqual(state.first_line, next.first_line);
+    // Every row that scrolled off is a line of its own.
+    try testing.expect(next.history_rows >= 40);
+    try testing.expectEqual(next.first_line + next.history_rows, next.end_line);
+    state = next;
+
+    // Reset: ids go on, every row is pruned.
+    reset(t);
+    const after = try lineStateReady(t);
+    try testing.expect(after.first_line >= state.end_line);
+    try testing.expect(after.rows_pruned >= state.history_rows);
+    try testing.expectEqual(@as(u64, 0), after.history_rows);
+}
+
+test "line_edits maps kinds and reports overflow" {
+    const t = try lineTestTerminal(10);
+    defer free(t);
+    const pages = &t.?.terminal.screens.get(.primary).?.pages;
+
+    var out: [20]LineEdit = undefined;
+    var n: usize = 99;
+    try testing.expectEqual(Result.success, line_edits(t, 0, &out, out.len, &n));
+    try testing.expectEqual(@as(usize, 0), n);
+
+    // Edits come from reflow and prompt redraws; stand in for them.
+    _ = pages.edit_log.push(.recount, 100, 3, 4);
+    _ = pages.edit_log.push(.rewrite, 200, 2, 2);
+    try testing.expectEqual(Result.success, line_edits(t, 0, &out, out.len, &n));
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(u64, 1), out[0].seq);
+    try testing.expectEqual(LineEditKind.recount, out[0].kind);
+    try testing.expectEqual(@as(u64, 100), out[0].first_line);
+    try testing.expectEqual(@as(u64, 3), out[0].old_lines);
+    try testing.expectEqual(@as(u64, 4), out[0].new_lines);
+    try testing.expectEqual(LineEditKind.rewrite, out[1].kind);
+
+    // Past the ring: the oldest are gone and the state says so.
+    for (0..20) |_| _ = pages.edit_log.push(.recount, 1, 1, 2);
+    var state = try lineStateReady(t);
+    try testing.expect(state.edits_overflowed);
+    try testing.expectEqual(Result.success, line_edits(t, 0, &out, out.len, &n));
+    try testing.expectEqual(@as(usize, 16), n);
+    // A small buffer returns the oldest ones.
+    try testing.expectEqual(Result.success, line_edits(t, state.edit_seq - 3, &out, 2, &n));
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(state.edit_seq - 2, out[0].seq);
+
+    // Reading up to the newest sequence clears the overflow.
+    try testing.expectEqual(Result.success, line_edits(t, state.edit_seq, &out, out.len, &n));
+    try testing.expectEqual(@as(usize, 0), n);
+    state = try lineStateReady(t);
+    try testing.expect(!state.edits_overflowed);
+}
+
+test "line_rows row_line lines_rows via the C API" {
+    const t = try lineTestTerminal(40);
+    defer free(t);
+    const state = try lineStateReady(t);
+
+    // Every line is one row here: line L is row L - first_line + rows_pruned.
+    var rows: LineRows = undefined;
+    try testing.expectEqual(Result.success, line_rows(t, state.first_line + 5, &rows));
+    try testing.expectEqual(state.rows_pruned + 5, rows.start_row);
+    try testing.expectEqual(rows.start_row, rows.end_row);
+    var line: u64 = 0;
+    try testing.expectEqual(Result.success, row_line(t, rows.start_row, &line));
+    try testing.expectEqual(state.first_line + 5, line);
+
+    // Not a history line: no value.
+    try testing.expectEqual(Result.no_value, line_rows(t, state.end_line, &rows));
+    try testing.expectEqual(Result.no_value, line_rows(t, state.first_line - 1, &rows));
+
+    // One sweep over sorted lines, with one that does not exist.
+    const lines = [_]u64{ state.first_line, state.first_line + 3, state.first_line + 30, state.end_line + 9 };
+    var starts: [4]u64 = undefined;
+    try testing.expectEqual(Result.success, lines_rows(t, &lines, lines.len, &starts));
+    try testing.expectEqual(state.rows_pruned, starts[0]);
+    try testing.expectEqual(state.rows_pruned + 3, starts[1]);
+    try testing.expectEqual(state.rows_pruned + 30, starts[2]);
+    try testing.expectEqual(formatter_core.row_pruned, starts[3]);
+}
+
+const LineTestSink = struct {
+    bytes: [4096]u8 = undefined,
+    len: usize = 0,
+
+    fn write(
+        userdata: ?*anyopaque,
+        data: [*]const u8,
+        n: usize,
+    ) callconv(lib.calling_conv) bool {
+        const self: *LineTestSink = @ptrCast(@alignCast(userdata.?));
+        if (n > self.bytes.len - self.len) return false;
+        @memcpy(self.bytes[self.len..][0..n], data[0..n]);
+        self.len += n;
+        return true;
+    }
+
+    fn writer(self: *LineTestSink) c_io.Writer {
+        return .{ .write = &write, .userdata = self };
+    }
+
+    fn text(self: *const LineTestSink) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+test "read_lines via the C API with a GhosttyWriter" {
+    const t = try lineTestTerminal(30);
+    defer free(t);
+    const state = try lineStateReady(t);
+
+    var sink: LineTestSink = .{};
+    var read: LineRead = undefined;
+    try testing.expectEqual(Result.success, read_lines(t, state.first_line, null, 5, 1000, sink.writer(), &read));
+    try testing.expectEqualStrings("line 0\nline 1\nline 2\nline 3\nline 4\n", sink.text());
+    try testing.expectEqual(@as(u64, 5), read.lines);
+    try testing.expectEqual(@as(u64, 35), read.bytes);
+    try testing.expectEqual(state.first_line + 5, read.next_line);
+    try testing.expect(!read.reached_end);
+    try testing.expectEqual(state.first_line, read.first_line_read);
+
+    // A budget stops at a line end; the next call goes on from there.
+    sink = .{};
+    try testing.expectEqual(Result.success, read_lines(t, read.next_line, &read.next, 100, 14, sink.writer(), &read));
+    try testing.expectEqualStrings("line 5\nline 6\n", sink.text());
+    try testing.expectEqual(@as(u64, 2), read.lines);
+
+    // To the end: the blank rows of the screen follow the numbered lines.
+    sink = .{};
+    try testing.expectEqual(Result.success, read_lines(t, state.first_line, null, 1000, 4000, sink.writer(), &read));
+    try testing.expect(read.reached_end);
+    try testing.expect(std.mem.startsWith(u8, sink.text(), "line 0\n"));
+    try testing.expect(std.mem.indexOf(u8, sink.text(), "line 29\n") != null);
+
+    // A failing writer reports an I/O error.
+    const Fail = struct {
+        fn write(_: ?*anyopaque, _: [*]const u8, _: usize) callconv(lib.calling_conv) bool {
+            return false;
+        }
+    };
+    try testing.expectEqual(Result.io_error, read_lines(t, state.first_line, null, 3, 100, .{ .write = &Fail.write }, &read));
+}
+
+test "locate_bytes via the C API" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 10, 4));
+    defer free(t);
+    var unlimited: usize = std.math.maxInt(usize);
+    try testing.expectEqual(Result.success, set(t, .scrollback_max_bytes, &unlimited));
+    vt_write(t, "short\r\n", 7);
+    // 35 bytes over four rows of ten columns.
+    vt_write(t, "abcdefghijklmnopqrstuvwxyz0123456789\r\n", 38);
+    for (0..10) |_| vt_write(t, "x\r\n", 3);
+    const state = try lineStateReady(t);
+
+    const offsets = [_]u64{ 0, 12, 35 };
+    var cells: [3]LineCell = undefined;
+    var result: LocateResult = undefined;
+    try testing.expectEqual(Result.success, locate_bytes(t, state.first_line + 1, &offsets, 3, null, 100, &cells, &result));
+    try testing.expectEqual(@as(usize, 3), result.located);
+    try testing.expectEqual(@as(u64, 4), result.rows_read);
+    try testing.expect(result.complete);
+    try testing.expectEqual(state.rows_pruned + 1, cells[0].screen_row);
+    try testing.expectEqual(@as(u32, 0), cells[0].col);
+    try testing.expectEqual(state.rows_pruned + 2, cells[1].screen_row);
+    try testing.expectEqual(@as(u32, 2), cells[1].col);
+    try testing.expectEqual(state.rows_pruned + 4, cells[2].screen_row);
+
+    // A row budget of two stops short and resumes.
+    try testing.expectEqual(Result.success, locate_bytes(t, state.first_line + 1, &.{ 5, 30 }, 2, null, 2, &cells, &result));
+    try testing.expectEqual(@as(usize, 1), result.located);
+    try testing.expect(!result.complete);
+    try testing.expectEqual(@as(u64, 2), result.next.row);
+    var resume_at = result.next;
+    try testing.expectEqual(Result.success, locate_bytes(t, state.first_line + 1, &.{30}, 1, &resume_at, 100, &cells, &result));
+    try testing.expectEqual(@as(usize, 1), result.located);
+    try testing.expect(result.complete);
+    try testing.expectEqual(state.rows_pruned + 4, cells[0].screen_row);
+
+    // A line before the first live one is lost; one that does not exist is not found.
+    try testing.expectEqual(Result.success, locate_bytes(t, state.first_line - 1, &.{0}, 1, null, 100, &cells, &result));
+    try testing.expectEqual(formatter_core.row_pruned, cells[0].screen_row);
+    try testing.expectEqual(Result.no_value, locate_bytes(t, state.end_line + 1000, &.{0}, 1, null, 100, &cells, &result));
+}
+
+test "line calls reject null and invalid arguments" {
+    const t = try lineTestTerminal(10);
+    defer free(t);
+    var n: usize = 0;
+    var edits: [2]LineEdit = undefined;
+    try testing.expectEqual(Result.invalid_value, line_edits(null, 0, &edits, 2, &n));
+    try testing.expectEqual(Result.invalid_value, line_edits(t, 0, &edits, 2, null));
+    try testing.expectEqual(Result.invalid_value, line_edits(t, 0, null, 2, &n));
+    try testing.expectEqual(Result.success, line_edits(t, 0, null, 0, &n));
+
+    var rows: LineRows = undefined;
+    try testing.expectEqual(Result.invalid_value, line_rows(null, 0, &rows));
+    try testing.expectEqual(Result.invalid_value, line_rows(t, 0, null));
+    var line: u64 = 0;
+    try testing.expectEqual(Result.invalid_value, row_line(null, 0, &line));
+    try testing.expectEqual(Result.invalid_value, row_line(t, 0, null));
+    // Rows before the pruned ones, and past the list, have no line.
+    try testing.expectEqual(Result.no_value, row_line(t, std.math.maxInt(u64) / 2, &line));
+
+    var rows_out: [1]u64 = undefined;
+    const ids = [_]u64{1};
+    try testing.expectEqual(Result.invalid_value, lines_rows(null, &ids, 1, &rows_out));
+    try testing.expectEqual(Result.invalid_value, lines_rows(t, null, 1, &rows_out));
+    try testing.expectEqual(Result.invalid_value, lines_rows(t, &ids, 1, null));
+    try testing.expectEqual(Result.success, lines_rows(t, null, 0, null));
+
+    var sink: LineTestSink = .{};
+    var read: LineRead = undefined;
+    try testing.expectEqual(Result.invalid_value, read_lines(null, 0, null, 1, 10, sink.writer(), &read));
+    try testing.expectEqual(Result.invalid_value, read_lines(t, 0, null, 1, 10, .{}, &read));
+    try testing.expectEqual(Result.invalid_value, read_lines(t, 0, null, 1, 10, sink.writer(), null));
+
+    var cells: [1]LineCell = undefined;
+    var result: LocateResult = undefined;
+    const offsets = [_]u64{0};
+    try testing.expectEqual(Result.invalid_value, locate_bytes(null, 0, &offsets, 1, null, 1, &cells, &result));
+    try testing.expectEqual(Result.invalid_value, locate_bytes(t, 0, null, 1, null, 1, &cells, &result));
+    try testing.expectEqual(Result.invalid_value, locate_bytes(t, 0, &offsets, 1, null, 1, null, &result));
+    try testing.expectEqual(Result.invalid_value, locate_bytes(t, 0, &offsets, 1, null, 1, &cells, null));
+}
+
+test "line_state sized layout ends at index_ready" {
+    try testing.expectEqualStrings("index_ready", TerminalLineState.sized_base);
+    try testing.expect(@offsetOf(TerminalLineState, "edits_overflowed") < @offsetOf(TerminalLineState, "index_ready"));
+    try testing.expect(@offsetOf(TerminalLineState, "index_ready") < @sizeOf(TerminalLineState));
 }

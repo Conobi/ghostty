@@ -18,6 +18,7 @@ const compression = @import("compress.zig");
 const highlight = @import("highlight.zig");
 const hyperlink = @import("hyperlink.zig");
 const kitty = @import("kitty.zig");
+const LineIndex = @import("LineIndex.zig");
 const terminal_mem = @import("mem.zig");
 const point = @import("point.zig");
 const pagepkg = @import("page.zig");
@@ -183,6 +184,21 @@ const Node = struct {
     /// compressed so the lazy reflow boundary can be tested without decoding
     /// it. Meaningless while resident: `endsWrapped` reads the page then.
     ends_wrapped: bool = false,
+
+    /// Line ends of this page, built on demand for a node wholly above the
+    /// active area and never for one that touches it. It describes the page
+    /// as it is: a node that is written must lose it (`dropLineEnds`).
+    line_ends: ?*LineIndex.LineEnds = null,
+
+    /// Whether `line_index` holds this node. A node is mutated only after
+    /// it has left the index (`lineNodeChanged`), found through this flag
+    /// without a search.
+    line_indexed: bool = false,
+
+    /// Where the node sits in `line_index`, as a number that rises along it:
+    /// lets the index find the node by binary search. Meaningful only while
+    /// `line_indexed`.
+    line_seq: u64 = 0,
 
     /// The physical representation of the page contents.
     ///
@@ -456,11 +472,18 @@ const Node = struct {
         const encoded_len = compressed.encoded.len;
         compressed.deinit();
 
-        // We're now a resident, non-compressed node.
+        // We're now a resident, non-compressed node, which may be written.
+        self.dropLineEnds();
         self.data = .{ .resident = restored };
         self.incompressible = false;
         if (self.counters) |c| c.restored(self, encoded_len);
         return &self.data.resident;
+    }
+
+    /// Forget the line-end summary; the page is about to change or go away.
+    fn dropLineEnds(self: *Node) void {
+        if (self.line_ends) |le| le.deinit();
+        self.line_ends = null;
     }
 
     inline fn isCompressed(self: *const Node) bool {
@@ -646,6 +669,36 @@ limits: Limits,
 /// The total number of rows represented by this PageList. This is used
 /// specifically for scrollbar information so we can have the total size.
 total_rows: usize,
+
+/// Rows and line ends removed from the top of the list, for good: pruning,
+/// erasing history, a full reset. They only grow, so a line's id (its count
+/// of line ends since the start, plus `LineIndex.LINE_ORIGIN`) and a row's
+/// absolute number (this plus its position) never change while it lives.
+rows_pruned: u64 = 0,
+lines_pruned: u64 = 0,
+
+/// Rows of the top line that were pruned with the line's start: the line
+/// began above the top of the list. Zero when the list starts on a line.
+/// Such a line is not offered by `lineState` (its start is gone).
+head_rows_pruned: u64 = 0,
+
+/// Row and line-end counts of the nodes above the active area, in list order,
+/// extended at the tail by `lineState` and cut where a mutation reaches it.
+line_index: LineIndex.NodeIndex(*List.Node) = .{},
+
+/// Line edits the maintainer of a text copy must replay.
+edit_log: LineIndex.EditLog = .{},
+
+/// Times the whole index was renumbered because a splice found no room
+/// between its neighbours' sequence numbers.
+line_renumbers: u32 = 0,
+
+/// Decode buffer for summarising compressed pages without restoring them.
+line_scratch: ReadScratch = .{},
+
+/// Most nodes one `lineState` call adds to the index, so a call stays within
+/// a lock slice however long the history is.
+line_index_extend: usize = 256,
 
 /// The list of tracked pins. These are kept up to date automatically.
 tracked_pins: PinSet,
@@ -1294,6 +1347,7 @@ fn releasePages(pool: *MemoryPool, list: List) void {
     var it = list.first;
     while (it) |node| {
         it = node.next;
+        node.dropLineEnds();
         const page = node.restore(.discard);
         switch (node.owned) {
             .pool => releasePoolPage(pool, page),
@@ -1334,6 +1388,8 @@ pub fn deinit(self: *PageList) void {
 
     // Release every page and node back to the pools, then free the pools.
     releasePages(&self.pool, self.pages);
+    self.line_index.deinit(self.pool.alloc);
+    self.line_scratch.deinit(self.pool.alloc);
     self.pool.alloc.destroy(self.counters);
     self.pool.deinit();
 }
@@ -1350,6 +1406,16 @@ pub fn reset(self: *PageList) void {
 
     // Reset discards all scrollback, so there is nothing left to compress.
     self.page_compression.reset();
+
+    // Every row leaves the top: ids and absolute rows go on from here.
+    {
+        var it = self.pages.first;
+        while (it) |n| {
+            it = n.next;
+            self.linePrunedFromTop(n, n.rows(), false);
+        }
+        self.head_rows_pruned = 0;
+    }
 
     // Begin a new whole-list validity epoch before rebuilding from the pools.
     // Every old reference now has a serial below the epoch and can be rejected
@@ -1667,6 +1733,8 @@ pub const Resize = struct {
 /// TODO: docs
 pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     defer self.assertIntegrity();
+    // The active area may reach nodes the line index holds.
+    defer self.lineActiveMoved();
     self.layout_generation +%= 1;
     self.resize_generation +%= 1;
 
@@ -1885,6 +1953,15 @@ fn resizeCols(
         node.page().size.rows = 1;
         break :node node;
     };
+
+    // Every node from the first rewritten one on is replaced: cut the line
+    // index there, and log it if the rewrite changes the lines.
+    const line_src = if (tail) |t| t.k else self.pages.first.?;
+    const line_prev = line_src.prev;
+    const line_region = self.lineRegionBegin(line_src);
+    var line_failed = false;
+    defer if (!line_failed) self.lineRegionEnd(line_region, self.firstAfter(line_prev));
+    errdefer line_failed = true;
 
     // We need to grab our rowIterator now before we rewrite our
     // linked list below.
@@ -2364,11 +2441,18 @@ fn reflowChunk(self: *PageList, j: *List.Node) Allocator.Error!ChunkStats {
         cursor.page_row.wrap_continuation = true;
     };
     var last_source: ?*const Page = null;
+    var src_count: usize = 0;
+    var old_lines: u64 = 0;
     var node_: ?*List.Node = j;
     while (node_) |node| : (node_ = node.next) {
         self.visit();
         const source = try node.readPreserving(&scratch, alloc);
         last_source = source;
+        src_count += 1;
+        old_lines += if (node.line_ends) |le| le.count else count: {
+            const raw: [*]const u64 = @ptrCast(source.rows.ptr(source.memory));
+            break :count LineIndex.countLineEnds(raw[0..node.rows()], wrap_bit);
+        };
         cursor.sourceChanged();
         for (0..node.rows()) |y| {
             try cursor.reflowRowFrom(
@@ -2450,6 +2534,8 @@ fn reflowChunk(self: *PageList, j: *List.Node) Allocator.Error!ChunkStats {
             if (!node.isCompressed() and !viewport.holds(node)) _ = self.compressPage(node);
         }
     }
+
+    self.lineChunkReplaced(rows_before, src_count, old_lines, before, after);
 
     return .{
         .old_rows = old_rows,
@@ -4219,6 +4305,7 @@ fn resizeWithoutReflowGrowCols(
 
     // Remove the old page.
     // Deallocate the old page.
+    self.lineNodeChanged(chunk.node);
     self.pages.remove(chunk.node);
     self.destroyNode(chunk.node);
 }
@@ -4697,6 +4784,7 @@ pub fn scrollClear(self: *PageList) Allocator.Error!void {
 /// compression. The surrounding operation remains responsible for all such
 /// bookkeeping required by its layout change.
 pub fn invalidateNodeLayout(self: *PageList, node: *List.Node) void {
+    self.lineNodeChanged(node);
     node.serial = self.page_serial;
     self.page_serial += 1;
     node.incompressible = false;
@@ -4771,6 +4859,7 @@ pub fn compact(self: *PageList, node: *List.Node) Allocator.Error!?*List.Node {
     }
 
     // Insert the new page and destroy the old one
+    self.lineNodeChanged(node);
     self.pages.insertBefore(node, new_node);
     self.staleNodeReplaced(node, new_node);
     self.pages.remove(node);
@@ -5153,6 +5242,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         }
 
         self.staleHeadRemoved(first);
+        self.linePrunedFromTop(first, first.rows(), true);
 
         // If we have a pin viewport cache then we need to update it.
         if (self.viewport == .pin) viewport: {
@@ -5208,6 +5298,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         const was_compressed = first.isCompressed();
         const old_memory = first.restore(.discard).memory;
         first.incompressible = false;
+        first.dropLineEnds();
         self.counters.forget(first);
         assert(old_memory.len <= std_size);
         assert(layout.total_size <= std_size);
@@ -5283,6 +5374,637 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
     // active-boundary page wholly historical.
     self.limits.enforce(self, .lines);
     return next_node;
+}
+
+// ---------------------------------------------------------------- lines
+
+/// What `lineState` reports. Line ids start at `LineIndex.LINE_ORIGIN`.
+pub const LineState = struct {
+    /// Id of the oldest line that starts in a live row: a line whose first
+    /// rows were pruned is not counted.
+    first_line: u64,
+    /// One past the last complete history line; the line crossing the active
+    /// boundary and everything below it belong to the tail.
+    end_line: u64,
+    /// Rows removed from the top; a row's absolute number is this plus its
+    /// position in the list.
+    rows_pruned: u64,
+    /// Rows above the active area.
+    history_rows: u64,
+    /// Sequence of the newest line edit.
+    edit_seq: u64,
+    /// An edit was lost before it was read: rebuild instead of replaying.
+    edits_overflowed: bool,
+    /// The index reaches the active area, so `end_line` is final for now.
+    /// When false it stops at the lines indexed so far; call again.
+    index_ready: bool,
+};
+
+/// Where a line lies, in rows from the top of the list.
+pub const LineRows = struct {
+    start_row: u64,
+    /// The row holding the line end.
+    end_row: u64,
+};
+
+/// Answer of `linesRows` for a line that cannot be located.
+pub const line_unknown = std.math.maxInt(u64);
+
+/// Bitmap words that hold the rows of the tallest page.
+const line_bitmap_words = LineIndex.wordsFor(std.math.maxInt(size.CellCountInt));
+
+/// Bit of a row's `wrap` flag in its u64 representation.
+const wrap_bit: u6 = @bitOffsetOf(Row, "wrap");
+
+/// One u64 per row of the node's page, valid until the next read with
+/// `line_scratch`. Null when a compressed page cannot be decoded for lack of
+/// memory.
+fn lineRowFlags(self: *PageList, node: *List.Node) ?[]const u64 {
+    const page = node.readPreserving(&self.line_scratch, self.pool.alloc) catch return null;
+    const rows: [*]const u64 = @ptrCast(page.rows.ptr(page.memory));
+    return rows[0..node.rows()];
+}
+
+/// A node's line ends as a count and a bitmap, one bit per row.
+const LineScan = struct { count: u32, bits: []const u64 };
+
+/// Scan the node's rows; the bitmap lives in `out`.
+fn scanLineEnds(
+    self: *PageList,
+    node: *List.Node,
+    out: *[line_bitmap_words]u64,
+) ?LineScan {
+    const raw = self.lineRowFlags(node) orelse return null;
+    const bits = out[0..LineIndex.wordsFor(raw.len)];
+    return .{ .count = LineIndex.scanLineEnds(raw, wrap_bit, bits), .bits = bits };
+}
+
+/// Whether no row of the node lies in the active area.
+fn nodeIsHistory(self: *const PageList, node: *const List.Node) bool {
+    var it: ?*List.Node = self.getTopLeft(.active).node;
+    while (it) |n| : (it = n.next) if (n == node) return false;
+    return true;
+}
+
+/// The summary of a node known to lie above the active area: the cached one
+/// (recounted in safe builds), or a new one. Null only on out-of-memory.
+fn lineSummary(self: *PageList, node: *List.Node) ?*LineIndex.LineEnds {
+    if (node.line_ends) |le| {
+        if (std.debug.runtime_safety) {
+            self.checkLineEnds(node) catch @panic("stale line-end summary");
+        }
+        return le;
+    }
+    const raw = self.lineRowFlags(node) orelse return null;
+    node.line_ends = LineIndex.LineEnds.build(self.pool.alloc, raw, wrap_bit) catch return null;
+    return node.line_ends;
+}
+
+/// The cached line-end summary of a node wholly above the active area,
+/// built on first use; null for a node that touches the active area.
+pub fn lineEndsFor(self: *PageList, node: *List.Node) ?*const LineIndex.LineEnds {
+    if (!self.nodeIsHistory(node)) return null;
+    return self.lineSummary(node);
+}
+
+/// The node after the last indexed one: where the index continues.
+fn nextUnindexed(self: *const PageList) ?*List.Node {
+    const n = self.line_index.len();
+    if (n == 0) return self.pages.first;
+    return self.line_index.entry(n - 1).node.next;
+}
+
+/// Add up to `line_index_extend` nodes before `top` to the index; true when
+/// it then reaches `top`.
+fn extendLineIndex(self: *PageList, top: *List.Node) bool {
+    var cur = self.nextUnindexed();
+    var added: usize = 0;
+    while (cur) |node| : (cur = node.next) {
+        if (node == top) return true;
+        if (added >= self.line_index_extend) return false;
+        const le = self.lineSummary(node) orelse return false;
+        self.line_index.append(
+            self.pool.alloc,
+            node,
+            node.rows(),
+            @intCast(le.count),
+        ) catch return false;
+        const n = self.line_index.len();
+        node.line_seq = (if (n > 1) self.line_index.entry(n - 2).node.line_seq else 0) + line_seq_step;
+        node.line_indexed = true;
+        added += 1;
+    }
+    return true;
+}
+
+/// Id of the line that ends at the first line end of the list: the oldest
+/// line the counters know, whose start may have been pruned.
+fn lineBase(self: *const PageList) u64 {
+    return LineIndex.LINE_ORIGIN + self.lines_pruned;
+}
+
+/// Id of the oldest line that starts in a live row.
+fn lineFirst(self: *const PageList) u64 {
+    return self.lineBase() + @intFromBool(self.head_rows_pruned > 0);
+}
+
+/// Complete history lines the index can name now (counted from `lineBase`):
+/// those ending in indexed nodes, plus (when the index reaches the active
+/// area) those ending in the history rows of its top node.
+fn completeLines(self: *PageList) u64 {
+    const top = self.getTopLeft(.active);
+    var lines = self.line_index.totalLines();
+    if (self.nextUnindexed() != top.node or top.y == 0) return lines;
+    var bits: [line_bitmap_words]u64 = undefined;
+    const scan = self.scanLineEnds(top.node, &bits) orelse return lines;
+    lines += LineIndex.rankBits(scan.bits, top.y);
+    return lines;
+}
+
+/// Extend the index (at most `line_index_extend` nodes) and report the line
+/// counters. Constant time whatever the history size.
+pub fn lineState(self: *PageList) LineState {
+    const top = self.getTopLeft(.active);
+    const ready = self.extendLineIndex(top.node);
+    const lines = if (ready) self.completeLines() else self.line_index.totalLines();
+    const first = self.lineFirst();
+    return .{
+        .first_line = first,
+        .end_line = @max(self.lineBase() + lines, first),
+        .rows_pruned = self.rows_pruned,
+        .history_rows = self.total_rows - self.rows,
+        .edit_seq = self.edit_log.seq,
+        .edits_overflowed = self.edit_log.overflowed(),
+        .index_ready = ready,
+    };
+}
+
+/// Row (from the top of the list) holding the k-th live line end, or null
+/// when the index does not reach it. `hint` carries the index position
+/// between calls so ascending queries sweep instead of searching.
+fn lineEndRow(
+    self: *PageList,
+    k: u64,
+    hint: *?LineIndex.NodeIndex(*List.Node).Pos,
+) ?u64 {
+    const indexed = self.line_index.totalLines();
+    if (k < indexed) {
+        const pos = (if (hint.*) |h|
+            self.line_index.seekLine(h, k)
+        else
+            self.line_index.findLine(k)) orelse return null;
+        hint.* = pos;
+        const node = self.line_index.entry(pos.index).node;
+        const le = self.lineSummary(node) orelse return null;
+        const within = le.select(@intCast(k - pos.lines_before)) orelse return null;
+        return pos.rows_before + within;
+    }
+
+    // Past the indexed nodes: the history rows of the top node.
+    const top = self.getTopLeft(.active);
+    if (self.nextUnindexed() != top.node) return null;
+    var bits: [line_bitmap_words]u64 = undefined;
+    const scan = self.scanLineEnds(top.node, &bits) orelse return null;
+    const k2: u32 = @intCast(k - indexed);
+    if (k2 >= LineIndex.rankBits(scan.bits, top.y)) return null;
+    const within = LineIndex.selectBits(scan.bits, k2) orelse return null;
+    return self.line_index.totalRows() + within;
+}
+
+/// Rows of history line `line`; null when it is pruned, not complete, or
+/// beyond what the index reaches (see `lineState`).
+pub fn lineRows(self: *PageList, line: u64) ?LineRows {
+    if (line < self.lineFirst()) return null;
+    const k = line - self.lineBase();
+    var hint: ?LineIndex.NodeIndex(*List.Node).Pos = null;
+    const start: u64 = if (k == 0) 0 else (self.lineEndRow(k - 1, &hint) orelse return null) + 1;
+    const end = self.lineEndRow(k, &hint) orelse return null;
+    return .{ .start_row = start, .end_row = end };
+}
+
+/// The id of the line holding row `row` (from the top of the list). Rows of
+/// the tail get ids too: the count of line ends above them. Null past the
+/// end of the list, or below rows the index does not reach yet. Rows of a
+/// top line whose start was pruned get an id below `lineState().first_line`.
+pub fn rowLine(self: *PageList, row: u64) ?u64 {
+    const base = self.lineBase();
+    if (self.line_index.findRow(row)) |pos| {
+        const node = self.line_index.entry(pos.index).node;
+        const le = self.lineSummary(node) orelse return null;
+        const above = le.rank(@intCast(row - pos.rows_before));
+        return base + pos.lines_before + above;
+    }
+
+    // Below the indexed nodes: add up the nodes of the active area.
+    const top = self.getTopLeft(.active);
+    if (self.nextUnindexed() != top.node) return null;
+    var rows_before = self.line_index.totalRows();
+    var lines_before = self.line_index.totalLines();
+    var bits: [line_bitmap_words]u64 = undefined;
+    var it: ?*List.Node = top.node;
+    while (it) |node| : (it = node.next) {
+        const scan = self.scanLineEnds(node, &bits) orelse return null;
+        if (row < rows_before + node.rows()) {
+            const above = LineIndex.rankBits(scan.bits, @intCast(row - rows_before));
+            return base + lines_before + above;
+        }
+        rows_before += node.rows();
+        lines_before += scan.count;
+    }
+    return null;
+}
+
+/// Start rows of the ascending `lines[from..]`, written to `out[from..]`;
+/// `line_unknown` where `lineRows` would return null. Stops after `max`
+/// lines and returns the index it reached, so a caller can slice the sweep.
+/// Unsorted input still works, only slower.
+pub fn linesRows(
+    self: *PageList,
+    lines: []const u64,
+    out: []u64,
+    from: usize,
+    max: usize,
+) usize {
+    assert(out.len >= lines.len);
+    const base = self.lineBase();
+    const first = self.lineFirst();
+    const complete = self.completeLines();
+    var hint: ?LineIndex.NodeIndex(*List.Node).Pos = null;
+    const stop = @min(lines.len, from +| max);
+    var i = from;
+    while (i < stop) : (i += 1) {
+        out[i] = unknown: {
+            if (lines[i] < first) break :unknown line_unknown;
+            const k = lines[i] - base;
+            if (k >= complete) break :unknown line_unknown;
+            if (k == 0) break :unknown 0;
+            const prev = self.lineEndRow(k - 1, &hint) orelse break :unknown line_unknown;
+            break :unknown prev + 1;
+        };
+    }
+    return i;
+}
+
+/// Fails when the cached summary of `node` differs from a recount of its page.
+fn checkLineEnds(self: *PageList, node: *List.Node) error{StaleLineSummary}!void {
+    const le = node.line_ends orelse return;
+    var bits: [line_bitmap_words]u64 = undefined;
+    const scan = self.scanLineEnds(node, &bits) orelse return;
+    if (le.rows != node.rows() or le.count != scan.count or
+        !std.mem.eql(u64, le.bits(), scan.bits))
+        return error.StaleLineSummary;
+}
+
+/// Where a line lies, in rows from the top of the list, for any line of the
+/// list including the tail.
+pub const LineSpan = struct {
+    start_row: u64,
+    end_row: u64,
+    /// The last row of the list wraps, so the line has no line end yet.
+    unterminated: bool,
+};
+
+/// The id of the oldest line that starts in a live row.
+pub fn firstLine(self: *const PageList) u64 {
+    return self.lineFirst();
+}
+
+/// Row holding the k-th line end of the whole list, tail included; null
+/// when there are fewer, or the index does not yet reach the active area.
+fn lineEndRowAll(
+    self: *PageList,
+    k: u64,
+    hint: *?LineIndex.NodeIndex(*List.Node).Pos,
+) ?u64 {
+    if (self.lineEndRow(k, hint)) |row| return row;
+    const top = self.getTopLeft(.active).node;
+    if (self.nextUnindexed() != top) return null;
+    var lines_before = self.line_index.totalLines();
+    var rows_before = self.line_index.totalRows();
+    var bits: [line_bitmap_words]u64 = undefined;
+    var it: ?*List.Node = top;
+    while (it) |node| : (it = node.next) {
+        const scan = self.scanLineEnds(node, &bits) orelse return null;
+        if (k < lines_before + scan.count) {
+            const within = LineIndex.selectBits(scan.bits, @intCast(k - lines_before)) orelse return null;
+            return rows_before + within;
+        }
+        lines_before += scan.count;
+        rows_before += node.rows();
+    }
+    return null;
+}
+
+/// The rows of line `line`, in history or in the tail; null when it is
+/// pruned, does not exist, or lies beyond what the index reaches. Unlike
+/// `lineRows` it answers for lines that end in the active area.
+pub fn lineSpan(self: *PageList, line: u64) ?LineSpan {
+    if (line < self.lineFirst()) return null;
+    const k = line - self.lineBase();
+    var hint: ?LineIndex.NodeIndex(*List.Node).Pos = null;
+    const start: u64 = if (k == 0) 0 else (self.lineEndRowAll(k - 1, &hint) orelse return null) + 1;
+    if (self.lineEndRowAll(k, &hint)) |end| {
+        return .{ .start_row = start, .end_row = end, .unterminated = false };
+    }
+    // The last row wraps: its line has no end yet.
+    if (start < self.total_rows and self.nextUnindexed() == self.getTopLeft(.active).node) {
+        return .{ .start_row = start, .end_row = self.total_rows - 1, .unterminated = true };
+    }
+    return null;
+}
+
+/// The pin of the first cell of row `row` from the top of the list; null
+/// past the end, or below rows the index does not reach yet.
+pub fn rowPin(self: *PageList, row: u64) ?Pin {
+    if (self.line_index.findRow(row)) |pos| {
+        return .{
+            .node = self.line_index.entry(pos.index).node,
+            .y = @intCast(row - pos.rows_before),
+        };
+    }
+    const top = self.getTopLeft(.active).node;
+    if (self.nextUnindexed() != top) return null;
+    var rows_before = self.line_index.totalRows();
+    var it: ?*List.Node = top;
+    while (it) |node| : (it = node.next) {
+        if (row < rows_before + node.rows()) return .{ .node = node, .y = @intCast(row - rows_before) };
+        rows_before += node.rows();
+    }
+    return null;
+}
+
+// -------------------------------------------------- keeping the index right
+//
+// The index holds a prefix of the list. Every operation that removes, replaces
+// or rewrites a node first takes it (and the entries after it) out, through
+// one of the functions below, while the node is still alive.
+
+/// Gap between the sequence numbers of consecutive appended entries.
+const line_seq_step: u64 = 1 << 20;
+
+fn lineSeqOf(node: *List.Node) u64 {
+    return node.line_seq;
+}
+
+/// The position of an indexed node, by binary search on its sequence number.
+fn lineNodePos(self: *const PageList, node: *const List.Node) usize {
+    const pos = self.line_index.lowerBound(lineSeqOf, node.line_seq);
+    if (pos < self.line_index.len() and self.line_index.entry(pos).node == node) return pos;
+    // Unreachable while the numbers are kept right; counting the nodes
+    // before it is the slow, certain answer.
+    assert(false);
+    var n: usize = 0;
+    var it = node.prev;
+    while (it) |q| : (it = q.prev) n += 1;
+    return n;
+}
+
+/// Give entry numbers to `nodes`, which are about to replace `removed`
+/// entries at `at`: spread evenly between the neighbours, or renumber the
+/// whole index afterwards when they leave no room. Returns whether that is
+/// needed.
+fn lineAssignSeqs(self: *PageList, at: usize, removed: usize, nodes: []const LineIndex.NodeIndex(*List.Node).Entry) bool {
+    const left: u64 = if (at > 0) self.line_index.entry(at - 1).node.line_seq else 0;
+    const after = at + removed;
+    const right: u64 = if (after < self.line_index.len())
+        self.line_index.entry(after).node.line_seq
+    else
+        left + (nodes.len + 1) * line_seq_step;
+    const step = (right - left) / (nodes.len + 1);
+    for (nodes, 0..) |e, i| e.node.line_seq = left + step * (i + 1);
+    return step == 0;
+}
+
+/// Number every indexed entry afresh.
+fn lineRenumber(self: *PageList) void {
+    for (0..self.line_index.len()) |i| {
+        self.line_index.entry(i).node.line_seq = (i + 1) * line_seq_step;
+    }
+    self.line_renumbers += 1;
+}
+
+/// Drop the index entries from position `pos` on. The first `dead` of them
+/// name nodes that no longer exist, and are not touched.
+fn lineIndexTruncate(self: *PageList, pos: usize, dead: usize) void {
+    const len = self.line_index.len();
+    if (pos >= len) return;
+    for (pos + @min(dead, len - pos)..len) |i| {
+        self.line_index.entry(i).node.line_indexed = false;
+    }
+    self.line_index.truncate(pos);
+}
+
+/// `node` is about to be written, replaced or destroyed: forget its summary
+/// and cut the index at it. Cheap for a node the index does not hold.
+fn lineNodeChanged(self: *PageList, node: *List.Node) void {
+    node.dropLineEnds();
+    if (!node.line_indexed) return;
+    self.lineIndexTruncate(self.lineNodePos(node), 0);
+}
+
+/// The active area may now reach nodes the index holds (the height grew, or
+/// rows were pulled out of scrollback): they are no longer cold.
+fn lineActiveMoved(self: *PageList) void {
+    var rem: usize = self.rows;
+    var top = self.pages.last;
+    while (top) |n| : (top = n.prev) {
+        if (rem <= n.rows()) break;
+        rem -= n.rows();
+    }
+    var it = top;
+    while (it) |n| : (it = n.next) self.lineNodeChanged(n);
+}
+
+/// The first `k` rows of `node` (the first node of the list) are leaving
+/// the list for good: count them as pruned, so ids and absolute rows of what
+/// remains do not move. Call while the node's page is still intact. A whole
+/// node also leaves the index; a part cuts the index at the node.
+///
+/// A compressed page without a summary is decoded only when `decode` is set
+/// (reset must not touch pages it throws away). If it cannot be read, for
+/// that or for lack of memory, the counts are unknown: the edit log is marked lost so readers rebuild, and every row is
+/// counted as a line end.
+fn linePrunedFromTop(self: *PageList, node: *List.Node, k: usize, decode: bool) void {
+    var count: u64 = k;
+    var last_end: ?u32 = if (k > 0) @intCast(k - 1) else null;
+    var bits: [line_bitmap_words]u64 = undefined;
+    if (k == node.rows() and node.line_ends != null and self.nodeIsHistory(node)) {
+        const le = node.line_ends.?;
+        count = le.count;
+        last_end = if (count > 0) le.select(le.count - 1) else null;
+    } else if (if (decode or !node.isCompressed()) self.lineRowFlags(node) else null) |raw| {
+        const words = LineIndex.wordsFor(k);
+        const c = LineIndex.scanLineEnds(raw[0..k], wrap_bit, bits[0..words]);
+        count = c;
+        last_end = if (c > 0) LineIndex.selectBits(bits[0..words], c - 1) else null;
+    } else {
+        self.edit_log.markLost();
+    }
+
+    self.rows_pruned += k;
+    self.lines_pruned += count;
+    // The rows after the last line end begin a line that goes on below.
+    self.head_rows_pruned = if (last_end) |e| k - 1 - @as(usize, e) else self.head_rows_pruned + k;
+
+    if (k == node.rows() and node.line_indexed) {
+        assert(self.line_index.entry(0).node == node);
+        node.line_indexed = false;
+        self.line_index.dropFront(1);
+    } else {
+        self.lineNodeChanged(node);
+    }
+}
+
+/// Line ends of a node's rows, from its summary or a scan; null when a
+/// compressed page cannot be read.
+fn nodeLineEnds(self: *PageList, node: *List.Node) ?u32 {
+    if (node.line_ends) |le| return le.count;
+    const raw = self.lineRowFlags(node) orelse return null;
+    return LineIndex.countLineEnds(raw, wrap_bit);
+}
+
+/// Line ends of the rows from node `from` to the end of the list.
+fn lineEndsFrom(self: *PageList, from: ?*List.Node) ?u64 {
+    var total: u64 = 0;
+    var it = from;
+    while (it) |n| : (it = n.next) total += self.nodeLineEnds(n) orelse return null;
+    return total;
+}
+
+/// A region of the list is about to be rewritten into new nodes.
+const LineRegion = struct {
+    /// Id of the line ending at the region's first line end.
+    first_line: u64,
+    /// Line ends in the region, to the end of the list.
+    old_lines: u64,
+};
+
+/// The nodes from `src` to the end are about to be replaced: cut the index
+/// at `src` and remember how many line ends they hold. Null when the index
+/// does not hold `src`, so no reader has seen a line there.
+fn lineRegionBegin(self: *PageList, src: *List.Node) ?LineRegion {
+    if (!src.line_indexed) return null;
+    const pos = self.lineNodePos(src);
+    const at = self.line_index.posAt(pos) orelse return null;
+    const old = self.lineEndsFrom(src) orelse {
+        self.edit_log.markLost();
+        self.lineIndexTruncate(pos, 0);
+        return null;
+    };
+    self.lineIndexTruncate(pos, 0);
+    return .{ .first_line = self.lineBase() + at.lines_before, .old_lines = old };
+}
+
+/// The region begun by `lineRegionBegin` now starts at node `from`. Lines a
+/// reader has seen only move when the count differs: log it.
+fn lineRegionEnd(self: *PageList, region: ?LineRegion, from: ?*List.Node) void {
+    const r = region orelse return;
+    const new = self.lineEndsFrom(from) orelse {
+        self.edit_log.markLost();
+        return;
+    };
+    if (new != r.old_lines) _ = self.edit_log.push(.recount, r.first_line, r.old_lines, new);
+}
+
+/// A reflow step replaced `src_count` nodes, which started `rows_before`
+/// rows below the top, holding `old_lines` line ends, by the nodes after
+/// `before` up to `after`. The index swaps its entries for them when it
+/// holds the whole range and the new nodes are cold; otherwise it is cut at
+/// the range. The sources are already destroyed.
+fn lineChunkReplaced(
+    self: *PageList,
+    rows_before: u64,
+    src_count: usize,
+    old_lines: u64,
+    before: ?*List.Node,
+    after: *List.Node,
+) void {
+    if (rows_before >= self.line_index.totalRows()) return;
+    const at = self.line_index.findRow(rows_before) orelse return;
+    const alloc = self.pool.alloc;
+
+    // The new nodes, and whether any reaches the active area.
+    const top = self.getTopLeft(.active).node;
+    var out_count: usize = 0;
+    var new_lines: u64 = 0;
+    var cold = true;
+    var it = self.firstAfter(before);
+    while (it) |n| : (it = n.next) {
+        if (n == after) break;
+        if (n == top) cold = false;
+        new_lines += self.nodeLineEnds(n) orelse {
+            self.edit_log.markLost();
+            self.lineIndexTruncate(at.index, src_count);
+            return;
+        };
+        out_count += 1;
+    }
+
+    const covered = at.rows_before == rows_before and
+        at.index + src_count <= self.line_index.len();
+    spliced: {
+        if (!covered or !cold) break :spliced;
+        const entries = alloc.alloc(LineIndex.NodeIndex(*List.Node).Entry, out_count) catch break :spliced;
+        defer alloc.free(entries);
+        var i: usize = 0;
+        it = self.firstAfter(before);
+        while (it) |n| : (it = n.next) {
+            if (n == after) break;
+            const le = self.lineSummary(n) orelse break :spliced;
+            entries[i] = .{ .node = n, .rows = n.rows(), .lines = @intCast(le.count) };
+            i += 1;
+        }
+        const renumber = self.lineAssignSeqs(at.index, src_count, entries);
+        self.line_index.splice(alloc, at.index, src_count, entries) catch break :spliced;
+        for (entries) |e| e.node.line_indexed = true;
+        if (renumber) self.lineRenumber();
+        if (old_lines != new_lines) {
+            _ = self.edit_log.push(.recount, self.lineBase() + at.lines_before, old_lines, new_lines);
+        }
+        return;
+    }
+    self.lineIndexTruncate(at.index, src_count);
+    if (old_lines != new_lines) {
+        _ = self.edit_log.push(.recount, self.lineBase() + at.lines_before, old_lines, new_lines);
+    }
+}
+
+/// The rows from `start` down are about to be cleared (a prompt the shell
+/// redraws). Wrap flags stay, so ids and counts hold; readers must read the
+/// history lines it touches again.
+pub fn lineRewritten(self: *PageList, start: Pin) void {
+    var below: usize = 0;
+    var it: ?*List.Node = start.node;
+    while (it) |n| : (it = n.next) below += n.rows();
+    below -= start.y;
+    const row: u64 = self.total_rows - below;
+    if (row >= self.total_rows - self.rows) return;
+    const first = self.rowLine(row) orelse return;
+    const end = self.lineBase() + self.completeLines();
+    if (first >= end) return;
+    _ = self.edit_log.push(.rewrite, first, end - first, end - first);
+}
+
+/// Fails unless the index is exactly the first nodes of the list, with their
+/// real row and line counts, and `line_indexed` marks exactly those.
+fn checkLineIndex(self: *PageList) error{BadLineIndex}!void {
+    var i: usize = 0;
+    var it = self.pages.first;
+    while (it) |n| : (it = n.next) {
+        const indexed = i < self.line_index.len();
+        if (n.line_indexed != indexed) return error.BadLineIndex;
+        if (indexed) {
+            const e = self.line_index.entry(i);
+            if (e.node != n or e.rows != n.rows()) return error.BadLineIndex;
+            // Sequence numbers rise along the index, and find the position.
+            if (i > 0 and self.line_index.entry(i - 1).node.line_seq >= n.line_seq) return error.BadLineIndex;
+            if (self.lineNodePos(n) != i) return error.BadLineIndex;
+            if (e.lines != (self.nodeLineEnds(n) orelse return error.BadLineIndex)) return error.BadLineIndex;
+            if (n.line_ends != null) self.checkLineEnds(n) catch return error.BadLineIndex;
+        }
+        i += 1;
+    }
+    if (i < self.line_index.len()) return error.BadLineIndex;
 }
 
 /// The size the byte limit is compared with, per `Limits.bytes_mode`.
@@ -5970,6 +6692,7 @@ pub fn increaseCapacity(
     }
 
     // Insert this page and destroy the old page
+    self.lineNodeChanged(node);
     self.pages.insertBefore(node, new_node);
     self.staleNodeReplaced(node, new_node);
     self.pages.remove(node);
@@ -6118,6 +6841,9 @@ pub const PageAllocation = struct {
         // No fallible work remains. Publish the page and update every cached
         // quantity affected by inserting rows above the existing first page.
         errdefer comptime unreachable;
+        // Rows above the first one shift every id and row below them.
+        destination.lineIndexTruncate(0, 0);
+        destination.edit_log.markLost();
         destination.pages.prepend(node);
 
         // Older history joins the stale prefix; a page of another width starts
@@ -6207,6 +6933,7 @@ inline fn createPage(
         // creating a new pooled one is a net zero.
 
         self.counters.forget(node);
+        node.dropLineEnds();
         node.* = .{
             .data = .{ .resident = .initBuf(.init(item), layout) },
             .serial = self.page_serial,
@@ -6851,6 +7578,18 @@ fn compressPageOutcome(self: *PageList, node: *List.Node) CompressOutcome {
         return .unprofitable;
     };
 
+    // Pruning counts a compressed page's line ends without decoding it, so
+    // the summary is taken while the page is still readable. Failing to
+    // allocate it only costs a decode later.
+    const summary: ?*LineIndex.LineEnds = if (node.line_ends != null) null else summary: {
+        const rows: [*]const u64 = @ptrCast(page.rows.ptr(page.memory));
+        break :summary LineIndex.LineEnds.build(
+            self.pool.alloc,
+            rows[0..node.rows()],
+            wrap_bit,
+        ) catch null;
+    };
+
     // Strict decommit is the final fallible step. It either discards the whole
     // raw mapping or leaves it untouched, so failure can safely free the
     // candidate and preserve the resident node exactly as it was.
@@ -6866,12 +7605,17 @@ fn compressPageOutcome(self: *PageList, node: *List.Node) CompressOutcome {
         compressed.page.memory.len,
     )) {
         compressed.deinit();
+        if (summary) |le| le.deinit();
         return .failed;
     }
 
     // Publish the new state only after both the encoded allocation and the
     // retained-mapping decommit have succeeded.
     node.ends_wrapped = ends_wrapped;
+    if (summary) |le| {
+        if (node.line_ends) |old| old.deinit();
+        node.line_ends = le;
+    }
     node.data = .{ .compressed = compressed };
     if (node.counters) |c| c.compressed(node);
     return .compressed;
@@ -6917,6 +7661,7 @@ fn destroyNodeExt(
     node: *List.Node,
     total_size: ?*usize,
 ) void {
+    node.dropLineEnds();
     const page = node.restore(.discard);
     if (node.counters) |c| c.detach(node);
 
@@ -7460,6 +8205,7 @@ fn eraseRows(
             // size which will let us grow our active area back.
             if (chunk.node.next == null and chunk.node.prev == null) {
                 // Reinitializing the sole page invalidates every coordinate in it.
+                self.linePrunedFromTop(chunk.node, chunk.node.rows(), true);
                 self.invalidateNodeLayout(chunk.node);
                 const page = chunk.node.page();
                 erased += page.size.rows;
@@ -7475,6 +8221,9 @@ fn eraseRows(
             self.erasePage(chunk.node);
             continue;
         }
+
+        // Rows leaving the top of the list are pruned for good.
+        if (chunk.node.prev == null) self.linePrunedFromTop(chunk.node, chunk.end, true);
 
         // Moving the retained suffix changes every captured row coordinate.
         self.invalidateNodeLayout(chunk.node);
@@ -7580,6 +8329,13 @@ fn erasePage(self: *PageList, node: *List.Node) void {
 
     // The stale prefix only ever loses its head.
     if (node.prev == null) self.staleHeadRemoved(node);
+
+    // Rows leaving the top are pruned; any other page just leaves the index.
+    if (node.prev == null) {
+        self.linePrunedFromTop(node, node.rows(), true);
+    } else {
+        self.lineNodeChanged(node);
+    }
 
     // Remove the page from the linked list
     self.pages.remove(node);
@@ -25738,4 +26494,903 @@ test "PageList reflowStep keeps resident pages bounded without an incremental pa
         try testing.expect(s.counters.resident_size <= base + 3 * PagePool.item_size);
     }
     try testing.expect(steps >= 10);
+}
+
+// ---------------------------------------------------------- line index tests
+
+/// Wrap flag of every row, top to bottom.
+fn wrapFlagsForTest(self: *PageList, alloc: Allocator) ![]bool {
+    var out: std.ArrayList(bool) = .empty;
+    errdefer out.deinit(alloc);
+    var scratch: ReadScratch = .{};
+    defer scratch.deinit(alloc);
+    var node = self.pages.first;
+    while (node) |n| : (node = n.next) {
+        const page = try n.readPreserving(&scratch, alloc);
+        const rows = page.rows.ptr(page.memory);
+        for (0..n.rows()) |y| try out.append(alloc, rows[y].wrap);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Set the wrap flag of every row, top to bottom, and the continuation flag
+/// of the row after a wrapped one, as a terminal writes them.
+fn setWrapsForTest(self: *PageList, flags: []const bool) void {
+    var i: usize = 0;
+    var node = self.pages.first;
+    while (node) |n| : (node = n.next) {
+        const page = n.page();
+        const rows = page.rows.ptr(page.memory);
+        for (0..n.rows()) |y| {
+            rows[y].wrap = flags[i];
+            rows[y].wrap_continuation = i > 0 and flags[i - 1];
+            i += 1;
+        }
+    }
+    assert(i == flags.len);
+}
+
+/// `lineState` until the index reaches the active area.
+fn lineStateReadyForTest(self: *PageList) !LineState {
+    for (0..10_000) |_| {
+        const st = self.lineState();
+        if (st.index_ready) return st;
+    }
+    return error.IndexNeverReady;
+}
+
+/// Check every query against a brute-force pass over the page flags.
+fn expectLinesMatchForTest(self: *PageList) !void {
+    try self.expectLinesMatchSampledForTest(1);
+}
+
+/// `expectLinesMatchForTest` on every `stride`-th line and row.
+fn expectLinesMatchSampledForTest(self: *PageList, stride: usize) !void {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const flags = try self.wrapFlagsForTest(alloc);
+    defer alloc.free(flags);
+    const st = try self.lineStateReadyForTest();
+    const history: usize = @intCast(st.history_rows);
+    try testing.expectEqual(self.total_rows - self.rows, history);
+
+    // Rows that end a line, in order.
+    var ends: std.ArrayList(usize) = .empty;
+    defer ends.deinit(alloc);
+    for (flags, 0..) |w, r| if (!w) try ends.append(alloc, r);
+    var complete: usize = 0;
+    while (complete < ends.items.len and ends.items[complete] < history) complete += 1;
+
+    // A top line whose start was pruned is not offered.
+    const base = LineIndex.LINE_ORIGIN + self.lines_pruned;
+    const skip: usize = @intFromBool(self.head_rows_pruned > 0);
+    try testing.expectEqual(base + skip, st.first_line);
+    try testing.expectEqual(@max(base + complete, base + skip), st.end_line);
+    try testing.expectEqual(self.rows_pruned, st.rows_pruned);
+
+    var j: usize = skip;
+    while (j < complete) : (j += stride) {
+        const got = self.lineRows(base + j).?;
+        const start: usize = if (j == 0) 0 else ends.items[j - 1] + 1;
+        try testing.expectEqual(@as(u64, start), got.start_row);
+        try testing.expectEqual(@as(u64, ends.items[j]), got.end_row);
+        // The line's rows all name it, and the next row names the next line.
+        try testing.expectEqual(base + j, self.rowLine(start).?);
+        try testing.expectEqual(base + j, self.rowLine(ends.items[j]).?);
+    }
+    try testing.expectEqual(@as(?LineRows, null), self.lineRows(st.end_line));
+    try testing.expectEqual(@as(?LineRows, null), self.lineRows(st.first_line - 1));
+
+    // Every row, tail included: the line ends above it.
+    var above: usize = 0;
+    for (flags, 0..) |w, r| {
+        if (r % stride == 0) try testing.expectEqual(@as(?u64, base + above), self.rowLine(r));
+        if (!w) above += 1;
+    }
+    try testing.expectEqual(@as(?u64, null), self.rowLine(flags.len));
+}
+
+/// A list with `cold` whole pages of history above the active area.
+fn linesListForTest(cold: usize) !PageList {
+    var s = try init(std.testing.allocator, .{ .cols = 80, .rows = 24 });
+    errdefer s.deinit();
+    try s.growColdPagesQuietForTest(cold);
+    return s;
+}
+
+test "LineIndex line_rows and row_line are inverse over a multi-node list" {
+    const testing = std.testing;
+    var s = try linesListForTest(4);
+    defer s.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0x11e5);
+    const rnd = prng.random();
+    const flags = try testing.allocator.alloc(bool, s.total_rows);
+    defer testing.allocator.free(flags);
+    // Soft wraps of every length, and blank lines, all over.
+    for (flags) |*f| f.* = rnd.uintLessThan(u8, 100) < 30;
+
+    // One line spanning the end of node 0, all of node 1 and the start of node 2.
+    const n0: usize = s.pages.first.?.rows();
+    const n1: usize = s.pages.first.?.next.?.rows();
+    @memset(flags[n0 - 5 .. n0 + n1 + 5], true);
+    // Blank lines before it, a line end right after it.
+    @memset(flags[n0 - 20 .. n0 - 15], false);
+    flags[n0 + n1 + 5] = false;
+    // The last history row is wrapped: that line belongs to the tail.
+    flags[s.total_rows - s.rows - 1] = true;
+    s.setWrapsForTest(flags);
+
+    try s.expectLinesMatchForTest();
+    const st = s.lineState();
+    // The spanning line is one history line, three nodes long.
+    const spanning = s.lineRows(s.rowLine(n0 + 1).?).?;
+    try testing.expect(spanning.start_row < n0);
+    try testing.expectEqual(@as(u64, n0 + n1 + 5), spanning.end_row);
+    // The wrapped last history row ends nothing: end_line stops before it.
+    try testing.expect(s.rowLine(s.total_rows - s.rows - 1).? >= st.end_line);
+}
+
+test "LineIndex a line spanning the whole list has no history line" {
+    const testing = std.testing;
+    var s = try linesListForTest(3);
+    defer s.deinit();
+    const flags = try testing.allocator.alloc(bool, s.total_rows);
+    defer testing.allocator.free(flags);
+    @memset(flags, true);
+    s.setWrapsForTest(flags);
+
+    try s.expectLinesMatchForTest();
+    const st = s.lineState();
+    try testing.expectEqual(st.first_line, st.end_line);
+    try testing.expectEqual(@as(?u64, LineIndex.LINE_ORIGIN), s.rowLine(s.total_rows - 1));
+}
+
+test "LineIndex first_line and end_line follow output" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+
+    var st = s.lineState();
+    try testing.expectEqual(LineIndex.LINE_ORIGIN, st.first_line);
+    try testing.expectEqual(LineIndex.LINE_ORIGIN, st.end_line);
+    try testing.expectEqual(@as(u64, 0), st.history_rows);
+    try testing.expectEqual(@as(u64, 0), st.rows_pruned);
+    try testing.expectEqual(@as(u64, 0), st.edit_seq);
+    try testing.expect(st.index_ready);
+    try testing.expect(!st.edits_overflowed);
+
+    // Every fresh row is a line end, so every row that scrolls off is a line.
+    s.line_index_extend = 2; // small slices: several calls to catch up
+    var bulk: BulkGrowth = .init(&s);
+    var grown: u64 = 0;
+    var last_end = st.end_line;
+    for ([_]usize{ 100, 1, 700, 1500 }) |n| {
+        try bulk.growMany(n);
+        grown += n;
+        st = try s.lineStateReadyForTest();
+        try testing.expectEqual(grown, st.history_rows);
+        try testing.expectEqual(LineIndex.LINE_ORIGIN + grown, st.end_line);
+        try testing.expect(st.end_line >= last_end);
+        last_end = st.end_line;
+    }
+    bulk.finish();
+    // A call adds at most `line_index_extend` nodes.
+    const before = s.line_index.len();
+    s.line_index.truncate(0);
+    const partial = s.lineState();
+    try testing.expect(s.line_index.len() <= 2);
+    try testing.expect(before > 2);
+    try testing.expect(!partial.index_ready);
+    try testing.expect(partial.end_line < st.end_line);
+    try testing.expectEqual(st.history_rows, partial.history_rows);
+}
+
+test "LineIndex the line crossing the active boundary is not a history line" {
+    const testing = std.testing;
+    for ([_]usize{ 0, 1, 2 }) |wrapped_tail| {
+        var s = try linesListForTest(3);
+        defer s.deinit();
+        const history = s.total_rows - s.rows;
+        const flags = try testing.allocator.alloc(bool, s.total_rows);
+        defer testing.allocator.free(flags);
+        @memset(flags, false);
+        // The last `wrapped_tail` history rows wrap into the active area.
+        @memset(flags[history - wrapped_tail .. history], true);
+        s.setWrapsForTest(flags);
+
+        const st = try s.lineStateReadyForTest();
+        try testing.expectEqual(LineIndex.LINE_ORIGIN + history - wrapped_tail, st.end_line);
+        // Its end is in the active area, so it has no history rows.
+        if (wrapped_tail > 0) {
+            try testing.expectEqual(@as(?LineRows, null), s.lineRows(st.end_line));
+            try testing.expectEqual(@as(?u64, st.end_line), s.rowLine(history - 1));
+        }
+        try s.expectLinesMatchForTest();
+    }
+}
+
+test "LineIndex a summary is not built for the active-area node" {
+    const testing = std.testing;
+    var one = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer one.deinit();
+    try testing.expect(one.lineEndsFor(one.pages.first.?) == null);
+    _ = one.lineState();
+    try testing.expect(one.pages.first.?.line_ends == null);
+
+    var s = try linesListForTest(3);
+    defer s.deinit();
+    _ = try s.lineStateReadyForTest();
+    const active = s.getTopLeft(.active).node;
+    var cold: usize = 0;
+    var node = s.pages.first;
+    while (node) |n| : (node = n.next) {
+        if (n == active) break;
+        try testing.expect(s.lineEndsFor(n) != null);
+        cold += 1;
+    }
+    try testing.expect(cold >= 3);
+    // The node holding the active top, and every one after it, has none.
+    var rest: ?*List.Node = active;
+    while (rest) |n| : (rest = n.next) {
+        try testing.expect(n.line_ends == null);
+        try testing.expect(s.lineEndsFor(n) == null);
+    }
+}
+
+test "LineIndex lines_rows equals line_rows for a sorted batch, and resumes" {
+    const testing = std.testing;
+    var s = try linesListForTest(4);
+    defer s.deinit();
+    var prng = std.Random.DefaultPrng.init(0x50f7);
+    const rnd = prng.random();
+    const flags = try testing.allocator.alloc(bool, s.total_rows);
+    defer testing.allocator.free(flags);
+    for (flags) |*f| f.* = rnd.uintLessThan(u8, 100) < 40;
+    s.setWrapsForTest(flags);
+
+    const st = try s.lineStateReadyForTest();
+    const count: usize = @intCast(st.end_line - st.first_line);
+    try testing.expect(count > 100);
+
+    // Sorted with repeats, plus ids outside what exists on both sides.
+    var lines: [300]u64 = undefined;
+    for (lines[1 .. lines.len - 1]) |*l| l.* = st.first_line + rnd.uintLessThan(u64, count);
+    lines[0] = st.first_line - 1;
+    lines[lines.len - 1] = st.end_line + 5;
+    std.mem.sort(u64, lines[1 .. lines.len - 1], {}, std.sort.asc(u64));
+
+    var out: [300]u64 = undefined;
+    @memset(&out, 0);
+    var at: usize = 0;
+    var calls: usize = 0;
+    while (at < lines.len) : (calls += 1) at = s.linesRows(&lines, &out, at, 7);
+    try testing.expectEqual(@as(usize, 43), calls);
+
+    for (lines, out) |l, got| {
+        if (s.lineRows(l)) |r| {
+            try testing.expectEqual(r.start_row, got);
+        } else try testing.expectEqual(line_unknown, got);
+    }
+    try testing.expectEqual(line_unknown, out[0]);
+    try testing.expectEqual(line_unknown, out[lines.len - 1]);
+}
+
+test "LineIndex head_bytes_pruned on a line whose first rows were pruned" {
+    const testing = std.testing;
+
+    // Pruned by the limits: every page ends in a soft wrap of three rows.
+    {
+        var s = try linesListForTest(5);
+        defer s.deinit();
+        const flags = try testing.allocator.alloc(bool, s.total_rows);
+        defer testing.allocator.free(flags);
+        @memset(flags, false);
+        var row: usize = 0;
+        var node = s.pages.first;
+        while (node) |n| : (node = n.next) {
+            row += n.rows();
+            @memset(flags[row - 3 .. row], true);
+        }
+        s.setWrapsForTest(flags);
+        const before = try s.lineStateReadyForTest();
+        try testing.expectEqual(@as(u64, 0), before.rows_pruned);
+
+        s.limits.set(.lines, 0);
+        s.limits.enforce(&s, .lines);
+        try testing.expect(s.rows_pruned > 0);
+        var ends: u64 = 0;
+        for (flags[0..@intCast(s.rows_pruned)]) |w| ends += @intFromBool(!w);
+        try testing.expectEqual(ends, s.lines_pruned);
+        try testing.expectEqual(@as(u64, 3), s.head_rows_pruned);
+
+        try s.expectLinesMatchForTest();
+        // The line that began in a pruned page is not offered: the first
+        // line is the one after it, which starts in a live row.
+        const st = s.lineState();
+        try testing.expectEqual(LineIndex.LINE_ORIGIN + ends + 1, st.first_line);
+        try testing.expectEqual(@as(?LineRows, null), s.lineRows(LineIndex.LINE_ORIGIN + ends));
+        try testing.expectEqual(@as(u64, 1), s.lineRows(st.first_line).?.start_row);
+        // The pruned head left the index with it.
+        try testing.expectEqual(s.pages.first.?, s.line_index.entry(0).node);
+        try s.checkLineIndex();
+    }
+
+    // Pruned by `grow` at the byte limit: nothing wrapped, so ids track rows.
+    {
+        var s = try init(testing.allocator, .{ .cols = 80, .rows = 24, .max_size = 0 });
+        defer s.deinit();
+        var bulk: BulkGrowth = .init(&s);
+        defer bulk.finish();
+        var grown: u64 = 0;
+        for (0..8) |_| {
+            try bulk.growMany(500);
+            grown += 500;
+            const st = s.lineState();
+            try testing.expectEqual(LineIndex.LINE_ORIGIN + s.lines_pruned, st.first_line);
+            if (s.line_index.len() > 0) try testing.expectEqual(s.pages.first.?, s.line_index.entry(0).node);
+        }
+        try testing.expect(s.rows_pruned > 0);
+        try testing.expectEqual(s.rows_pruned, s.lines_pruned);
+        try testing.expectEqual(@as(u64, 0), s.head_rows_pruned);
+        try testing.expectEqual(grown + s.rows, s.rows_pruned + s.total_rows);
+    }
+}
+
+test "LineIndex debug recount catches a corrupted summary" {
+    const testing = std.testing;
+    var s = try linesListForTest(2);
+    defer s.deinit();
+    _ = try s.lineStateReadyForTest();
+    const node = s.pages.first.?;
+    try s.checkLineEnds(node);
+
+    const le = node.line_ends.?;
+    const word: *u64 = @constCast(&le.bits()[0]);
+    word.* ^= 1;
+    try testing.expectError(error.StaleLineSummary, s.checkLineEnds(node));
+    word.* ^= 1;
+    try s.checkLineEnds(node);
+    le.count += 1;
+    try testing.expectError(error.StaleLineSummary, s.checkLineEnds(node));
+    le.count -= 1;
+}
+
+test "LineIndex summaries build from compressed pages without restoring them" {
+    const testing = std.testing;
+    if (!terminal_mem.canReclaim(.strict)) return error.SkipZigTest;
+    var s = try linesListForTest(4);
+    defer s.deinit();
+    s.fillTextRowsForTest();
+    var prng = std.Random.DefaultPrng.init(0xc0de);
+    const flags = try testing.allocator.alloc(bool, s.total_rows);
+    defer testing.allocator.free(flags);
+    for (flags) |*f| f.* = prng.random().uintLessThan(u8, 100) < 30;
+    s.setWrapsForTest(flags);
+    _ = s.compress(.full);
+    try testing.expect(s.pages.first.?.isCompressed());
+
+    try s.expectLinesMatchForTest();
+    try testing.expect(s.pages.first.?.isCompressed());
+}
+
+// ------------------------------------------- keeping the index right: tests
+
+/// `fillTextRowsForTest` that also clears the rows' blank flag, so the pages
+/// stay valid when something checks them.
+fn fillTextForTest(self: *PageList) void {
+    var node = self.pages.first;
+    while (node) |n| : (node = n.next) {
+        const page = n.page();
+        const rows = page.rows.ptr(page.memory);
+        for (0..n.rows()) |y| {
+            page.getRowAndCell(0, y).cell.* = .init('x');
+            rows[y].blank = false;
+        }
+    }
+}
+
+/// Fails unless the index, every summary and the pruned totals are right.
+fn expectLinesRightForTest(self: *PageList) !void {
+    try self.checkLineIndex();
+    var it = self.pages.first;
+    while (it) |n| : (it = n.next) try self.checkLineEnds(n);
+}
+
+/// Random consistent wrap flags for every row: soft wraps of a few rows.
+fn randomWrapsForTest(self: *PageList, rnd: std.Random) !void {
+    const alloc = std.testing.allocator;
+    const flags = try alloc.alloc(bool, self.total_rows);
+    defer alloc.free(flags);
+    for (flags) |*f| f.* = rnd.uintLessThan(u8, 100) < 30;
+    // Nothing follows the last row, so it cannot wrap.
+    flags[flags.len - 1] = false;
+    self.setWrapsForTest(flags);
+}
+
+/// The line ends of the live rows plus those already pruned.
+fn totalLineEndsForTest(self: *PageList) !u64 {
+    const alloc = std.testing.allocator;
+    const flags = try self.wrapFlagsForTest(alloc);
+    defer alloc.free(flags);
+    var n: u64 = self.lines_pruned;
+    for (flags) |w| n += @intFromBool(!w);
+    return n;
+}
+
+test "LineIndex stays equal to a recount across random operations" {
+    const testing = std.testing;
+    const canCompress = terminal_mem.canReclaim(.strict);
+
+    for (0..200) |seq_i| {
+        const compress_here = canCompress and seq_i % 4 == 0;
+        const seed: u64 = 0x1d3a + seq_i;
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rnd = prng.random();
+        var op_i: usize = 0;
+        errdefer std.debug.print("LineIndex property: seed {d} op {d}\n", .{ seed, op_i });
+
+        var s = try init(testing.allocator, .{
+            .cols = rnd.intRangeAtMost(u16, 40, 100),
+            .rows = rnd.intRangeAtMost(u16, 4, 20),
+            // Encoding pages is slow in a debug build: only some sequences
+            // reflow lazily (which compresses its output) or compress.
+            .lazy_reflow = seq_i % 3 == 0,
+        });
+        defer s.deinit();
+        s.pauseIntegrityChecks(true);
+        defer s.pauseIntegrityChecks(false);
+        s.line_index_extend = rnd.intRangeAtMost(usize, 1, 6);
+        try s.growColdPagesQuietForTest(rnd.intRangeAtMost(usize, 1, 2));
+        s.fillTextForTest();
+        try s.randomWrapsForTest(rnd);
+
+        var last_first: u64 = 0;
+        var last_rows_pruned: u64 = 0;
+        var last_lines_pruned: u64 = 0;
+        for (0..8) |i| {
+            op_i = i;
+            const before_total = try s.totalLineEndsForTest();
+            const seq_before = s.edit_log.seq;
+            // Operations that keep every logical line keep the total, and
+            // log nothing; reflow, writes and RIS are the exceptions.
+            var keeps_total = true;
+            var may_edit = false;
+            switch (rnd.uintLessThan(u8, 14)) {
+                0 => { // output: rows scroll in, the active area is rewritten
+                    keeps_total = false;
+                    {
+                        var bulk: BulkGrowth = .init(&s);
+                        defer bulk.finish();
+                        try bulk.growMany(rnd.intRangeAtMost(usize, 1, 150));
+                    }
+                    var top: ?*List.Node = s.getTopLeft(.active).node;
+                    while (top) |n| : (top = n.next) {
+                        const page = n.page();
+                        const rows = page.rows.ptr(page.memory);
+                        for (0..n.rows()) |y| {
+                            rows[y].wrap = rnd.uintLessThan(u8, 100) < 30;
+                            page.getRowAndCell(0, y).cell.* = .init('x');
+                            rows[y].blank = false;
+                        }
+                        // Continuations follow wraps within the node.
+                        for (1..n.rows()) |y| rows[y].wrap_continuation = rows[y - 1].wrap;
+                        if (n.next == null) rows[n.rows() - 1].wrap = false;
+                    }
+                },
+                1 => { // height
+                    keeps_total = false;
+                    may_edit = true;
+                    const h: i32 = @intCast(s.rows);
+                    const nh: u16 = @intCast(@max(1, h + rnd.intRangeAtMost(i32, -6, 25)));
+                    try s.resize(.{ .rows = nh, .reflow = rnd.boolean() });
+                },
+                2 => { // width: eager or lazy reflow
+                    keeps_total = false;
+                    may_edit = true;
+                    try s.resize(.{ .cols = rnd.intRangeAtMost(u16, 30, 120) });
+                },
+                3, 4 => { // lazy reflow steps
+                    keeps_total = false;
+                    may_edit = true;
+                    for (0..rnd.intRangeAtMost(usize, 1, 3)) |_| {
+                        if (s.stale_tail == null) break;
+                        _ = try s.reflowStep(rnd.intRangeAtMost(usize, 50, 600), rnd.intRangeAtMost(usize, 1, 3));
+                    }
+                },
+                5 => if (compress_here) {
+                    _ = s.compress(.full);
+                },
+                6 => { // restore a page and write nothing
+                    var n = s.pages.first;
+                    var k = rnd.uintLessThan(usize, 4);
+                    while (n) |node| : (n = node.next) {
+                        if (k == 0) {
+                            _ = node.page();
+                            break;
+                        }
+                        k -= 1;
+                    }
+                },
+                7 => { // prune by the line limit
+                    s.limits.set(.lines, 0);
+                    s.limits.enforce(&s, .lines);
+                },
+                8 => s.eraseHistory(null), // ED3
+                9 => { // ED3 up to a row
+                    const hist = s.total_rows - s.rows;
+                    if (hist > 0) s.eraseHistory(.{ .history = .{
+                        .y = @intCast(rnd.uintLessThan(usize, hist)),
+                    } });
+                },
+                10 => { // RIS
+                    keeps_total = false;
+                    s.reset();
+                },
+                11 => { // compact a page (content is kept)
+                    var n = s.pages.first;
+                    var k = rnd.uintLessThan(usize, 4);
+                    while (n) |node| : (n = node.next) {
+                        if (k == 0) {
+                            _ = s.compact(node) catch {};
+                            break;
+                        }
+                        k -= 1;
+                    }
+                },
+                12 => { // a prompt redraw somewhere in history
+                    may_edit = true;
+                    const hist = s.total_rows - s.rows;
+                    if (hist > 0) {
+                        const pt: point.Point = .{ .screen = .{
+                            .y = @intCast(rnd.uintLessThan(usize, hist)),
+                        } };
+                        if (s.pin(pt)) |p| s.lineRewritten(p);
+                    }
+                },
+                else => {}, // just query
+            }
+
+            if (keeps_total) try testing.expectEqual(before_total, try s.totalLineEndsForTest());
+            if (!may_edit) try testing.expectEqual(seq_before, s.edit_log.seq);
+
+            // Query between extensions too: the index may be partial.
+            _ = s.lineState();
+            try s.expectLinesRightForTest();
+            if (rnd.uintLessThan(u8, 3) == 0) {
+                try s.expectLinesMatchSampledForTest(rnd.intRangeAtMost(usize, 3, 11));
+                try s.expectLinesRightForTest();
+            }
+
+            // Ids and absolute rows never go back.
+            const st = s.lineState();
+            try testing.expect(st.first_line >= last_first);
+            try testing.expect(s.rows_pruned >= last_rows_pruned);
+            try testing.expect(s.lines_pruned >= last_lines_pruned);
+            last_first = st.first_line;
+            last_rows_pruned = s.rows_pruned;
+            last_lines_pruned = s.lines_pruned;
+        }
+    }
+}
+
+test "LineIndex height grow then shrink moves end_line and logs no edit" {
+    const testing = std.testing;
+    var s = try linesListForTest(3);
+    defer s.deinit();
+    s.fillTextForTest();
+    var prng = std.Random.DefaultPrng.init(0x4e1f);
+    try s.randomWrapsForTest(prng.random());
+
+    const before = try s.lineStateReadyForTest();
+    const rows = s.rows;
+    // Rows pulled out of scrollback: the active area reaches indexed nodes.
+    try s.resize(.{ .rows = rows + 300, .reflow = false });
+    try s.expectLinesRightForTest();
+    const taller = try s.lineStateReadyForTest();
+    try testing.expect(taller.end_line < before.end_line);
+    try testing.expectEqual(before.first_line, taller.first_line);
+    try s.expectLinesMatchSampledForTest(5);
+
+    try s.resize(.{ .rows = rows, .reflow = false });
+    try s.expectLinesRightForTest();
+    const back = try s.lineStateReadyForTest();
+    try testing.expectEqual(before.end_line, back.end_line);
+    try testing.expectEqual(@as(u64, 0), back.edit_seq);
+    try s.expectLinesMatchSampledForTest(5);
+}
+
+test "LineIndex prune across a line that starts in a pruned page" {
+    const testing = std.testing;
+    // `grow` prunes at the byte limit: the page it takes ends in a soft wrap.
+    var s = try linesListForTest(3);
+    defer s.deinit();
+    const flags = try testing.allocator.alloc(bool, s.total_rows);
+    defer testing.allocator.free(flags);
+    @memset(flags, false);
+    var row: usize = 0;
+    var node = s.pages.first;
+    while (node) |n| : (node = n.next) {
+        row += n.rows();
+        @memset(flags[row - 2 .. row], true);
+    }
+    s.setWrapsForTest(flags);
+    _ = try s.lineStateReadyForTest();
+
+    s.limits.set(.bytes, 0);
+    var bulk: BulkGrowth = .init(&s);
+    defer bulk.finish();
+    try bulk.growMany(s.pages.first.?.capacity().rows + 5);
+    try testing.expect(s.rows_pruned > 0);
+    try testing.expectEqual(@as(u64, 2), s.head_rows_pruned);
+    const st = try s.lineStateReadyForTest();
+    try testing.expectEqual(LineIndex.LINE_ORIGIN + s.lines_pruned + 1, st.first_line);
+    try s.expectLinesRightForTest();
+}
+
+test "LineIndex ED3 and RIS keep ids monotonic" {
+    const testing = std.testing;
+    var s = try linesListForTest(4);
+    defer s.deinit();
+    s.fillTextForTest();
+    var prng = std.Random.DefaultPrng.init(0xed3);
+    try s.randomWrapsForTest(prng.random());
+    const a = try s.lineStateReadyForTest();
+    const total = try s.totalLineEndsForTest();
+
+    // A partial ED3, then the rest.
+    s.eraseHistory(.{ .history = .{ .y = 100 } });
+    try s.expectLinesRightForTest();
+    const b = try s.lineStateReadyForTest();
+    try testing.expect(s.rows_pruned >= 101);
+    try testing.expect(b.first_line >= a.first_line);
+    try testing.expectEqual(total, try s.totalLineEndsForTest());
+    try s.expectLinesMatchSampledForTest(7);
+
+    s.eraseHistory(null);
+    try s.expectLinesRightForTest();
+    const c = try s.lineStateReadyForTest();
+    try testing.expect(c.first_line >= b.first_line);
+    try testing.expectEqual(@as(u64, 0), c.history_rows);
+    try testing.expectEqual(total, try s.totalLineEndsForTest());
+    // Everything the readers saw is below the first line.
+    try testing.expect(c.first_line >= a.end_line);
+
+    // RIS: every row goes, ids go on.
+    try s.growColdPagesQuietForTest(2);
+    _ = try s.lineStateReadyForTest();
+    const before = s.lineFirst();
+    const rows_before = s.rows_pruned;
+    s.reset();
+    try s.expectLinesRightForTest();
+    const d = try s.lineStateReadyForTest();
+    try testing.expect(d.first_line >= before);
+    try testing.expect(s.rows_pruned > rows_before);
+    try testing.expectEqual(@as(u64, 0), d.history_rows);
+    try testing.expectEqual(@as(usize, 0), s.line_index.len());
+}
+
+test "LineIndex a recount edit is logged when a reflow changes a region's line count" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24, .lazy_reflow = true });
+    defer s.deinit();
+    try s.growColdPagesQuietForTest(10);
+    s.fillTextForTest();
+    var prng = std.Random.DefaultPrng.init(0xe0d1);
+    try s.randomWrapsForTest(prng.random());
+
+    try s.resize(.{ .cols = 50 });
+    try testing.expect(s.stale_tail != null);
+    _ = try s.lineStateReadyForTest();
+    try s.expectLinesRightForTest();
+    try testing.expectEqual(@as(u64, 0), s.edit_log.seq);
+
+    // A step that keeps every line logs nothing, and the index follows it.
+    _ = try s.reflowStep(300, 2);
+    try s.expectLinesRightForTest();
+    try testing.expectEqual(@as(u64, 0), s.edit_log.seq);
+    _ = try s.lineStateReadyForTest();
+    try s.expectLinesMatchSampledForTest(3);
+
+    // No input reflows to a different count, so make the cached count of
+    // the youngest stale page lie by one: the step then sees its sources
+    // hold one line more than it wrote.
+    const tail = s.stale_tail.?;
+    _ = try s.lineStateReadyForTest();
+    try testing.expect(tail.line_indexed);
+    tail.line_ends.?.count += 1;
+    _ = try s.reflowStep(300, 2);
+    try testing.expectEqual(@as(u64, 1), s.edit_log.seq);
+    var out: [2]LineIndex.LineEdit = undefined;
+    const got = s.edit_log.since(0, &out);
+    try testing.expectEqual(@as(usize, 1), got.n);
+    try testing.expectEqual(LineIndex.EditKind.recount, out[0].kind);
+    try testing.expectEqual(out[0].old_lines, out[0].new_lines + 1);
+    // It names the line ending at the first line end of the replaced rows.
+    const flags = try s.wrapFlagsForTest(testing.allocator);
+    defer testing.allocator.free(flags);
+    var ends: u64 = 0;
+    for (flags[0..s.stale_rows]) |w| ends += @intFromBool(!w);
+    try testing.expectEqual(LineIndex.LINE_ORIGIN + ends, out[0].first_line);
+    try s.expectLinesRightForTest();
+}
+
+test "LineIndex prompt redraw logs a rewrite edit for history lines" {
+    const testing = std.testing;
+    var s = try linesListForTest(3);
+    defer s.deinit();
+    const st = try s.lineStateReadyForTest();
+
+    // From a row in history: every history line from it down is rewritten.
+    const p = s.pin(.{ .screen = .{ .y = 40 } }).?;
+    s.lineRewritten(p);
+    var out: [2]LineIndex.LineEdit = undefined;
+    const got = s.edit_log.since(0, &out);
+    try testing.expectEqual(@as(usize, 1), got.n);
+    try testing.expectEqual(LineIndex.EditKind.rewrite, out[0].kind);
+    try testing.expectEqual(st.first_line + 40, out[0].first_line);
+    try testing.expectEqual(st.end_line - out[0].first_line, out[0].old_lines);
+    try testing.expectEqual(out[0].old_lines, out[0].new_lines);
+
+    // From the active area: history is untouched, nothing is logged.
+    s.lineRewritten(s.pin(.{ .active = .{ .y = 3 } }).?);
+    try testing.expectEqual(@as(u64, 1), s.edit_log.seq);
+}
+
+test "LineIndex two resizes before the first reflow finishes keep ids stable" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24, .lazy_reflow = true });
+    defer s.deinit();
+    try s.growColdPagesQuietForTest(8);
+    s.fillTextForTest();
+    var prng = std.Random.DefaultPrng.init(0x2e51);
+    try s.randomWrapsForTest(prng.random());
+    const total = try s.totalLineEndsForTest();
+    _ = try s.lineStateReadyForTest();
+
+    // Pages of three widths: the oldest at 80, the next at 50, the newest at 65.
+    try s.resize(.{ .cols = 50 });
+    _ = try s.reflowStep(400, 2);
+    _ = try s.lineStateReadyForTest();
+    try s.resize(.{ .cols = 65 });
+    try s.expectLinesRightForTest();
+    try s.expectLinesMatchSampledForTest(5);
+    try testing.expectEqual(total, try s.totalLineEndsForTest());
+
+    var steps: usize = 0;
+    while (s.stale_tail != null) : (steps += 1) {
+        _ = try s.reflowStep(400, 3);
+        try s.expectLinesRightForTest();
+        _ = s.lineState();
+    }
+    try s.expectLinesMatchSampledForTest(5);
+    try testing.expectEqual(total, try s.totalLineEndsForTest());
+    try testing.expectEqual(@as(u64, 0), s.edit_log.seq);
+}
+
+test "LineIndex a line over 8192 rows crossing the soft boundary keeps its line end" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24, .lazy_reflow = true });
+    defer s.deinit();
+    s.pauseIntegrityChecks(true);
+    defer s.pauseIntegrityChecks(false);
+    // One line of more than `max_line_rows` rows, then ordinary lines.
+    {
+        var bulk: BulkGrowth = .init(&s);
+        defer bulk.finish();
+        try bulk.growMany(max_line_rows + 3000);
+    }
+    s.fillTextForTest();
+    const flags = try testing.allocator.alloc(bool, s.total_rows);
+    defer testing.allocator.free(flags);
+    @memset(flags, false);
+    @memset(flags[1000 .. 1000 + max_line_rows + 500], true);
+    s.setWrapsForTest(flags);
+    const total = try s.totalLineEndsForTest();
+    s.line_index_extend = 1000;
+    _ = try s.lineStateReadyForTest();
+
+    try s.resize(.{ .cols = 60 });
+    var steps: usize = 0;
+    while (s.stale_tail != null) : (steps += 1) {
+        _ = try s.reflowStep(2000, 4);
+        try s.checkLineIndex();
+    }
+    try testing.expectEqual(total, try s.totalLineEndsForTest());
+    try s.expectLinesRightForTest();
+    try s.expectLinesMatchSampledForTest(97);
+    try testing.expectEqual(@as(u64, 0), s.edit_log.seq);
+}
+
+test "LineIndex restore drops the summary and readPreserving keeps it" {
+    const testing = std.testing;
+    if (!terminal_mem.canReclaim(.strict)) return error.SkipZigTest;
+    var s = try linesListForTest(3);
+    defer s.deinit();
+    s.fillTextForTest();
+    _ = try s.lineStateReadyForTest();
+    _ = s.compress(.full);
+    const node = s.pages.first.?;
+    try testing.expect(node.isCompressed());
+    try testing.expect(node.line_ends != null);
+
+    var scratch: ReadScratch = .{};
+    defer scratch.deinit(testing.allocator);
+    _ = try node.readPreserving(&scratch, testing.allocator);
+    try testing.expect(node.isCompressed());
+    try testing.expect(node.line_ends != null);
+
+    _ = node.page();
+    try testing.expect(!node.isCompressed());
+    try testing.expect(node.line_ends == null);
+    // The index still holds it; its summary is rebuilt on use.
+    try s.checkLineIndex();
+    try s.expectLinesMatchSampledForTest(3);
+    try testing.expect(node.line_ends != null);
+}
+
+test "LineIndex compression builds the summary" {
+    const testing = std.testing;
+    if (!terminal_mem.canReclaim(.strict)) return error.SkipZigTest;
+    var s = try linesListForTest(3);
+    defer s.deinit();
+    s.fillTextForTest();
+    const node = s.pages.first.?;
+    try testing.expect(node.line_ends == null);
+    try testing.expect(s.compressPage(node));
+    try testing.expect(node.line_ends != null);
+    try s.checkLineEnds(node);
+    try testing.expectEqual(@as(u32, node.rows()), node.line_ends.?.count);
+}
+
+test "LineIndex pruning a page that cannot be read marks the edit log lost" {
+    const testing = std.testing;
+    if (!terminal_mem.canReclaim(.strict)) return error.SkipZigTest;
+    var s = try linesListForTest(4);
+    defer s.deinit();
+    s.fillTextForTest();
+    _ = s.compress(.full);
+    const first = s.pages.first.?;
+    try testing.expect(first.isCompressed());
+    first.dropLineEnds();
+    s.line_scratch.deinit(testing.allocator);
+
+    // Decoding needs a buffer, and none can be had.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const real = s.pool.alloc;
+    s.pool.alloc = failing.allocator();
+    s.limits.set(.lines, 0);
+    s.limits.enforce(&s, .lines);
+    s.pool.alloc = real;
+
+    try testing.expect(s.rows_pruned > 0);
+    const st = s.lineState();
+    try testing.expect(st.edits_overflowed);
+    // A reader that rebuilds and catches up clears it.
+    var out: [4]LineIndex.LineEdit = undefined;
+    _ = s.edit_log.since(st.edit_seq, &out);
+    try testing.expect(!s.lineState().edits_overflowed);
+}
+
+test "LineIndex splices get sequence numbers between their neighbours, or renumber" {
+    const testing = std.testing;
+    var s = try linesListForTest(6);
+    defer s.deinit();
+    _ = try s.lineStateReadyForTest();
+    try s.expectLinesRightForTest();
+    const n = s.line_index.len();
+    try testing.expect(n >= 4);
+
+    // Room between the neighbours: the number lands strictly between them.
+    const mid = s.line_index.entry(2);
+    try testing.expect(!s.lineAssignSeqs(2, 1, &.{mid}));
+    try testing.expect(mid.node.line_seq > s.line_index.entry(1).node.line_seq);
+    try testing.expect(mid.node.line_seq < s.line_index.entry(3).node.line_seq);
+
+    // No room: consecutive numbers leave none, and one renumber fixes it.
+    for (0..n) |i| s.line_index.entry(i).node.line_seq = i + 1;
+    try testing.expect(s.lineAssignSeqs(1, 0, &.{mid}));
+    s.lineRenumber();
+    try testing.expectEqual(@as(u32, 1), s.line_renumbers);
+    try s.expectLinesRightForTest();
 }

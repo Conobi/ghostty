@@ -24,6 +24,15 @@
 #include <ghostty/vt/selection.h>
 #include <ghostty/vt/style.h>
 
+/**
+ * The `screen_row` of a GhosttyLineCell whose row was lost to pruning, and
+ * the start row ghostty_terminal_lines_rows() gives for a line it cannot
+ * locate.
+ *
+ * @ingroup terminal
+ */
+#define GHOSTTY_ROW_PRUNED UINT64_MAX
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -639,6 +648,232 @@ typedef struct {
   /** Whether the viewport shows at least one stale row. */
   bool viewport_stale;
 } GhosttyTerminalReflowState;
+
+/**
+ * What a line edit changed. See ghostty_terminal_line_edits().
+ *
+ * @ingroup terminal
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  /** The number of lines in a region changed: later line ids shifted. */
+  GHOSTTY_LINE_EDIT_RECOUNT = 0,
+
+  /** Lines kept their ids but their text was cleared and may be redrawn. */
+  GHOSTTY_LINE_EDIT_REWRITE = 1,
+  GHOSTTY_LINE_EDIT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyLineEditKind;
+
+/**
+ * One change to the lines of the history, from
+ * ghostty_terminal_line_edits().
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Sequence number of the edit, from 1 and rising. */
+  uint64_t seq;
+
+  /** What changed. */
+  GhosttyLineEditKind kind;
+
+  /** Id of the first line affected. */
+  uint64_t first_line;
+
+  /** Lines in the affected region before the edit. */
+  uint64_t old_lines;
+
+  /**
+   * Lines in the affected region after the edit. Equal to `old_lines` for
+   * `GHOSTTY_LINE_EDIT_REWRITE`.
+   */
+  uint64_t new_lines;
+} GhosttyLineEdit;
+
+/**
+ * The line counters of a terminal's primary screen.
+ *
+ * A line is the text between two line ends: a row that is not soft-wrapped
+ * ends a line. Line ids start at a large constant and never go back, even
+ * when history is pruned or erased. History lines are the lines that end
+ * above the active area; the line crossing the boundary belongs to the
+ * tail.
+ *
+ * Read with ghostty_terminal_get() and `GHOSTTY_TERMINAL_DATA_LINE_STATE`.
+ * Every line call in this header acts on the primary screen, whichever
+ * screen is active, and all rows are absolute: the position in the list
+ * plus `rows_pruned`.
+ *
+ * This is a sized struct. Initialize it with GHOSTTY_INIT_SIZED() before
+ * passing it to ghostty_terminal_get(). See @ref sized-structs.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Size of this struct in bytes. Set by you. */
+  size_t size;
+
+  /**
+   * Id of the oldest line that starts in a live row. A line whose first rows
+   * were pruned is not counted.
+   */
+  uint64_t first_line;
+
+  /**
+   * One past the last complete history line, as far as the index reaches
+   * (see `index_ready`). Lines from here on, up to the last row, are the
+   * tail.
+   */
+  uint64_t end_line;
+
+  /** Rows removed from the top for good. The absolute row of row 0 is this. */
+  uint64_t rows_pruned;
+
+  /** Rows above the active area. */
+  uint64_t history_rows;
+
+  /** Sequence of the newest line edit. */
+  uint64_t edit_seq;
+
+  /**
+   * An edit was lost before it was read: discard what you built from the
+   * lines and read them again. Cleared once ghostty_terminal_line_edits() is
+   * called with `since_seq` equal to `edit_seq`.
+   */
+  bool edits_overflowed;
+
+  /**
+   * Whether the index reaches the active area. Each call extends it by a
+   * bounded number of pages, so after a flood this is false until a few
+   * calls caught up; `end_line` is then the lines indexed so far.
+   */
+  bool index_ready;
+} GhosttyTerminalLineState;
+
+/**
+ * The rows of a history line. See ghostty_terminal_line_rows().
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Absolute row of the first row of the line. */
+  uint64_t start_row;
+
+  /** Absolute row holding the line end. */
+  uint64_t end_row;
+} GhosttyLineRows;
+
+/**
+ * Where ghostty_terminal_read_lines() goes on inside a line it did not
+ * finish. A zeroed value starts a line at its beginning.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Row of the line to continue from. */
+  uint64_t row;
+
+  /**
+   * Trailing blank cells of the row before it: the text written for them
+   * depends on what follows.
+   */
+  size_t blanks;
+
+  /** Bytes of that row's text already written, when one row did not fit. */
+  uint64_t skip;
+} GhosttyLineResume;
+
+/**
+ * What ghostty_terminal_read_lines() did.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /**
+   * Id of the first line read: the requested one, or the oldest line that
+   * starts in a live row when it was pruned.
+   */
+  uint64_t first_line_read;
+
+  /** Lines written whole. */
+  uint64_t lines;
+
+  /** Bytes written. */
+  uint64_t bytes;
+
+  /** Line to continue from, with `next`. */
+  uint64_t next_line;
+
+  /** Rows formatted by the call. */
+  uint64_t rows_formatted;
+
+  /** Where to go on inside `next_line`. */
+  GhosttyLineResume next;
+
+  /** No line follows `next_line`. */
+  bool reached_end;
+
+  /** The last line written has no line end, so no newline either. */
+  bool last_unterminated;
+} GhosttyLineRead;
+
+/**
+ * Where a byte of a line's text is on screen.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /**
+   * Absolute row, or GHOSTTY_ROW_PRUNED when the row was lost to pruning.
+   */
+  uint64_t screen_row;
+
+  /** Column of the cell. */
+  uint32_t col;
+} GhosttyLineCell;
+
+/**
+ * Where ghostty_terminal_locate_bytes() goes on after it stopped short. A
+ * zeroed value starts at the line's beginning.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Row of the line to format next. */
+  uint64_t row;
+
+  /** Bytes of the line's text before that row. */
+  uint64_t byte_base;
+
+  /** Trailing blank cells of the row before it. */
+  size_t blanks;
+} GhosttyLocateResume;
+
+/**
+ * What ghostty_terminal_locate_bytes() achieved.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  /** Leading offsets that have a cell (or are GHOSTTY_ROW_PRUNED). */
+  size_t located;
+
+  /**
+   * One past the last row formatted that was needed: the row of the largest
+   * byte plus one when all were located, else where the budget or the line
+   * ended. Counted from the start of the line.
+   */
+  uint64_t rows_read;
+
+  /**
+   * Every offset is answered, or lies beyond the text of the whole line.
+   * When false the row budget stopped short: call again with `next` and the
+   * offsets not yet located.
+   */
+  bool complete;
+
+  /** Where to go on. */
+  GhosttyLocateResume next;
+} GhosttyLocateResult;
 
 /** @} */
 
@@ -3283,6 +3518,21 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: GhosttyTerminalReflowState *
    */
   GHOSTTY_TERMINAL_DATA_REFLOW_STATE = 44,
+
+  /**
+   * The line counters of the primary screen: ids of the first and last
+   * lines, pruned rows and line edits. See GhosttyTerminalLineState.
+   *
+   * Set the struct's `size` field before the call, for example with
+   * GHOSTTY_INIT_SIZED(). If `size` is too small, this returns
+   * GHOSTTY_INVALID_VALUE and leaves the struct unchanged.
+   *
+   * This extends the line index by a bounded number of pages (about a
+   * microsecond each), whatever the history size.
+   *
+   * Output type: GhosttyTerminalLineState *
+   */
+  GHOSTTY_TERMINAL_DATA_LINE_STATE = 45,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
@@ -3739,6 +3989,155 @@ GHOSTTY_API GhosttyResult ghostty_terminal_reflow_step(
     size_t max_rows,
     size_t max_pages,
     GhosttyTerminalReflowResult* out_result);
+
+/**
+ * Copy the line edits newer than `since_seq`, oldest first.
+ *
+ * Only the last 16 edits are kept. If more were lost,
+ * GhosttyTerminalLineState::edits_overflowed is set.
+ *
+ * @param terminal The terminal handle
+ * @param since_seq Return edits with a sequence above this
+ * @param out Array to fill, or NULL when `cap` is zero
+ * @param cap Elements `out` can hold
+ * @param out_n Receives the number written
+ * @return GHOSTTY_SUCCESS, or GHOSTTY_INVALID_VALUE for a NULL handle or
+ *         `out_n`, or a NULL `out` with `cap` above zero
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_line_edits(
+    GhosttyTerminal terminal,
+    uint64_t since_seq,
+    GhosttyLineEdit* out,
+    size_t cap,
+    size_t* out_n);
+
+/**
+ * Find the rows of a history line.
+ *
+ * Only lines the index reaches are found; see
+ * GhosttyTerminalLineState::index_ready.
+ *
+ * @param terminal The terminal handle
+ * @param line Line id
+ * @param out Receives the rows
+ * @return GHOSTTY_SUCCESS, GHOSTTY_NO_VALUE if the line is pruned, not a
+ *         complete history line, or not indexed yet, or
+ *         GHOSTTY_INVALID_VALUE for a NULL argument
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_line_rows(
+    GhosttyTerminal terminal,
+    uint64_t line,
+    GhosttyLineRows* out);
+
+/**
+ * Find the line that holds an absolute row. Rows of the tail get ids too:
+ * the count of line ends above them.
+ *
+ * @param terminal The terminal handle
+ * @param row Absolute row
+ * @param out Receives the line id
+ * @return GHOSTTY_SUCCESS, GHOSTTY_NO_VALUE if the row is pruned, past the
+ *         end, or not indexed yet, or GHOSTTY_INVALID_VALUE for a NULL
+ *         argument
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_row_line(
+    GhosttyTerminal terminal,
+    uint64_t row,
+    uint64_t* out);
+
+/**
+ * Find the first rows of many lines in one sweep. `lines` should ascend; a
+ * long list can be cut into slices to bound the time spent in one call.
+ *
+ * @param terminal The terminal handle
+ * @param lines Line ids
+ * @param n Number of lines
+ * @param out_start_rows Receives the absolute first row of each line, or
+ *        GHOSTTY_ROW_PRUNED for a line that cannot be located
+ * @return GHOSTTY_SUCCESS, or GHOSTTY_INVALID_VALUE for a NULL handle or a
+ *         NULL array with `n` above zero
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_lines_rows(
+    GhosttyTerminal terminal,
+    const uint64_t* lines,
+    size_t n,
+    uint64_t* out_start_rows);
+
+/**
+ * Write lines as text: unwrapped, trailing spaces trimmed, a newline after
+ * every line, blank lines included.
+ *
+ * Reading goes through the active area; a last line with no line end is
+ * written without a newline. The call stops after `max_lines` lines or
+ * `max_bytes` bytes at a line end. A line too long for the budget is
+ * written in pieces that end on row boundaries: pass `out_read->next_line`
+ * and `out_read->next` to the next call. Compressed history is read without
+ * being restored.
+ *
+ * @param terminal The terminal handle
+ * @param first_line Line id to start at; older lines are skipped
+ * @param resume Where to go on inside the line, or NULL to start at its
+ *        beginning
+ * @param max_lines Most lines to write
+ * @param max_bytes Most bytes to write
+ * @param writer Receives the text; see ghostty_terminal_get()'s writer rules
+ * @param out_read Receives what was done
+ * @return GHOSTTY_SUCCESS, GHOSTTY_INVALID_VALUE for a NULL handle,
+ *         `writer` callback or `out_read`, GHOSTTY_OUT_OF_MEMORY, or an
+ *         I/O error from the writer
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_read_lines(
+    GhosttyTerminal terminal,
+    uint64_t first_line,
+    const GhosttyLineResume* resume,
+    size_t max_lines,
+    size_t max_bytes,
+    GhosttyWriter writer,
+    GhosttyLineRead* out_read);
+
+/**
+ * Find where bytes of a line's text are on screen. The text is the one
+ * ghostty_terminal_read_lines() writes for the line, without the newline.
+ *
+ * Rows are formatted in order from `resume`, in growing windows, until the
+ * row holding the largest offset is done or `max_rows` rows were formatted,
+ * so the cost follows the position of the match, not the length of the line.
+ * Offsets must ascend. A line already pruned answers GHOSTTY_ROW_PRUNED for
+ * every byte.
+ *
+ * @param terminal The terminal handle
+ * @param line Line id
+ * @param byte_offsets Byte offsets into the line's text
+ * @param n Number of offsets
+ * @param resume Where to go on after an incomplete call, or NULL
+ * @param max_rows Most rows to format
+ * @param out_cells Receives one cell per located offset
+ * @param out_result Receives what was done
+ * @return GHOSTTY_SUCCESS, GHOSTTY_NO_VALUE if the line does not exist or is
+ *         not indexed yet, GHOSTTY_OUT_OF_MEMORY, or GHOSTTY_INVALID_VALUE
+ *         for a NULL handle, `out_result`, or an array with `n` above zero
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_locate_bytes(
+    GhosttyTerminal terminal,
+    uint64_t line,
+    const uint64_t* byte_offsets,
+    size_t n,
+    const GhosttyLocateResume* resume,
+    size_t max_rows,
+    GhosttyLineCell* out_cells,
+    GhosttyLocateResult* out_result);
 
 /**
  * Read the soft-wrap flags of a range of rows without restoring history.

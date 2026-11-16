@@ -2502,6 +2502,9 @@ fn clearPromptForRedraw(
                     };
                 };
 
+                // The lines this touches in history must be read again.
+                self.pages.lineRewritten(start);
+
                 // Clear cells from our start down. We replace it with spaces,
                 // and do not physically erase the rows (eraseRows) because the
                 // shell is going to expect this space to be available.
@@ -13455,4 +13458,44 @@ test "Screen clearPromptForRedraw never touches stale pages" {
         @as(usize, 0),
         std.mem.trim(u8, text[stale_text.len..], "\n ").len,
     );
+}
+
+test "Screen LineIndex prompt redraw logs a rewrite edit for history lines" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    const LineIndex = @import("LineIndex.zig");
+
+    var s = try init(io, alloc, .{ .cols = 10, .rows = 3, .max_scrollback_bytes = 10_000 });
+    defer s.deinit();
+
+    // A three-row prompt whose first row scrolled into history.
+    // zig fmt: off
+    try s.testWriteString("out1\nout2\n");
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("p1\n");
+    s.cursorSetSemanticContent(.{ .prompt = .continuation });
+    try s.testWriteString("p2\n");
+    try s.testWriteString("p3\n");
+    s.cursorSetSemanticContent(.{ .prompt = .continuation });
+    try s.testWriteString("> ");
+    s.cursorSetSemanticContent(.{ .input = .clear_eol });
+    try s.testWriteString("echo");
+    // zig fmt: on
+
+    const before = s.pages.lineState();
+    try testing.expect(before.index_ready);
+    try testing.expectEqual(@as(u64, 3), before.history_rows);
+
+    try s.resize(.{ .cols = 20, .rows = 3, .prompt_redraw = .true });
+
+    // The prompt starts on history row 2: that line is cleared and must be
+    // read again; the two before it are not.
+    var out: [4]LineIndex.LineEdit = undefined;
+    const got = s.pages.edit_log.since(before.edit_seq, &out);
+    try testing.expectEqual(@as(usize, 1), got.n);
+    try testing.expectEqual(LineIndex.EditKind.rewrite, out[0].kind);
+    try testing.expectEqual(before.first_line + 2, out[0].first_line);
+    try testing.expectEqual(@as(u64, 1), out[0].old_lines);
+    try testing.expectEqual(@as(u64, 1), out[0].new_lines);
 }

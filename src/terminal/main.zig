@@ -101,6 +101,7 @@ test {
     _ = @import("compress.zig");
     _ = @import("fraction.zig");
     _ = @import("hash_map.zig");
+    _ = @import("LineIndex.zig");
     _ = @import("mem.zig");
     _ = @import("ref_counted_set.zig");
     _ = @import("size.zig");

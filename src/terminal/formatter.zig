@@ -953,6 +953,14 @@ pub const PageListFormatter = struct {
     /// Warning: there is a significant performance hit to track this
     pin_map: ?PinMap,
 
+    /// The state of the rows just above `top_left`, when it is in the middle
+    /// of a wrapped line (see `PageFormatter.continue_state`).
+    initial_state: ?PageFormatter.TrailingState = null,
+
+    /// If set, receives the state after the last row formatted: pass it as
+    /// `initial_state` to go on from the next row.
+    final_state: ?*?PageFormatter.TrailingState = null,
+
     pub fn init(
         list: *const PageList,
         opts: Options,
@@ -990,7 +998,7 @@ pub const PageListFormatter = struct {
             }
         }
 
-        var page_state: ?PageFormatter.TrailingState = null;
+        var page_state: ?PageFormatter.TrailingState = self.initial_state;
         var iter = tl.pageIterator(.right_down, br);
         while (iter.next()) |chunk| {
             assert(chunk.start < chunk.end);
@@ -1002,6 +1010,7 @@ pub const PageListFormatter = struct {
             formatter.start_y = chunk.start;
             formatter.end_y = chunk.end - 1;
             formatter.trailing_state = page_state;
+            formatter.continue_state = self.initial_state != null;
             formatter.rectangle = self.rectangle;
 
             // For rectangle selection, apply start_x and end_x to all chunks
@@ -1028,6 +1037,7 @@ pub const PageListFormatter = struct {
 
             page_state = try formatter.formatWithState(writer);
         }
+        if (self.final_state) |out| out.* = page_state;
 
         // VT output without trimming keeps the blank rows at the end:
         // they are part of the layout, and a replay without them scrolls
@@ -1059,6 +1069,432 @@ pub const PageListFormatter = struct {
         }
     }
 };
+
+/// Where `readLines` goes on inside a line it left unfinished.
+///
+/// A line is resumed at a row, not at a byte, so continuing costs the rows
+/// still to read and never the rows already read. `blanks` carries the
+/// trailing blank cells of the row before it, which the formatter writes
+/// only if text follows; `skip` is for a single row whose text alone
+/// exceeds the budget.
+pub const ReadResume = extern struct {
+    row: u64 = 0,
+    blanks: usize = 0,
+    skip: u64 = 0,
+};
+
+/// What `readLines` returned and where to go on.
+pub const ReadLines = struct {
+    /// Id of the first line read: `first_line` raised to the oldest line
+    /// that still starts in a live row, when older ones were pruned.
+    first_line_read: u64,
+    /// Lines written whole.
+    lines: usize,
+    /// Bytes written.
+    bytes: usize,
+    /// Where to resume: this line, from `next_row` (see `ReadResume`).
+    next_line: u64,
+    next_row: u64,
+    next_blanks: usize,
+    next_skip: u64,
+    /// Rows formatted by this call, for cost accounting.
+    rows_formatted: u64,
+    /// No line follows `next_line`: the list ends there.
+    reached_end: bool,
+    /// The last line written has no `\n`: it has no line end yet.
+    last_unterminated: bool,
+
+    /// The resume point to pass to the next call.
+    pub fn resumePoint(self: ReadLines) ReadResume {
+        return .{ .row = self.next_row, .blanks = self.next_blanks, .skip = self.next_skip };
+    }
+};
+
+/// Lines one batch formats at most, and the rows it spans at most.
+const read_batch_lines = 64;
+const read_batch_rows = 2048;
+
+/// Rows one window of a long line formats at most.
+const read_window_rows = 4096;
+
+/// Write lines `first_line`, ... of the list as text: unwrapped, trimmed,
+/// one `\n` after every line, blank lines included. Lines are those of
+/// `PageList.lineSpan`, so the tail up to the last row can be read too; the
+/// line with no end yet is written without `\n` (`last_unterminated`).
+///
+/// Stops after `max_lines` lines or `max_bytes` bytes. Short lines are
+/// written whole, stopping at a line end. A line too long for the budget
+/// (or one resumed) is written row by row: a piece ends on a row boundary,
+/// and `next_row` and the fields after it say where it goes on, so a line
+/// of any length costs time linear in its rows over all the calls. The text
+/// of a line is the same whatever the width, but the rows are not: resume
+/// with the same list layout. Compressed pages are decoded into scratch,
+/// never restored. Lines beyond what the index reaches are not offered: call
+/// `PageList.lineState` until `index_ready` first.
+pub fn readLines(
+    list: *PageList,
+    first_line: u64,
+    cont: ReadResume,
+    max_lines: usize,
+    max_bytes: usize,
+    writer: *std.Io.Writer,
+) (Allocator.Error || std.Io.Writer.Error)!ReadLines {
+    const alloc = list.pool.alloc;
+    const oldest = list.firstLine();
+    var line = @max(first_line, oldest);
+    var res: ReadLines = .{
+        .first_line_read = line,
+        .lines = 0,
+        .bytes = 0,
+        .next_line = line,
+        .next_row = 0,
+        .next_blanks = 0,
+        .next_skip = 0,
+        .rows_formatted = 0,
+        .reached_end = false,
+        .last_unterminated = false,
+    };
+    // Bytes lost to pruning cannot be skipped: start the line afresh.
+    var at: ReadResume = if (first_line >= oldest) cont else .{};
+    res.next_row = at.row;
+    res.next_blanks = at.blanks;
+    res.next_skip = at.skip;
+    if (max_lines == 0 or max_bytes == 0) return res;
+
+    const buf = try alloc.alloc(u8, max_bytes + 1);
+    defer alloc.free(buf);
+
+    while (res.lines < max_lines) {
+        const budget = max_bytes - res.bytes;
+
+        // Gather the short lines of this batch.
+        var spans: [read_batch_lines]PageList.LineSpan = undefined;
+        var m: usize = 0;
+        var rows: u64 = 0;
+        var long_first: ?PageList.LineSpan = null;
+        while (m < read_batch_lines and res.lines + m < max_lines) {
+            const span = list.lineSpan(line + m) orelse break;
+            const n = span.end_row - span.start_row + 1;
+            const cols = (list.rowPin(span.start_row) orelse return error.WriteFailed).node.cols();
+            const resumed = m == 0 and (at.row > 0 or at.skip > 0);
+            // A line of a few rows is always formatted in the batch, whatever
+            // the budget; a longer one that cannot fit goes row by row.
+            if (resumed or n > read_batch_rows or (n > 8 and n * cols > budget)) {
+                if (m == 0) long_first = span;
+                break;
+            }
+            if (m > 0 and rows + n > read_batch_rows) break;
+            spans[m] = span;
+            m += 1;
+            rows += n;
+            if (span.unterminated) break;
+        }
+
+        if (long_first) |span| {
+            // Only a call's first line is written in pieces: otherwise stop
+            // here, and the next call starts on it.
+            if (res.lines > 0) break;
+            const piece = try readLineRows(list, span, at, budget, &res.rows_formatted, writer);
+            res.bytes += piece.written;
+            if (!piece.done) {
+                res.next_line = line;
+                res.next_row = piece.cont.row;
+                res.next_blanks = piece.cont.blanks;
+                res.next_skip = piece.cont.skip;
+                return res;
+            }
+            res.lines += 1;
+            res.last_unterminated = span.unterminated;
+            line += 1;
+            at = .{};
+            res.next_line = line;
+            res.next_row = 0;
+            res.next_blanks = 0;
+            res.next_skip = 0;
+            continue;
+        }
+        if (m == 0) {
+            res.reached_end = true;
+            break;
+        }
+
+        // Format the rows of the whole batch.
+        var tl = list.rowPin(spans[0].start_row) orelse return error.WriteFailed;
+        tl.x = 0;
+        var br = list.rowPin(spans[m - 1].end_row) orelse return error.WriteFailed;
+        br.x = br.node.cols() - 1;
+        var formatter: PageListFormatter = .init(list, .{ .emit = .plain, .unwrap = true, .trim = true });
+        formatter.top_left = tl;
+        formatter.bottom_right = br;
+        var fixed: std.Io.Writer = .fixed(buf[0 .. budget + 1]);
+        var truncated = false;
+        formatter.format(&fixed) catch |err| switch (err) {
+            error.WriteFailed => truncated = true,
+        };
+        res.rows_formatted += rows;
+        const text_all = fixed.buffered();
+
+        // Emit its lines while the budget lasts.
+        var pos: usize = 0;
+        var consumed: usize = 0;
+        while (consumed < m) : (consumed += 1) {
+            const rest = text_all[pos..];
+            var complete = true;
+            var text = rest;
+            var next_pos = text_all.len;
+            if (std.mem.indexOfScalar(u8, rest, '\n')) |k| {
+                text = rest[0..k];
+                next_pos = pos + k + 1;
+            } else if (truncated) {
+                complete = false;
+            }
+            // Trailing blank lines left no text at all: they are empty.
+
+            const unterminated = spans[consumed].unterminated;
+            const need = text.len + @intFromBool(!unterminated);
+            if (!complete or res.bytes + need > max_bytes) {
+                // The rest does not fit: it starts the next call, or, when
+                // this is the first line, goes out in pieces.
+                if (consumed == 0 and res.lines == 0) {
+                    const piece = try readLineRows(list, spans[0], .{}, max_bytes, &res.rows_formatted, writer);
+                    res.bytes += piece.written;
+                    if (!piece.done) {
+                        res.next_line = line;
+                        res.next_row = piece.cont.row;
+                        res.next_blanks = piece.cont.blanks;
+                        res.next_skip = piece.cont.skip;
+                        return res;
+                    }
+                    res.lines += 1;
+                    res.last_unterminated = unterminated;
+                    pos = next_pos;
+                    continue;
+                }
+                break;
+            }
+            try writer.writeAll(text);
+            if (!unterminated) try writer.writeByte('\n');
+            res.bytes += need;
+            res.lines += 1;
+            res.last_unterminated = unterminated;
+            pos = next_pos;
+        }
+        line += consumed;
+        at = .{};
+        res.next_line = line;
+        res.next_row = 0;
+        res.next_blanks = 0;
+        res.next_skip = 0;
+        if (consumed < m) break;
+    }
+    return res;
+}
+
+/// What `readLineRows` wrote and where it stopped.
+const RowPiece = struct {
+    written: usize,
+    done: bool,
+    cont: ReadResume,
+};
+
+/// Write line `span` row by row from `at`, at most `budget` bytes, ending on
+/// a row boundary; the newline too when the whole line is done.
+fn readLineRows(
+    list: *PageList,
+    span: PageList.LineSpan,
+    at: ReadResume,
+    budget: usize,
+    rows_formatted: *u64,
+    writer: *std.Io.Writer,
+) (Allocator.Error || std.Io.Writer.Error)!RowPiece {
+    const alloc = list.pool.alloc;
+    const n = span.end_row - span.start_row + 1;
+    const buf = try alloc.alloc(u8, budget + 1 + @as(usize, @intCast(@min(at.skip, 1 << 30))));
+    defer alloc.free(buf);
+
+    var row = at.row;
+    var skip: usize = @intCast(@min(at.skip, 1 << 30));
+    var state: PageFormatter.TrailingState = .{ .rows = 0, .cells = at.blanks };
+    var written: usize = 0;
+    while (row < n) {
+        const left = budget - written;
+        const first = list.rowPin(span.start_row + row) orelse return error.WriteFailed;
+        const per_row = @as(usize, first.node.cols()) * 4;
+        // Rows that surely fit in what is left; a row at a time when the
+        // text has more bytes than that (graphemes), or is cut at a byte.
+        var k: u64 = if (skip > 0) 1 else std.math.clamp(left / per_row, 1, read_window_rows);
+        k = @min(k, n - row);
+        if (written > 0 and left < per_row) break;
+
+        while (true) {
+            var tl = first;
+            tl.x = 0;
+            var br = list.rowPin(span.start_row + row + k - 1) orelse return error.WriteFailed;
+            br.x = br.node.cols() - 1;
+            var formatter: PageListFormatter = .init(list, .{ .emit = .plain, .unwrap = true, .trim = true });
+            formatter.top_left = tl;
+            formatter.bottom_right = br;
+            formatter.initial_state = state;
+            var next_state: ?PageFormatter.TrailingState = null;
+            formatter.final_state = &next_state;
+            var fixed: std.Io.Writer = .fixed(buf[0 .. left + skip + 1]);
+            var truncated = false;
+            formatter.format(&fixed) catch |err| switch (err) {
+                error.WriteFailed => truncated = true,
+            };
+            rows_formatted.* += k;
+            const text = fixed.buffered();
+            const shown = text[@min(skip, text.len)..];
+            if (truncated or shown.len > left) {
+                if (k > 1) {
+                    k = 1;
+                    continue;
+                }
+                if (written > 0) return .{ .written = written, .done = false, .cont = .{ .row = row, .blanks = state.cells } };
+                // One row alone is more than the budget: cut it.
+                const take = @min(shown.len, left);
+                try writer.writeAll(shown[0..take]);
+                return .{
+                    .written = take,
+                    .done = false,
+                    .cont = .{ .row = row, .blanks = state.cells, .skip = skip + take },
+                };
+            }
+            try writer.writeAll(shown);
+            written += shown.len;
+            skip = 0;
+            state = next_state orelse .empty;
+            row += k;
+            break;
+        }
+    }
+
+    if (row < n) return .{ .written = written, .done = false, .cont = .{ .row = row, .blanks = state.cells } };
+    if (!span.unterminated) {
+        // The newline may not fit in what is left: it starts the next piece.
+        if (written + 1 > budget) return .{ .written = written, .done = false, .cont = .{ .row = n } };
+        try writer.writeByte('\n');
+        written += 1;
+    }
+    return .{ .written = written, .done = true, .cont = .{} };
+}
+
+/// Marks a byte of a line whose rows were pruned.
+pub const row_pruned: u64 = std.math.maxInt(u64);
+
+/// Where a byte of a line's text is on screen.
+pub const LineCell = extern struct {
+    /// Absolute row: the row from the top of the list plus `rows_pruned`.
+    screen_row: u64,
+    col: u32,
+};
+
+/// Where `locateBytes` goes on after it stopped short of the bytes asked.
+pub const LocateResume = extern struct {
+    /// Row of the line to format next.
+    row: u64 = 0,
+    /// Bytes of the line's text before that row.
+    byte_base: u64 = 0,
+    /// Trailing blank cells of the row before it.
+    blanks: usize = 0,
+};
+
+/// What `locateBytes` achieved.
+pub const LocateResult = extern struct {
+    /// Leading offsets that have a cell (or are `row_pruned`).
+    located: usize,
+    /// The row after the last one formatted that was needed: the row of the
+    /// largest byte plus one when all were located, else where the budget
+    /// or the line ended.
+    rows_read: u64,
+    /// Every offset is answered, or lies beyond the text of the whole line.
+    /// When false the row budget stopped short: call again with `next` and
+    /// the offsets not yet located.
+    complete: bool,
+    next: LocateResume,
+};
+
+/// Find the cell of each byte of line `line`'s text (the text `readLines`
+/// writes for it, without the `\n`): `out[i]` for `byte_offsets[i]`, which
+/// must ascend. Rows are formatted in order from `resume`, in growing
+/// windows, until the row holding the largest offset is done or `max_rows`
+/// rows were formatted; tab holes and wraps are exact because the state of
+/// the rows above is carried. A line already pruned answers `row_pruned`
+/// for every byte. Offsets past the end of the text are left unlocated.
+pub fn locateBytes(
+    list: *PageList,
+    line: u64,
+    byte_offsets: []const u64,
+    cont: LocateResume,
+    max_rows: usize,
+    out: []LineCell,
+) (Allocator.Error || std.Io.Writer.Error || error{LineNotFound})!LocateResult {
+    assert(out.len >= byte_offsets.len);
+    if (line < list.firstLine()) {
+        for (out[0..byte_offsets.len]) |*o| o.* = .{ .screen_row = row_pruned, .col = 0 };
+        return .{ .located = byte_offsets.len, .rows_read = 0, .complete = true, .next = .{} };
+    }
+    const span = list.lineSpan(line) orelse return error.LineNotFound;
+    const total = span.end_row - span.start_row + 1;
+    const alloc = list.pool.alloc;
+
+    var row = cont.row;
+    var base = cont.byte_base;
+    var state: PageFormatter.TrailingState = .{ .rows = 0, .cells = cont.blanks };
+    var located: usize = 0;
+    var needed_rows = row;
+    var rows_done: u64 = 0;
+    var window: u64 = 8;
+    while (located < byte_offsets.len and row < total and rows_done < max_rows) {
+        const k = @min(window, total - row, max_rows - rows_done);
+        var tl = list.rowPin(span.start_row + row) orelse return error.LineNotFound;
+        tl.x = 0;
+        var br = list.rowPin(span.start_row + row + k - 1) orelse return error.LineNotFound;
+        br.x = br.node.cols() - 1;
+
+        var map: PinMap.Map = .empty;
+        defer map.deinit(alloc);
+        var discard: std.Io.Writer.Allocating = .init(alloc);
+        defer discard.deinit();
+        var formatter: PageListFormatter = .init(list, .{ .emit = .plain, .unwrap = true, .trim = true });
+        formatter.top_left = tl;
+        formatter.bottom_right = br;
+        formatter.pin_map = .{ .alloc = alloc, .map = &map };
+        formatter.initial_state = state;
+        var next_state: ?PageFormatter.TrailingState = null;
+        formatter.final_state = &next_state;
+        try formatter.format(&discard.writer);
+
+        // The row from the top of the list of the first cell of `tl`'s node.
+        const node_row = span.start_row + row - tl.y;
+        while (located < byte_offsets.len) {
+            const off = byte_offsets[located];
+            if (off < base or off - base >= map.count()) break;
+            const pin = map.get(@intCast(off - base)) orelse break;
+            var node_at = node_row;
+            var n = tl.node;
+            while (n != pin.node) : (n = n.next orelse return error.LineNotFound) node_at += n.rows();
+            const in_list = node_at + pin.y;
+            out[located] = .{ .screen_row = list.rows_pruned + in_list, .col = pin.x };
+            needed_rows = @max(needed_rows, in_list - span.start_row + 1);
+            located += 1;
+        }
+        base += map.count();
+        state = next_state orelse .empty;
+        row += k;
+        rows_done += k;
+        window = @min(window * 2, read_window_rows);
+    }
+
+    const answered = located == byte_offsets.len;
+    return .{
+        .located = located,
+        .rows_read = if (answered) needed_rows else row,
+        // Out of text or out of budget: only the latter leaves work to do.
+        .complete = answered or row >= total,
+        .next = .{ .row = row, .byte_base = base, .blanks = state.cells },
+    };
+}
 
 /// Page formatter.
 ///
@@ -1109,6 +1545,11 @@ pub const PageFormatter = struct {
     /// over multiple pages this helps ensure that unwrapping and other
     /// accounting works properly.
     trailing_state: ?TrailingState,
+
+    /// Apply `trailing_state` even when formatting starts below the top row
+    /// of the page: for a caller that goes on from the middle of a wrapped
+    /// line, where the state of the rows above is known.
+    continue_state: bool = false,
 
     /// See point_map.
     pub const PointMap = struct {
@@ -1178,7 +1619,7 @@ pub const PageFormatter = struct {
         // starting from the beginning (start_y and start_x are both 0).
         // If a non-zero start position is specified, ignore trailing state.
         if (self.trailing_state) |state| {
-            if (self.start_y == 0 and self.start_x == 0) {
+            if ((self.start_y == 0 or self.continue_state) and self.start_x == 0) {
                 blank_rows = state.rows;
                 blank_cells = state.cells;
             }
@@ -8418,3 +8859,522 @@ test "PageListFormatter reads compressed history without restoring it" {
     // The whole history was read and not one page was restored.
     try testing.expectEqual(before, pages.memoryStats());
 }
+
+// ---------------------------------------------------- read_lines / locate_bytes
+
+fn lineTerminalForTest(alloc: Allocator, cols: size.CellCountInt, rows: size.CellCountInt) !Terminal {
+    return try Terminal.init(std.testing.io, alloc, .{
+        .cols = cols,
+        .rows = rows,
+        .max_scrollback_bytes = null,
+    });
+}
+
+/// `lineState` until the index reaches the active area.
+fn readyIndexForTest(list: *PageList) !void {
+    for (0..100_000) |_| if (list.lineState().index_ready) return;
+    return error.IndexNeverReady;
+}
+
+/// Everything `readLines` gives from `first` with generous budgets.
+fn readAllForTest(
+    list: *PageList,
+    first: u64,
+    max_lines: usize,
+    out: *std.Io.Writer.Allocating,
+) !ReadLines {
+    return try readLines(list, first, .{}, max_lines, 1 << 24, &out.writer);
+}
+
+test "LineIndex read_lines gives exactly one newline per line including blank lines" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try lineTerminalForTest(alloc, 20, 4);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    var expected: std.Io.Writer.Allocating = .init(alloc);
+    defer expected.deinit();
+    var input: std.Io.Writer.Allocating = .init(alloc);
+    defer input.deinit();
+    for (0..40) |i| {
+        // Every fifth line is blank, and two in a row at the seam.
+        if (i % 5 == 0 or i == 17) {
+            try expected.writer.writeAll("\n");
+        } else {
+            try expected.writer.print("line {d}\n", .{i});
+            try input.writer.print("line {d}", .{i});
+        }
+        try input.writer.writeAll("\r\n");
+    }
+    s.nextSlice(input.writer.buffered());
+
+    const list = &t.screens.active.pages;
+    try readyIndexForTest(list);
+    const first = list.firstLine();
+    {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        const r = try readAllForTest(list, first, 40, &out);
+        try testing.expectEqualStrings(expected.writer.buffered(), out.writer.buffered());
+        try testing.expectEqual(@as(usize, 40), r.lines);
+        try testing.expectEqual(expected.writer.buffered().len, r.bytes);
+        try testing.expectEqual(first + 40, r.next_line);
+        try testing.expect(!r.last_unterminated);
+    }
+
+    // Reading on to the end gives the blank rows of the screen as lines.
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const r = try readAllForTest(list, first, 1000, &out);
+    try testing.expect(r.reached_end);
+    const all = out.writer.buffered();
+    try testing.expect(std.mem.startsWith(u8, all, expected.writer.buffered()));
+    for (all[expected.writer.buffered().len..]) |c| try testing.expectEqual(@as(u8, '\n'), c);
+    try testing.expectEqual(@as(usize, 40) + (all.len - expected.writer.buffered().len), r.lines);
+}
+
+test "LineIndex read_lines text is identical before and after a width change" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try lineTerminalForTest(alloc, 40, 5);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Tab holes that straddle a wrap at some widths, and plain wraps.
+    var input: std.Io.Writer.Allocating = .init(alloc);
+    defer input.deinit();
+    for (0..30) |i| {
+        for (0..i % 9) |_| try input.writer.writeAll("ab");
+        try input.writer.writeAll("\tx\ty\t");
+        for (0..i % 7) |_| try input.writer.writeAll("z");
+        try input.writer.writeAll("\r\n");
+    }
+    s.nextSlice(input.writer.buffered());
+
+    const list = &t.screens.active.pages;
+    try readyIndexForTest(list);
+    const first = list.firstLine();
+    var before: std.Io.Writer.Allocating = .init(alloc);
+    defer before.deinit();
+    const a = try readAllForTest(list, first, 20, &before);
+    try testing.expectEqual(@as(usize, 20), a.lines);
+
+    for ([_]size.CellCountInt{ 17, 9, 25, 60 }) |cols| {
+        try t.resize(alloc, .{ .cols = cols, .rows = 5 });
+        try readyIndexForTest(list);
+        try testing.expectEqual(first, list.firstLine());
+        var after: std.Io.Writer.Allocating = .init(alloc);
+        defer after.deinit();
+        const b = try readAllForTest(list, first, 20, &after);
+        try testing.expectEqual(@as(usize, 20), b.lines);
+        try testing.expectEqualStrings(before.writer.buffered(), after.writer.buffered());
+    }
+}
+
+test "LineIndex read_lines reads compressed pages without restoring them" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    if (!@import("mem.zig").canReclaim(.strict)) return error.SkipZigTest;
+    var t = try lineTerminalForTest(alloc, 20, 4);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    var expected: std.Io.Writer.Allocating = .init(alloc);
+    defer expected.deinit();
+    for (0..3000) |i| {
+        var line: [32]u8 = undefined;
+        const text = try std.fmt.bufPrint(&line, "row {d}", .{i});
+        s.nextSlice(text);
+        s.nextSlice("\r\n");
+        if (i < 300) try expected.writer.print("{s}\n", .{text});
+    }
+
+    const list = &t.screens.active.pages;
+    try readyIndexForTest(list);
+    _ = list.compress(.full);
+    const first_node = list.pages.first.?;
+    try testing.expectEqual(PageList.List.Node.Storage.compressed, first_node.storage());
+    const resident = list.counters.resident_size;
+    const stored = list.counters.stored_size;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const r = try readAllForTest(list, list.firstLine(), 300, &out);
+    try testing.expectEqual(@as(usize, 300), r.lines);
+    try testing.expectEqualStrings(expected.writer.buffered(), out.writer.buffered());
+    try testing.expectEqual(PageList.List.Node.Storage.compressed, first_node.storage());
+    try testing.expectEqual(resident, list.counters.resident_size);
+    try testing.expectEqual(stored, list.counters.stored_size);
+}
+
+test "LineIndex read_lines splits a line longer than max_bytes and resumes at next_offset" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try lineTerminalForTest(alloc, 20, 4);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    var long: [300]u8 = undefined;
+    for (&long, 0..) |*c, i| c.* = 'a' + @as(u8, @intCast(i % 26));
+    s.nextSlice("first\r\n");
+    s.nextSlice(&long);
+    s.nextSlice("\r\nlast\r\n\r\n\r\n\r\n\r\n");
+
+    const list = &t.screens.active.pages;
+    try readyIndexForTest(list);
+    var expected: std.Io.Writer.Allocating = .init(alloc);
+    defer expected.deinit();
+    try expected.writer.print("first\n{s}\nlast\n", .{long});
+
+    // Budget 64: the long line comes out in pieces, resumed by the offsets.
+    var got: std.Io.Writer.Allocating = .init(alloc);
+    defer got.deinit();
+    var line = list.firstLine();
+    var at: ReadResume = .{};
+    var lines: usize = 0;
+    var calls: usize = 0;
+    while (lines < 3) : (calls += 1) {
+        try testing.expect(calls < 40);
+        const r = try readLines(list, line, at, 3 - lines, 64, &got.writer);
+        lines += r.lines;
+        line = r.next_line;
+        at = r.resumePoint();
+        try testing.expect(r.bytes <= 64);
+        try testing.expect(r.bytes > 0);
+    }
+    try testing.expectEqualStrings(expected.writer.buffered(), got.writer.buffered());
+    try testing.expect(calls >= 5);
+}
+
+test "LineIndex read_lines resumes a 2000-row line at a row and keeps the work bounded" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try lineTerminalForTest(alloc, 20, 4);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // 2000 rows of "word   " groups: row ends fall inside the blank runs,
+    // and the blanks carried across a piece must come back.
+    const row_count = 2000;
+    var long: std.Io.Writer.Allocating = .init(alloc);
+    defer long.deinit();
+    while (long.writer.buffered().len < row_count * 20) try long.writer.writeAll("word   ");
+    const text = long.writer.buffered()[0 .. row_count * 20];
+    s.nextSlice("head\r\n");
+    s.nextSlice(text);
+    s.nextSlice("\r\ntail\r\n\r\n\r\n\r\n\r\n");
+    const list = &t.screens.active.pages;
+    try readyIndexForTest(list);
+    const first = list.firstLine();
+
+    // The text of the whole line in one go.
+    var whole: std.Io.Writer.Allocating = .init(alloc);
+    defer whole.deinit();
+    _ = try readLines(list, first + 1, .{}, 1, 1 << 20, &whole.writer);
+
+    // In pieces of a few rows' bytes, by row.
+    var got: std.Io.Writer.Allocating = .init(alloc);
+    defer got.deinit();
+    var at: ReadResume = .{};
+    var calls: usize = 0;
+    var max_rows_per_call: u64 = 0;
+    while (true) : (calls += 1) {
+        try testing.expect(calls < 2000);
+        const r = try readLines(list, first + 1, at, 1, 70, &got.writer);
+        max_rows_per_call = @max(max_rows_per_call, r.rows_formatted);
+        try testing.expect(r.bytes <= 70);
+        if (r.lines == 1) break;
+        try testing.expectEqual(first + 1, r.next_line);
+        try testing.expect(r.next_row > at.row or r.next_skip > at.skip);
+        at = r.resumePoint();
+    }
+    try testing.expectEqualStrings(whole.writer.buffered(), got.writer.buffered());
+    try testing.expectEqualStrings(
+        std.mem.trimEnd(u8, whole.writer.buffered(), "\n"),
+        std.mem.trimEnd(u8, text, " "),
+    );
+    // About three rows' bytes a piece: a few rows formatted per call, never
+    // the rows already read.
+    try testing.expect(calls >= row_count / 4);
+    try testing.expect(max_rows_per_call <= 8);
+}
+
+test "LineIndex read_lines reads the active area and flags an unterminated last line" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try lineTerminalForTest(alloc, 10, 3);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("one\r\ntwo\r\nthree\r\nfour");
+
+    const list = &t.screens.active.pages;
+    try readyIndexForTest(list);
+    {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        const r = try readAllForTest(list, list.firstLine(), 100, &out);
+        try testing.expectEqualStrings("one\ntwo\nthree\nfour\n", out.writer.buffered());
+        try testing.expect(r.reached_end);
+        try testing.expect(!r.last_unterminated);
+    }
+
+    // A last row that wraps has no line end yet.
+    const last = list.pages.last.?;
+    const page = last.page();
+    page.rows.ptr(page.memory)[last.rows() - 1].wrap = true;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const r = try readAllForTest(list, list.firstLine(), 100, &out);
+    try testing.expectEqualStrings("one\ntwo\nthree\nfour", out.writer.buffered());
+    try testing.expectEqual(@as(usize, 4), r.lines);
+    try testing.expect(r.last_unterminated);
+    try testing.expect(r.reached_end);
+}
+
+/// Every non-blank character of line `line`'s text must be found at the
+/// cell `locateBytes` names for its first byte.
+fn expectLocatesCellsForTest(list: *PageList, line: u64) !void {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const r = try readLines(list, line, .{}, 1, 1 << 20, &out.writer);
+    try testing.expectEqual(@as(usize, 1), r.lines);
+    const text = std.mem.trimEnd(u8, out.writer.buffered(), "\n");
+
+    const offsets = try alloc.alloc(u64, text.len + 3);
+    defer alloc.free(offsets);
+    const cells = try alloc.alloc(LineCell, text.len + 3);
+    defer alloc.free(cells);
+    for (offsets, 0..) |*o, i| o.* = i;
+    const res = try locateBytes(list, line, offsets, .{}, 1 << 20, cells);
+    // Offsets past the text are not located.
+    try testing.expectEqual(text.len, res.located);
+    try testing.expect(res.complete);
+
+    var i: usize = 0;
+    while (i < text.len) {
+        const n = try std.unicode.utf8ByteSequenceLength(text[i]);
+        const cp = try std.unicode.utf8Decode(text[i..][0..n]);
+        const combining = cp >= 0x300 and cp <= 0x36F;
+        if (cp != ' ' and !combining) {
+            const cell = cells[i];
+            const pin = list.pin(.{ .screen = .{
+                .x = @intCast(cell.col),
+                .y = @intCast(cell.screen_row - list.rows_pruned),
+            } }).?;
+            try testing.expectEqual(cp, pin.rowAndCell().cell.codepoint());
+        }
+        i += n;
+    }
+}
+
+fn expectAllLinesLocateForTest(list: *PageList) !void {
+    const st = list.lineState();
+    var line = st.first_line;
+    while (line < st.end_line) : (line += 1) try expectLocatesCellsForTest(list, line);
+}
+
+test "LineIndex locate_bytes tab hole straddling a wrap" {
+    const alloc = std.testing.allocator;
+    var t = try lineTerminalForTest(alloc, 10, 4);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    for (0..14) |i| {
+        for (0..i) |_| s.nextSlice("q");
+        s.nextSlice("\tXYZ\tend\r\n");
+    }
+    try readyIndexForTest(&t.screens.active.pages);
+    try expectAllLinesLocateForTest(&t.screens.active.pages);
+}
+
+test "LineIndex locate_bytes background-fill line" {
+    const alloc = std.testing.allocator;
+    var t = try lineTerminalForTest(alloc, 12, 4);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    for (0..12) |i| {
+        s.nextSlice("\x1b[41mfill");
+        for (0..i) |_| s.nextSlice("w");
+        s.nextSlice("\x1b[K\x1b[0m\r\n");
+    }
+    try readyIndexForTest(&t.screens.active.pages);
+    try expectAllLinesLocateForTest(&t.screens.active.pages);
+}
+
+test "LineIndex locate_bytes Kitty placeholder line" {
+    const alloc = std.testing.allocator;
+    var t = try lineTerminalForTest(alloc, 10, 4);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    for (0..10) |i| {
+        s.nextSlice("ab");
+        for (0..i) |_| s.nextSlice("\u{10EEEE}");
+        s.nextSlice("cd\r\n");
+    }
+    try readyIndexForTest(&t.screens.active.pages);
+    try expectAllLinesLocateForTest(&t.screens.active.pages);
+}
+
+test "LineIndex locate_bytes trailing typed spaces" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try lineTerminalForTest(alloc, 10, 4);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    for (0..8) |_| s.nextSlice("abc     \r\n");
+    const list = &t.screens.active.pages;
+    try readyIndexForTest(list);
+    try expectAllLinesLocateForTest(list);
+
+    // The trimmed spaces are not part of the text: offset 3 does not exist.
+    var cells: [4]LineCell = undefined;
+    const res = try locateBytes(list, list.firstLine(), &.{ 0, 2, 3, 5 }, .{}, 100, &cells);
+    try testing.expectEqual(@as(usize, 2), res.located);
+    try testing.expect(res.complete);
+}
+
+test "LineIndex locate_bytes wide and accented text" {
+    const alloc = std.testing.allocator;
+    var t = try lineTerminalForTest(alloc, 9, 4);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    for (0..10) |i| {
+        for (0..i) |_| s.nextSlice("e\u{0301}");
+        s.nextSlice("\u{65E5}\u{672C}\u{8A9E}x\u{00E9}\u{65E5}\u{672C}\r\n");
+    }
+    try readyIndexForTest(&t.screens.active.pages);
+    try expectAllLinesLocateForTest(&t.screens.active.pages);
+}
+
+test "LineIndex locate_bytes pruned head returns ROW_PRUNED" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 4, .max_scrollback_bytes = 1 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    for (0..6000) |_| s.nextSlice("some text here\r\n");
+    const list = &t.screens.active.pages;
+    try readyIndexForTest(list);
+    try testing.expect(list.rows_pruned > 0);
+
+    // A line from before the prune: every byte is lost.
+    var cells: [3]LineCell = undefined;
+    const old = list.firstLine() - 5;
+    const res = try locateBytes(list, old, &.{ 0, 4, 9 }, .{}, 10, &cells);
+    try testing.expectEqual(@as(usize, 3), res.located);
+    try testing.expect(res.complete);
+    for (cells) |c| try testing.expectEqual(row_pruned, c.screen_row);
+
+    // The first live line answers with absolute rows (pruned rows included).
+    const live = try locateBytes(list, list.firstLine(), &.{0}, .{}, 10, &cells);
+    try testing.expectEqual(@as(usize, 1), live.located);
+    try testing.expectEqual(list.rows_pruned, cells[0].screen_row);
+}
+
+test "LineIndex locate_bytes row budget returns partial progress" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try lineTerminalForTest(alloc, 10, 4);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("s");
+    for (0..100) |i| s.nextSlice(&.{'a' + @as(u8, @intCast(i % 26))});
+    s.nextSlice("\r\nx\r\nx\r\nx\r\nx\r\nx\r\n");
+    const list = &t.screens.active.pages;
+    try readyIndexForTest(list);
+
+    // The line is 101 bytes over 11 rows; three rows cover bytes 0..29.
+    const line = list.firstLine();
+    var cells: [4]LineCell = undefined;
+    const res = try locateBytes(list, line, &.{ 0, 25, 95, 100 }, .{}, 3, &cells);
+    try testing.expectEqual(@as(usize, 2), res.located);
+    try testing.expectEqual(@as(u64, 3), res.rows_read);
+    try testing.expect(!res.complete);
+    try testing.expectEqual(list.rows_pruned, cells[0].screen_row);
+    try testing.expectEqual(list.rows_pruned + 2, cells[1].screen_row);
+
+    // Asking again with a bigger budget finishes it.
+    const rest = try locateBytes(list, line, &.{ 95, 100 }, .{}, 100, &cells);
+    try testing.expectEqual(@as(usize, 2), rest.located);
+    try testing.expect(rest.complete);
+    try testing.expectEqual(list.rows_pruned + 9, cells[0].screen_row);
+}
+
+test "LineIndex locate_bytes agrees with row_line and line_rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try lineTerminalForTest(alloc, 12, 4);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    for (0..30) |i| {
+        for (0..i % 40) |_| s.nextSlice("m");
+        s.nextSlice("\r\n");
+    }
+    const list = &t.screens.active.pages;
+    try readyIndexForTest(list);
+    const st = list.lineState();
+    var line = st.first_line;
+    while (line < st.end_line) : (line += 1) {
+        const rows = list.lineRows(line).?;
+        var cells: [1]LineCell = undefined;
+        const res = try locateBytes(list, line, &.{0}, .{}, 1000, &cells);
+        if (res.located == 0) continue; // a blank line has no byte
+        // The first byte is on the first row of the line, and that row
+        // belongs to the line.
+        try testing.expectEqual(list.rows_pruned + rows.start_row, cells[0].screen_row);
+        try testing.expectEqual(line, list.rowLine(cells[0].screen_row - list.rows_pruned).?);
+    }
+}
+
+test "LineIndex locate_bytes stops at the row of the largest byte and resumes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try lineTerminalForTest(alloc, 10, 4);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("s");
+    for (0..99) |i| s.nextSlice(&.{'a' + @as(u8, @intCast(i % 26))});
+    s.nextSlice("\r\nx\r\nx\r\nx\r\nx\r\nx\r\n");
+    const list = &t.screens.active.pages;
+    try readyIndexForTest(list);
+    const line = list.firstLine();
+
+    // Byte 35 is on row 3: four rows are enough.
+    var cells: [3]LineCell = undefined;
+    const a = try locateBytes(list, line, &.{ 0, 12, 35 }, .{}, 1000, &cells);
+    try testing.expectEqual(@as(usize, 3), a.located);
+    try testing.expectEqual(@as(u64, 4), a.rows_read);
+    try testing.expect(a.complete);
+    try testing.expectEqual(list.rows_pruned + 3, cells[2].screen_row);
+
+    // A budget of 3 rows stops short of byte 95 and says where to go on.
+    const b = try locateBytes(list, line, &.{ 5, 95 }, .{}, 3, &cells);
+    try testing.expectEqual(@as(usize, 1), b.located);
+    try testing.expect(!b.complete);
+    try testing.expectEqual(@as(u64, 3), b.rows_read);
+    try testing.expectEqual(@as(u64, 3), b.next.row);
+    try testing.expectEqual(@as(u64, 30), b.next.byte_base);
+    const c = try locateBytes(list, line, &.{95}, b.next, 1000, &cells);
+    try testing.expectEqual(@as(usize, 1), c.located);
+    try testing.expect(c.complete);
+    try testing.expectEqual(@as(u64, 10), c.rows_read);
+    try testing.expectEqual(list.rows_pruned + 9, cells[0].screen_row);
+}
+
