@@ -19990,7 +19990,7 @@ test "Terminal LineIndex prompt redraw through the stream logs a rewrite edit" {
     try testing_.expect(out[0].old_lines >= 1);
 }
 
-test "Terminal LineIndex prompt redraw with history on several pages logs a rewrite edit" {
+test "Terminal LineIndex prompt redraw with history on several pages marks the edit log lost without walking" {
     const testing_ = std.testing;
     const alloc = testing_.allocator;
     const LineIndex = @import("LineIndex.zig");
@@ -20019,17 +20019,13 @@ test "Terminal LineIndex prompt redraw with history on several pages logs a rewr
     while (!before.index_ready) before = pages.lineState();
     try testing_.expect(pages.line_index.len() >= 2);
     const p1_row = pages.total_rows - 4;
-    const p1_line = pages.rowLine(p1_row).?;
+    _ = pages.rowLine(p1_row).?;
+    var out: [8]LineIndex.LineEdit = undefined;
 
     try t.resize(alloc, .{ .cols = 20, .rows = 3 });
 
-    var out: [8]LineIndex.LineEdit = undefined;
-    const got = pages.edit_log.since(before.edit_seq, &out);
-    var rewrites: usize = 0;
-    for (out[0..got.n]) |e| {
-        if (e.kind != .rewrite) continue;
-        rewrites += 1;
-        try testing_.expectEqual(p1_line, e.first_line);
-    }
-    try testing_.expectEqual(@as(usize, 1), rewrites);
+    // The resize reflowed first and cut the index, so the line cannot be
+    // found cheaply: the log is lost, and no walk over the nodes ran.
+    try testing_.expectEqual(@as(u32, 1), pages.line_rewrite_lost);
+    try testing_.expect(pages.edit_log.since(before.edit_seq, &out).overflowed);
 }

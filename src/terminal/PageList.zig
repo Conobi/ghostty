@@ -733,6 +733,10 @@ edit_log: LineIndex.EditLog = .{},
 /// between its neighbours' sequence numbers.
 line_renumbers: u32 = 0,
 
+/// Times `lineRewritten` could not find its line and marked the log lost
+/// instead of walking the list.
+line_rewrite_lost: u32 = 0,
+
 /// Decode buffer for summarising compressed pages without restoring them.
 line_scratch: ReadScratch = .{},
 
@@ -6017,35 +6021,14 @@ fn lineChunkReplaced(
     }
 }
 
-/// Line ends in the rows above row `row` (from the top of the list), by a
-/// walk over the nodes: slow, and independent of the index. Null when a
-/// compressed page cannot be read.
-fn lineEndsAbove(self: *PageList, row: u64) ?u64 {
-    var lines: u64 = 0;
-    var rows_before: u64 = 0;
-    var bits: [line_bitmap_words]u64 = undefined;
-    var it = self.pages.first;
-    while (it) |n| : (it = n.next) {
-        if (rows_before >= row) break;
-        if (rows_before + n.rows() <= row) {
-            lines += self.nodeLineEnds(n) orelse return null;
-            rows_before += n.rows();
-            continue;
-        }
-        const scan = self.scanLineEnds(n, &bits) orelse return null;
-        lines += LineIndex.rankBits(scan.bits, @intCast(row - rows_before));
-        break;
-    }
-    return lines;
-}
-
 /// The rows from `start` down are about to be cleared (a prompt the shell
 /// redraws). Wrap flags stay, so ids and counts hold; readers must read the
 /// history lines it touches again.
 ///
 /// A reflow that came first (a resize clears the prompt after reflowing)
-/// has cut the index, so the lines are then counted by walking the list:
-/// readers may have seen them before the cut.
+/// has cut the index, so the line cannot be found cheaply. Counting it by
+/// walking the list would cost O(nodes) under the terminal lock, so the log
+/// is marked lost instead and the reader rebuilds in a background turn.
 pub fn lineRewritten(self: *PageList, start: Pin) void {
     var below: usize = 0;
     var it: ?*List.Node = start.node;
@@ -6055,22 +6038,12 @@ pub fn lineRewritten(self: *PageList, start: Pin) void {
     const history = self.total_rows - self.rows;
     if (row >= history) return;
 
-    const base = self.lineBase();
-    var first: u64 = undefined;
-    var end: u64 = undefined;
-    if (self.rowLine(row)) |f| {
-        first = f;
-        end = base + self.completeLines();
-    } else {
-        const above = self.lineEndsAbove(row);
-        const through = self.lineEndsAbove(history);
-        if (above == null or through == null) {
-            self.edit_log.markLost();
-            return;
-        }
-        first = base + above.?;
-        end = base + through.?;
-    }
+    const first = self.rowLine(row) orelse {
+        self.line_rewrite_lost += 1;
+        self.edit_log.markLost();
+        return;
+    };
+    const end = self.lineBase() + self.completeLines();
     if (first >= end) return;
     _ = self.edit_log.push(.rewrite, first, end - first, end - first);
 }
