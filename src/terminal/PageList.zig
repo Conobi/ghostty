@@ -5799,9 +5799,15 @@ fn lineSeqOf(node: *List.Node) u64 {
 fn lineNodePos(self: *const PageList, node: *const List.Node) usize {
     const pos = self.line_index.lowerBound(lineSeqOf, node.line_seq);
     if (pos < self.line_index.len() and self.line_index.entry(pos).node == node) return pos;
-    // Unreachable while the numbers are kept right; counting the nodes
-    // before it is the slow, certain answer.
-    assert(false);
+    return lineNodePosMissed(node);
+}
+
+/// A lookup missed its node, which the sequence numbers should rule out.
+/// Safe builds stop; release builds count the nodes before it, the slow but
+/// certain answer (`assert` would be undefined behaviour there).
+fn lineNodePosMissed(node: *const List.Node) usize {
+    @branchHint(.cold);
+    if (std.debug.runtime_safety) @panic("line index lookup missed a node");
     var n: usize = 0;
     var it = node.prev;
     while (it) |q| : (it = q.prev) n += 1;
