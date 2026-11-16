@@ -2748,10 +2748,11 @@ const ReflowCursor = struct {
         // Defer processing of blank rows so that blank rows
         // at the end of the page list are never written.
         if (cols_len == 0) {
-            // If this blank row was a wrap continuation somehow
-            // then we won't need to write it since it should be
-            // a part of the previously written row.
-            if (!src_row.wrap_continuation) self.new_rows += 1;
+            // A blank row ends its line even when it continues a wrapped
+            // row (e.g. its text was erased): skipping it would glue the
+            // next line onto the row before. Only unwrapped rows get here;
+            // a wrapped row keeps its blank cells and is written below.
+            self.new_rows += 1;
             return;
         }
 
@@ -19224,6 +19225,88 @@ test "PageList resize reflow more cols wrapped rows" {
         try testing.expectEqual(@as(u21, 'A'), cells[0].content.codepoint.data);
         try testing.expectEqual(@as(u21, 'A'), cells[2].content.codepoint.data);
     }
+}
+
+/// Writes `text` into row `y` of the first page, marking wrap flags.
+fn setRowForTest(s: *PageList, y: usize, text: []const u8, wrap: bool, cont: bool) void {
+    const page = s.pages.first.?.page();
+    const rac0 = page.getRowAndCell(0, y);
+    rac0.row.wrap = wrap;
+    rac0.row.wrap_continuation = cont;
+    for (text, 0..) |c, x| {
+        const rac = page.getRowAndCell(x, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = c } },
+        };
+    }
+}
+
+/// Plain-text dump of the list, with or without unwrapping, against `want`.
+fn expectDumpForTest(s: *PageList, unwrap: bool, want: []const u8) !void {
+    const got = try s.dumpForTest(std.testing.allocator, unwrap);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings(want, got);
+}
+
+/// Widens a width-5 list holding `fixture`'s rows to 20, eagerly and through
+/// the lazy stepped path, and checks both give `want` (rows not unwrapped).
+fn expectWidenedBothWaysForTest(
+    comptime fixture: fn (*PageList) void,
+    want: []const u8,
+) !void {
+    const testing = std.testing;
+    {
+        var s = try init(testing.allocator, .{ .cols = 5, .rows = 4, .max_size = 0 });
+        defer s.deinit();
+        fixture(&s);
+        try s.resize(.{ .cols = 20, .reflow = true });
+        try expectDumpForTest(&s, false, want);
+    }
+    {
+        var s = try init(testing.allocator, .{ .cols = 5, .rows = 4 });
+        defer s.deinit();
+        s.lazy_reflow = true;
+        try s.growColdPagesQuietForTest(30);
+        fixture(&s);
+        try s.resize(.{ .cols = 20 });
+        try testing.expect(s.stale_tail != null);
+        while ((try s.reflowStep(2000, 6)).pending) {}
+        try expectDumpForTest(&s, false, want);
+    }
+}
+
+fn erasedContinuationFixtureForTest(s: *PageList) void {
+    setRowForTest(s, 0, "abcde", true, false);
+    setRowForTest(s, 1, "", false, true);
+    setRowForTest(s, 2, "X", false, false);
+}
+
+fn blankWrappedContinuationFixtureForTest(s: *PageList) void {
+    setRowForTest(s, 0, "abcde", true, false);
+    setRowForTest(s, 1, "", true, true);
+    setRowForTest(s, 2, "fgh", false, true);
+}
+
+test "PageList reflow keeps the line end of a wrapped row followed by an erased continuation row" {
+    try expectWidenedBothWaysForTest(erasedContinuationFixtureForTest, "abcde\nX");
+}
+
+test "PageList reflow still skips a blank wrapped continuation row" {
+    try expectWidenedBothWaysForTest(blankWrappedContinuationFixtureForTest, "abcde     fgh");
+}
+
+test "PageList reflow line count of a line of exactly k times width cells" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 10, .rows = 4, .max_size = 0 });
+    defer s.deinit();
+    setRowForTest(&s, 0, "abcdefghij", false, false);
+    setRowForTest(&s, 1, "X", false, false);
+    try s.resize(.{ .cols = 5, .reflow = true });
+    try expectDumpForTest(&s, false, "abcde\nfghij\nX");
+    try expectDumpForTest(&s, true, "abcdefghij\nX");
+    try s.resize(.{ .cols = 10, .reflow = true });
+    try expectDumpForTest(&s, false, "abcdefghij\nX");
 }
 
 test "PageList resize reflow invalidates viewport offset cache" {
