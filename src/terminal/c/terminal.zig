@@ -9170,3 +9170,22 @@ test "line_state sized layout ends at index_ready" {
     try testing.expect(@offsetOf(TerminalLineState, "edits_overflowed") < @offsetOf(TerminalLineState, "index_ready"));
     try testing.expect(@offsetOf(TerminalLineState, "index_ready") < @sizeOf(TerminalLineState));
 }
+
+test "read_lines treats max_bytes as a budget, not an allocation size" {
+    const t = try lineTestTerminal(5);
+    defer free(t);
+    const state = try lineStateReady(t);
+
+    var sink: LineTestSink = .{};
+    var read: LineRead = undefined;
+    const max = std.math.maxInt(usize);
+    try testing.expectEqual(Result.success, read_lines(t, state.first_line, null, 2, max, sink.writer(), &read));
+    try testing.expectEqualStrings("line 0\nline 1\n", sink.text());
+    try testing.expectEqual(@as(u64, 2), read.lines);
+
+    // And with no limit on lines either: everything to the end.
+    sink = .{};
+    try testing.expectEqual(Result.success, read_lines(t, state.first_line, null, max, max, sink.writer(), &read));
+    try testing.expect(std.mem.startsWith(u8, sink.text(), "line 0\nline 1\nline 2\nline 3\nline 4\n"));
+    try testing.expect(read.reached_end);
+}

@@ -1117,6 +1117,11 @@ const read_batch_rows = 2048;
 /// Rows one window of a long line formats at most.
 const read_window_rows = 4096;
 
+/// Most bytes `readLines` buffers at once, whatever its budget: text longer
+/// than this goes out in pieces (the budget is a limit, not a size to
+/// allocate, and may be as large as `usize` allows).
+const read_buffer_cap = 4 << 20;
+
 /// Write lines `first_line`, ... of the list as text: unwrapped, trimmed,
 /// one `\n` after every line, blank lines included. Lines are those of
 /// `PageList.lineSpan`, so the tail up to the last row can be read too; the
@@ -1161,7 +1166,7 @@ pub fn readLines(
     res.next_skip = at.skip;
     if (max_lines == 0 or max_bytes == 0) return res;
 
-    const buf = try alloc.alloc(u8, max_bytes + 1);
+    const buf = try alloc.alloc(u8, @min(max_bytes, read_buffer_cap) + 1);
     defer alloc.free(buf);
 
     while (res.lines < max_lines) {
@@ -1226,7 +1231,7 @@ pub fn readLines(
         var formatter: PageListFormatter = .init(list, .{ .emit = .plain, .unwrap = true, .trim = true });
         formatter.top_left = tl;
         formatter.bottom_right = br;
-        var fixed: std.Io.Writer = .fixed(buf[0 .. budget + 1]);
+        var fixed: std.Io.Writer = .fixed(buf[0 .. @min(budget, read_buffer_cap) + 1]);
         var truncated = false;
         formatter.format(&fixed) catch |err| switch (err) {
             error.WriteFailed => truncated = true,
@@ -1252,7 +1257,7 @@ pub fn readLines(
 
             const unterminated = spans[consumed].unterminated;
             const need = text.len + @intFromBool(!unterminated);
-            if (!complete or res.bytes + need > max_bytes) {
+            if (!complete or res.bytes +| need > max_bytes) {
                 // The rest does not fit: it starts the next call, or, when
                 // this is the first line, goes out in pieces.
                 if (consumed == 0 and res.lines == 0) {
@@ -1309,11 +1314,13 @@ fn readLineRows(
 ) (Allocator.Error || std.Io.Writer.Error)!RowPiece {
     const alloc = list.pool.alloc;
     const n = span.end_row - span.start_row + 1;
-    const buf = try alloc.alloc(u8, budget + 1 + @as(usize, @intCast(@min(at.skip, 1 << 30))));
+    // A text window is bounded by the buffer, not by the budget: one that
+    // overflows it is formatted again a row at a time.
+    var skip: usize = @intCast(@min(at.skip, read_buffer_cap));
+    const buf = try alloc.alloc(u8, @min(budget, read_buffer_cap) + 1 + skip);
     defer alloc.free(buf);
 
     var row = at.row;
-    var skip: usize = @intCast(@min(at.skip, 1 << 30));
     var state: PageFormatter.TrailingState = .{ .rows = 0, .cells = at.blanks };
     var written: usize = 0;
     while (row < n) {
@@ -1337,7 +1344,7 @@ fn readLineRows(
             formatter.initial_state = state;
             var next_state: ?PageFormatter.TrailingState = null;
             formatter.final_state = &next_state;
-            var fixed: std.Io.Writer = .fixed(buf[0 .. left + skip + 1]);
+            var fixed: std.Io.Writer = .fixed(buf[0 .. @min(left, read_buffer_cap) + skip + 1]);
             var truncated = false;
             formatter.format(&fixed) catch |err| switch (err) {
                 error.WriteFailed => truncated = true,
@@ -1372,7 +1379,7 @@ fn readLineRows(
     if (row < n) return .{ .written = written, .done = false, .cont = .{ .row = row, .blanks = state.cells } };
     if (!span.unterminated) {
         // The newline may not fit in what is left: it starts the next piece.
-        if (written + 1 > budget) return .{ .written = written, .done = false, .cont = .{ .row = n } };
+        if (written +| 1 > budget) return .{ .written = written, .done = false, .cont = .{ .row = n } };
         try writer.writeByte('\n');
         written += 1;
     }

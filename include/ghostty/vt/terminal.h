@@ -4087,7 +4087,9 @@ GHOSTTY_API GhosttyResult ghostty_terminal_lines_rows(
  * @param resume Where to go on inside the line, or NULL to start at its
  *        beginning
  * @param max_lines Most lines to write
- * @param max_bytes Most bytes to write
+ * @param max_bytes Most bytes to write. This is a budget, not an allocation
+ *        size: any value up to SIZE_MAX is fine, and no more memory is used
+ *        than the text of one batch of lines needs
  * @param writer Receives the text; see ghostty_terminal_get()'s writer rules
  * @param out_read Receives what was done
  * @return GHOSTTY_SUCCESS, GHOSTTY_INVALID_VALUE for a NULL handle,
