@@ -1964,7 +1964,7 @@ fn resizeCols(
     };
 
     // A lazy list reflows only its tail; null means the whole list.
-    const tail: ?LazyTail = if (self.lazy_reflow) self.lazyTail() else null;
+    const tail: ?LazyTail = if (self.lazy_reflow) self.lazyTail(cols) else null;
     const prefix_rows: usize = if (tail) |t| t.prefix_rows else 0;
 
     // Update our cols. We have to do this early because grow() that we
@@ -2381,7 +2381,78 @@ fn chunkStart(self: *PageList, max_rows: usize, max_pages: usize) *List.Node {
         j = prev;
         self.visit();
     }
-    return j;
+    return self.alignSeam(j, self.cols, null, &extra);
+}
+
+/// Most nodes `alignSeam` moves a cut back to find an aligned one.
+const max_seam_search_nodes: usize = 512;
+
+/// Move a chunk start `j` that cuts a logical line (the row before it has
+/// `wrap` set) back to a node boundary where the cells of the line before it
+/// fill whole rows of `new_cols`, or to the line's first node.
+///
+/// The chunk before the cut then ends on a full output row and the fresh part
+/// continues right after it. A cut at any other cell leaves a wrapped row
+/// holding fewer cells than the width, whose blank rest reads back as text.
+/// Cells are counted as full rows of each node's width: a wide character that
+/// wraps early (spacer head) makes the count too high, so such a line can
+/// still keep a short row at the cut. `rows` grows by the rows moved over;
+/// nodes before `limit` (when given) are never taken. Returns `j` itself when
+/// no aligned boundary is near or a page cannot be read.
+fn alignSeam(
+    self: *PageList,
+    j: *List.Node,
+    new_cols: usize,
+    limit: ?*List.Node,
+    rows: *usize,
+) *List.Node {
+    const first = j.prev orelse return j;
+    if (!first.endsWrapped()) return j;
+
+    // Cells of the line before `j`, down to the node where it starts.
+    var cells: usize = 0;
+    var line_start: *List.Node = first;
+    var n = first;
+    while (true) {
+        self.visit();
+        const count = n.rows();
+        var run = count;
+        const all_wrapped = if (n.line_ends) |le| le.count == 0 else false;
+        if (!all_wrapped) {
+            const raw = self.lineRowFlags(n) orelse return j;
+            run = 0;
+            var i = raw.len;
+            while (i > 0) : (i -= 1) {
+                if (raw[i - 1] & (@as(u64, 1) << wrap_bit) == 0) break;
+                run += 1;
+            }
+        }
+        cells += run * n.cols();
+        line_start = n;
+        if (run < count) break;
+        const prev = n.prev orelse break;
+        if (!prev.endsWrapped()) break;
+        n = prev;
+    }
+
+    var cur = j;
+    var moved: usize = 0;
+    var moved_rows: usize = 0;
+    while (cells % new_cols != 0) {
+        if (moved >= max_seam_search_nodes) return j;
+        const p = cur.prev.?;
+        if (limit) |l| if (cur == l) return j;
+        moved += 1;
+        moved_rows += p.rows();
+        if (p == line_start) {
+            rows.* += moved_rows;
+            return p;
+        }
+        cells -= p.rows() * p.cols();
+        cur = p;
+    }
+    rows.* += moved_rows;
+    return cur;
 }
 
 /// What reflowing one chunk consumed and produced, and whether it moved what
@@ -2681,7 +2752,7 @@ inline fn visit(self: *PageList) void {
 /// first active row is, never older than the fresh part, and moved to the
 /// nearest hard line start within `max_line_rows` rows. Beyond that the
 /// boundary stays inside the line. Touches only the nodes it considers.
-fn lazyTail(self: *PageList) ?LazyTail {
+fn lazyTail(self: *PageList, new_cols: size.CellCountInt) ?LazyTail {
     const first_fresh = if (self.stale_tail) |t| t.next.? else self.pages.first.?;
     const active_node = self.getTopLeft(.active).node;
 
@@ -2708,6 +2779,7 @@ fn lazyTail(self: *PageList) ?LazyTail {
         k = prev;
         self.visit();
     }
+    k = self.alignSeam(k, new_cols, first_fresh, &tail_rows);
 
     if (k == self.pages.first.?) return null;
     return .{ .k = k, .prefix_rows = self.total_rows - tail_rows };
@@ -27462,4 +27534,52 @@ test "LineIndex splices get sequence numbers between their neighbours, or renumb
     s.lineRenumber();
     try testing.expectEqual(@as(u32, 1), s.line_renumbers);
     try s.expectLinesRightForTest();
+}
+
+test "PageList lazy reflow of a line over max_line_rows leaves no short wrapped row" {
+    const testing = std.testing;
+    // Where the cut falls depends on the page sizes and on where the line
+    // starts, so try several starts.
+    for ([_]usize{ 1, 2, 5 }) |head| {
+        var s = try init(testing.allocator, .{ .cols = 80, .rows = 24, .lazy_reflow = true });
+        defer s.deinit();
+        s.pauseIntegrityChecks(true);
+        defer s.pauseIntegrityChecks(false);
+        {
+            var bulk: BulkGrowth = .init(&s);
+            defer bulk.finish();
+            try bulk.growMany(3 * max_line_rows + 500);
+        }
+        // Every cell holds text, so a wrapped row with a blank end is a hole.
+        var node = s.pages.first;
+        while (node) |n| : (node = n.next) {
+            const page = n.page();
+            for (0..n.rows()) |y| {
+                for (0..80) |x| page.getRowAndCell(x, y).cell.* = .init('x');
+                page.rows.ptr(page.memory)[y].blank = false;
+            }
+        }
+        // One line from row `head` to the row before the last 100.
+        const flags = try testing.allocator.alloc(bool, s.total_rows);
+        defer testing.allocator.free(flags);
+        @memset(flags, false);
+        @memset(flags[head .. s.total_rows - 100], true);
+        s.setWrapsForTest(flags);
+
+        try s.resize(.{ .cols = 120 });
+        while (s.stale_tail != null) _ = try s.reflowStep(2000, 6);
+
+        var wrapped: usize = 0;
+        var cur = s.pages.first;
+        while (cur) |n| : (cur = n.next) {
+            const page = n.page();
+            for (0..n.rows()) |y| {
+                if (!page.getRowAndCell(0, y).row.wrap) continue;
+                wrapped += 1;
+                const last = page.getRowAndCell(page.size.cols - 1, y).cell;
+                try testing.expect(last.codepoint() != 0);
+            }
+        }
+        try testing.expect(wrapped > 10_000);
+    }
 }
