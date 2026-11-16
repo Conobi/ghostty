@@ -814,6 +814,15 @@ typedef struct {
 
   /** The last line written has no line end, so no newline either. */
   bool last_unterminated;
+
+  /**
+   * The next call starts on a compressed page this one left undecoded, and
+   * decodes it as its first action, which takes about a millisecond: a
+   * caller that watches the time can start it on a fresh budget. A call
+   * decodes at most one page, as its first action, and stops short when
+   * the next line needs another.
+   */
+  bool page_boundary;
 } GhosttyLineRead;
 
 /**

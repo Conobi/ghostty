@@ -1335,6 +1335,11 @@
           "offset": 65,
           "size": 1,
           "type": "bool"
+        },
+        "page_boundary": {
+          "offset": 66,
+          "size": 1,
+          "type": "bool"
         }
       }
     },

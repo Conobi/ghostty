@@ -86,8 +86,10 @@ pub const Counters = struct {
     /// Number of encode attempts, for tests and measurement.
     encodes: usize = 0,
 
-    /// Rises whenever a node is restored, compressed or destroyed: a decoded
-    /// page a `ReadScratch` kept from before is then no longer trusted.
+    /// Rises whenever a node is restored or destroyed: a decoded page a
+    /// `ReadScratch` kept from before is then no longer trusted. (Compressing
+    /// needs no bump: a held node is compressed already, and has to be
+    /// restored before it can be compressed again.)
     read_epoch: u64 = 0,
 
     /// Times `readPreserving` reused the decoded page its scratch held.
@@ -125,7 +127,6 @@ pub const Counters = struct {
 
     /// A node has just become compressed.
     fn compressed(self: *Counters, node: *const List.Node) void {
-        self.read_epoch +%= 1;
         self.resident_size -= node.backingBytes();
         self.stored_size -= node.metadata().memory.len -
             node.data.compressed.encoded.len;
@@ -151,8 +152,7 @@ pub const Counters = struct {
 /// It remembers which node it decoded, so reading the same compressed node
 /// again costs nothing. The memory cost is one page. The memory is trusted
 /// only while the node's serial and the list's `read_epoch` are unchanged:
-/// restoring, compressing or destroying any node, and `invalidateNodeLayout`,
-/// all end that.
+/// restoring or destroying any node, and `invalidateNodeLayout`, all end that.
 pub const ReadScratch = struct {
     buf: []align(std.heap.page_size_min) u8 = &.{},
     page: Page = undefined,

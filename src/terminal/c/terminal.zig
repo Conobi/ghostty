@@ -1596,6 +1596,7 @@ pub fn read_lines(
         .next = read.resumePoint(),
         .reached_end = read.reached_end,
         .last_unterminated = read.last_unterminated,
+        .page_boundary = read.page_boundary,
     };
     return .success;
 }
@@ -2296,6 +2297,7 @@ pub const LineRead = extern struct {
     next: LineResume,
     reached_end: bool,
     last_unterminated: bool,
+    page_boundary: bool,
 };
 
 /// C: GhosttyLineCell
