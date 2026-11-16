@@ -86,6 +86,13 @@ pub const Counters = struct {
     /// Number of encode attempts, for tests and measurement.
     encodes: usize = 0,
 
+    /// Rises whenever a node is restored, compressed or destroyed: a decoded
+    /// page a `ReadScratch` kept from before is then no longer trusted.
+    read_epoch: u64 = 0,
+
+    /// Times `readPreserving` reused the decoded page its scratch held.
+    read_reuses: usize = 0,
+
     fn addResident(self: *Counters, bytes: usize) void {
         self.resident_size += bytes;
         self.resident_peak = @max(self.resident_peak, self.resident_size);
@@ -110,6 +117,7 @@ pub const Counters = struct {
 
     /// A resident node leaves the accounted list.
     fn detach(self: *Counters, node: *const List.Node) void {
+        self.read_epoch +%= 1;
         self.resident_size -= node.backingBytes();
         self.stored_size -= node.backingBytes();
         self.forget(node);
@@ -117,6 +125,7 @@ pub const Counters = struct {
 
     /// A node has just become compressed.
     fn compressed(self: *Counters, node: *const List.Node) void {
+        self.read_epoch +%= 1;
         self.resident_size -= node.backingBytes();
         self.stored_size -= node.metadata().memory.len -
             node.data.compressed.encoded.len;
@@ -127,6 +136,7 @@ pub const Counters = struct {
     /// A page behind the cursor is not a candidate for compression until it is
     /// compressed again, but this one may be, so restart the scan.
     fn restored(self: *Counters, node: *const List.Node, encoded_len: usize) void {
+        self.read_epoch +%= 1;
         self.addResident(node.backingBytes());
         self.stored_size += node.metadata().memory.len - encoded_len;
         self.resetScan();
@@ -137,9 +147,23 @@ pub const Counters = struct {
 ///
 /// Holds one decoded page at a time; the page returned by
 /// `Node.readPreserving` is valid until the next read with the same scratch.
+///
+/// It remembers which node it decoded, so reading the same compressed node
+/// again costs nothing. The memory cost is one page. The memory is trusted
+/// only while the node's serial and the list's `read_epoch` are unchanged:
+/// restoring, compressing or destroying any node, and `invalidateNodeLayout`,
+/// all end that.
 pub const ReadScratch = struct {
     buf: []align(std.heap.page_size_min) u8 = &.{},
     page: Page = undefined,
+    held: ?Held = null,
+
+    const Held = struct {
+        node: *const List.Node,
+        serial: u64,
+        epoch: u64,
+        encoded: [*]const u8,
+    };
 
     /// Free the buffer; the scratch may be reused afterwards.
     pub fn deinit(self: *ReadScratch, alloc: Allocator) void {
@@ -343,6 +367,21 @@ const Node = struct {
             .compressed => |*page_| page_,
         };
         const need = compressed.page.memory.len;
+        const key: ?ReadScratch.Held = if (self.counters) |c| .{
+            .node = self,
+            .serial = self.serial,
+            .epoch = c.read_epoch,
+            .encoded = compressed.encoded.ptr,
+        } else null;
+        if (key) |k| if (scratch.held) |h| {
+            if (h.node == k.node and h.serial == k.serial and
+                h.epoch == k.epoch and h.encoded == k.encoded)
+            {
+                self.counters.?.read_reuses += 1;
+                return &scratch.page;
+            }
+        };
+        scratch.held = null;
         if (scratch.buf.len < need) {
             const buf = try alloc.alignedAlloc(
                 u8,
@@ -357,6 +396,7 @@ const Node = struct {
             log.err("failed to read compressed page err={}", .{err});
             @panic("failed to read compressed terminal page");
         };
+        scratch.held = key;
         return &scratch.page;
     }
 
@@ -695,6 +735,10 @@ line_renumbers: u32 = 0,
 
 /// Decode buffer for summarising compressed pages without restoring them.
 line_scratch: ReadScratch = .{},
+
+/// Decode buffer for `readLines`; it keeps the last page it decoded, so the
+/// slices of a read that stay on one compressed page decode it once.
+read_scratch: ReadScratch = .{},
 
 /// Most nodes one `lineState` call adds to the index, so a call stays within
 /// a lock slice however long the history is.
@@ -1390,6 +1434,7 @@ pub fn deinit(self: *PageList) void {
     releasePages(&self.pool, self.pages);
     self.line_index.deinit(self.pool.alloc);
     self.line_scratch.deinit(self.pool.alloc);
+    self.read_scratch.deinit(self.pool.alloc);
     self.pool.alloc.destroy(self.counters);
     self.pool.deinit();
 }
@@ -5798,6 +5843,9 @@ fn lineIndexTruncate(self: *PageList, pos: usize, dead: usize) void {
 /// and cut the index at it. Cheap for a node the index does not hold.
 fn lineNodeChanged(self: *PageList, node: *List.Node) void {
     node.dropLineEnds();
+    if (self.read_scratch.held) |h| if (h.node == node) {
+        self.read_scratch.held = null;
+    };
     if (!node.line_indexed) return;
     self.lineIndexTruncate(self.lineNodePos(node), 0);
 }

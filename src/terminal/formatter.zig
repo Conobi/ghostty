@@ -961,6 +961,10 @@ pub const PageListFormatter = struct {
     /// `initial_state` to go on from the next row.
     final_state: ?*?PageFormatter.TrailingState = null,
 
+    /// Decode buffer to use for compressed pages instead of a private one.
+    /// It keeps its last page, so several calls share one decode.
+    scratch: ?*PageList.ReadScratch = null,
+
     pub fn init(
         list: *const PageList,
         opts: Options,
@@ -985,13 +989,14 @@ pub const PageListFormatter = struct {
         // Compressed pages are decoded into one reusable buffer instead of
         // being restored, so formatting a whole history leaves it compressed.
         const scratch_alloc = self.list.pool.alloc;
-        var scratch: PageList.ReadScratch = .{};
-        defer scratch.deinit(scratch_alloc);
+        var own: PageList.ReadScratch = .{};
+        defer own.deinit(scratch_alloc);
+        const scratch = self.scratch orelse &own;
 
         // If the end is a spacer head, move it onto the wrapped wide char,
         // which may be on another page.
         if (self.opts.unwrap and !self.rectangle) {
-            const br_page = br.node.readPreserving(&scratch, scratch_alloc) catch
+            const br_page = br.node.readPreserving(scratch, scratch_alloc) catch
                 return error.WriteFailed;
             if (br_page.getRowAndCell(br.x, br.y).cell.wide == .spacer_head) {
                 br = br.rightWrap(1) orelse br;
@@ -1004,7 +1009,7 @@ pub const PageListFormatter = struct {
             assert(chunk.start < chunk.end);
             assert(chunk.end > 0);
 
-            const chunk_page = chunk.node.readPreserving(&scratch, scratch_alloc) catch
+            const chunk_page = chunk.node.readPreserving(scratch, scratch_alloc) catch
                 return error.WriteFailed;
             var formatter: PageFormatter = .init(chunk_page, self.opts);
             formatter.start_y = chunk.start;
@@ -1230,6 +1235,7 @@ pub fn readLines(
         br.x = br.node.cols() - 1;
         var formatter: PageListFormatter = .init(list, .{ .emit = .plain, .unwrap = true, .trim = true });
         formatter.top_left = tl;
+        formatter.scratch = &list.read_scratch;
         formatter.bottom_right = br;
         var fixed: std.Io.Writer = .fixed(buf[0 .. @min(budget, read_buffer_cap) + 1]);
         var truncated = false;
@@ -1340,6 +1346,7 @@ fn readLineRows(
             br.x = br.node.cols() - 1;
             var formatter: PageListFormatter = .init(list, .{ .emit = .plain, .unwrap = true, .trim = true });
             formatter.top_left = tl;
+            formatter.scratch = &list.read_scratch;
             formatter.bottom_right = br;
             formatter.initial_state = state;
             var next_state: ?PageFormatter.TrailingState = null;
@@ -1465,6 +1472,7 @@ pub fn locateBytes(
         defer discard.deinit();
         var formatter: PageListFormatter = .init(list, .{ .emit = .plain, .unwrap = true, .trim = true });
         formatter.top_left = tl;
+        formatter.scratch = &list.read_scratch;
         formatter.bottom_right = br;
         formatter.pin_map = .{ .alloc = alloc, .map = &map };
         formatter.initial_state = state;
@@ -8891,6 +8899,63 @@ fn readAllForTest(
     out: *std.Io.Writer.Allocating,
 ) !ReadLines {
     return try readLines(list, first, .{}, max_lines, 1 << 24, &out.writer);
+}
+
+test "readLines reuses one decoded page and never serves a stale one" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try lineTerminalForTest(alloc, 80, 24);
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    var line_buf: [64]u8 = undefined;
+    const list = &t.screens.active.pages;
+    var bulk: PageList.BulkGrowth = .init(list);
+    for (0..6_000) |i| {
+        const line = try std.fmt.bufPrint(&line_buf, "line {d:0>6} the quick brown fox\r\n", .{i});
+        s.nextSlice(line);
+        if (i % 10 == 9) bulk.refresh();
+    }
+    bulk.finish();
+    _ = list.compress(.full);
+    try readyIndexForTest(list);
+    const node = list.pages.first.?;
+    try testing.expectEqual(PageList.List.Node.Storage.compressed, node.storage());
+
+    // Two reads of the same page: the second decodes nothing.
+    const first = list.firstLine();
+    var a: std.Io.Writer.Allocating = .init(alloc);
+    defer a.deinit();
+    _ = try readAllForTest(list, first, 3, &a);
+    const head = try alloc.dupe(u8, a.writer.buffered()[0..12]);
+    defer alloc.free(head);
+    try testing.expect(std.mem.startsWith(u8, head, "line "));
+    const reuses = list.counters.read_reuses;
+    var b: std.Io.Writer.Allocating = .init(alloc);
+    defer b.deinit();
+    _ = try readAllForTest(list, first, 3, &b);
+    try testing.expect(list.counters.read_reuses > reuses);
+    try testing.expectEqualStrings(a.writer.buffered(), b.writer.buffered());
+
+    // Rewrite the page (restored, written, compressed again): the next read
+    // must show the new text, not the page the scratch still holds.
+    node.page().getRowAndCell(0, 0).cell.* = .init('X');
+    _ = list.compress(.full);
+    try testing.expectEqual(PageList.List.Node.Storage.compressed, node.storage());
+    var c: std.Io.Writer.Allocating = .init(alloc);
+    defer c.deinit();
+    _ = try readAllForTest(list, first, 3, &c);
+    head[0] = 'X';
+    try testing.expect(std.mem.startsWith(u8, c.writer.buffered(), head));
+
+    // A node written without being compressed again is read as it is.
+    node.page().getRowAndCell(1, 0).cell.* = .init('Y');
+    var d: std.Io.Writer.Allocating = .init(alloc);
+    defer d.deinit();
+    _ = try readAllForTest(list, first, 3, &d);
+    head[1] = 'Y';
+    try testing.expect(std.mem.startsWith(u8, d.writer.buffered(), head));
 }
 
 test "LineIndex read_lines gives exactly one newline per line including blank lines" {
