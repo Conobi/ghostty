@@ -2281,9 +2281,11 @@ const PinSnapshot = struct {
 /// everything back. Sources are read without restoring them. On success the
 /// sources are destroyed and the boundary moves to the node before `j`.
 ///
-/// The output is left resident, except that the last (partial) page is
-/// compacted: encoding is about half the cost of a step, so it is left to the
-/// incremental pass, which the step resets to find the new pages.
+/// Finished output pages are compressed while the step runs, so a step holds
+/// only a few pages whatever the chunk. Output nodes are never kept across
+/// writes (writing can replace the page being filled when its capacity grows):
+/// each sweep walks the list again from `before`. The last (partial) page is
+/// compacted first, and the incremental pass is reset to find the new pages.
 fn reflowChunk(self: *PageList, j: *List.Node) Allocator.Error!ChunkStats {
     const alloc = self.pool.alloc;
     const tail = self.stale_tail.?;
@@ -2310,6 +2312,14 @@ fn reflowChunk(self: *PageList, j: *List.Node) Allocator.Error!ChunkStats {
         .top => 0,
         .active => self.total_rows - self.rows,
         .pin => self.viewport_pin_row_offset.?,
+    };
+
+    // Output pages are compressed as they are finished, except when the
+    // viewport may sit in them.
+    const viewport_in_chunk = switch (self.viewport) {
+        .top => before == null,
+        .active => false,
+        .pin => window_before >= rows_before and window_before < rows_before + old_rows,
     };
 
     const snapshot = try alloc.alloc(PinSnapshot, self.tracked_pins.count());
@@ -2369,6 +2379,9 @@ fn reflowChunk(self: *PageList, j: *List.Node) Allocator.Error!ChunkStats {
             );
         }
 
+        // Finished output is cold: compress it so a step never holds more
+        // than a few pages.
+        if (!viewport_in_chunk) self.compressFinished(before, cursor.node);
         if (node == tail) break;
     }
 
@@ -2429,6 +2442,14 @@ fn reflowChunk(self: *PageList, j: *List.Node) Allocator.Error!ChunkStats {
     }
 
     self.compactPartialPage(after.prev.?);
+    {
+        const viewport: ViewportNodes = .init(self);
+        var rest = self.firstAfter(before);
+        while (rest) |node| : (rest = node.next) {
+            if (node == after) break;
+            if (!node.isCompressed() and !viewport.holds(node)) _ = self.compressPage(node);
+        }
+    }
 
     return .{
         .old_rows = old_rows,
@@ -2454,6 +2475,23 @@ fn windowOverlaps(self: *const PageList, window: usize, start: usize, len: usize
 /// Whether two row ranges, given by start and length, share a row.
 fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) bool {
     return a < b + b_len and b < a + a_len;
+}
+
+/// Compress the output pages that are finished: every one after `before`
+/// that precedes the node being written and the node before it (a row may
+/// still move back into it). `frontier` is the node being written; nothing
+/// else about the output is assumed to have survived the last write.
+fn compressFinished(
+    self: *PageList,
+    before: ?*List.Node,
+    frontier: *List.Node,
+) void {
+    if (!terminal_mem.canReclaim(.strict)) return;
+    var node_ = self.firstAfter(before);
+    while (node_) |node| : (node_ = node.next) {
+        if (node == frontier or node.next == frontier) break;
+        if (!node.isCompressed() and !node.incompressible) _ = self.compressPage(node);
+    }
 }
 
 /// Shrink the last page a step wrote when it is less than seven eighths full.
@@ -25101,15 +25139,13 @@ test "PageList reflowStep reads compressed sources without restoring them" {
     try s.resize(.{ .cols = 110 });
     const compressed = s.memoryStats().compressed_pages;
 
-    // The peak counts pages resident at once: the output chunk (left resident
-    // for the incremental pass, and wider than its sources, which hold fewer
-    // rows per page), the copy of its compacted last page, and no sources.
+    // The peak counts pages resident at once: the output chunk, no sources.
     const max_pages: usize = 4;
     for (0..8) |_| {
         s.counters.resident_peak = s.counters.resident_size;
         const base = s.counters.resident_size;
         _ = try s.reflowStep(2000, max_pages);
-        try testing.expect(s.counters.resident_peak - base <= (2 * max_pages + 2) * PagePool.item_size);
+        try testing.expect(s.counters.resident_peak - base <= (max_pages + 2) * PagePool.item_size);
     }
     // Pages ahead of the chunks were never decoded.
     try testing.expect(s.memoryStats().compressed_pages >= compressed - 8 * (max_pages + 2));
@@ -25473,11 +25509,14 @@ test "PageList reflowStep output stays compressible by the incremental pass" {
     while (s.compressOldestResident()) {}
     const scanned = s.getTopLeft(.active).node;
     try testing.expect(s.counters.cursor == scanned);
+    // The viewport on the first pages keeps the last step's output resident
+    // (a step compresses the rest itself), behind the scan position.
+    s.scroll(.top);
     var random = std.Random.DefaultPrng.init(0x5343414E);
     try drainForTest(&s, random.random());
     try testing.expect(s.counters.cursor == null);
+    s.scroll(.active);
 
-    // A step leaves its output resident, behind the scan position.
     var resident_history: usize = 0;
     n = s.pages.first;
     while (n) |node| : (n = node.next) {
@@ -25537,4 +25576,83 @@ test "PageList reflowStep leaves no half-filled page behind and stores as little
     _ = eager.compress(.drain);
     try testing.expectEqual(eager.total_rows, lazy.total_rows);
     try testing.expect(lazy.counters.stored_size * 100 <= eager.counters.stored_size * 105);
+}
+
+/// Give the first `count` rows of every history page a style of their own.
+fn styleHistoryForTest(self: *PageList, count: usize) !void {
+    var page_index: usize = 0;
+    var n = self.pages.first;
+    while (n) |node| : (n = node.next) {
+        const page_ = node.page();
+        for (0..@min(count, node.rows())) |y| {
+            const style_id = try page_.styles.add(page_.memory, .{
+                .bg_color = .rgb(.{
+                    .r = @intCast(1 + (page_index * count + y) % 250),
+                    .g = @intCast(page_index % 250),
+                    .b = 7,
+                }),
+            });
+            const rac = page_.getRowAndCell(0, y);
+            rac.row.styled = true;
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = .{ .data = 'a' } },
+                .style_id = style_id,
+            };
+        }
+        page_index += 1;
+    }
+}
+
+test "PageList reflowStep survives output pages that grow their capacity mid-step" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesQuietForTest(16);
+    try s.styleHistoryForTest(70);
+    _ = s.compress(.full);
+
+    // Narrower pages hold more rows, so two source pages, each with seventy
+    // styles of its own, land in one output page whose style set (128) must
+    // grow while the step is writing it.
+    try s.resize(.{ .cols = 40 });
+    try testing.expect(s.stale_tail != null);
+    const first_stale = s.pages.first.?;
+    const source_styles = first_stale.capacity().styles;
+    const base = s.counters.resident_size;
+
+    var grew = false;
+    while (s.stale_tail != null) {
+        _ = try s.reflowStep(65536, 4);
+        s.assertIntegrity();
+        // The step compressed its own output: nothing piles up.
+        try testing.expect(s.counters.resident_size <= base + 4 * PagePool.item_size);
+        var n = s.pages.first;
+        while (n) |node| : (n = node.next) {
+            if (node.capacity().styles > source_styles) grew = true;
+        }
+    }
+    try testing.expect(grew);
+    try s.expectCountersForTest();
+}
+
+test "PageList reflowStep keeps resident pages bounded without an incremental pass" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.lazy_reflow = true;
+    try s.growColdPagesQuietForTest(80);
+    s.fillVariedRowsForTest(6);
+    _ = s.compress(.full);
+    try s.resize(.{ .cols = 50 });
+
+    const base = s.counters.resident_size;
+    var steps: usize = 0;
+    while (s.stale_tail != null) : (steps += 1) {
+        _ = try s.reflowStep(1500, 4);
+        // Never `compress`: only the step's own compression runs.
+        try testing.expect(s.counters.resident_size <= base + 3 * PagePool.item_size);
+    }
+    try testing.expect(steps >= 10);
 }
