@@ -1186,23 +1186,29 @@ pub fn readLines(
             var m: usize = 0;
             var rows: u64 = 0;
             var long_first: ?PageList.LineSpan = null;
-            var batch_fresh: ?*PageList.List.Node = null;
+            var batch_comp: ?*PageList.List.Node = null;
             var deferred = false;
             while (m < read_batch_lines and res.lines + m < max_lines) {
                 const span = list.lineSpan(line + m) orelse break;
                 const n = span.end_row - span.start_row + 1;
                 const cols = (list.rowPin(span.start_row) orelse return error.WriteFailed).node.cols();
                 // A call decodes one compressed page, as its first action: a
-                // line on another one waits for the next call.
-                const fresh = freshNodes(list, span.start_row, span.end_row);
+                // line on another one waits for the next call. A batch holds
+                // one compressed page whole, as formatting a second one would
+                // decode the first again.
                 const first_action = res.lines == 0 and m == 0;
-                for (fresh) |f| {
-                    const node = f orelse continue;
-                    if (node == batch_fresh) continue;
-                    if (!first_action) deferred = true;
+                const comp = compressedNodes(list, span.start_row, span.end_row);
+                if (comp[1] != null) {
+                    // Too long for one page: only row by row, as the first line.
+                    if (first_action) long_first = span else deferred = true;
+                    break;
+                }
+                if (comp[0]) |node| {
+                    if (batch_comp != null and batch_comp.? != node) deferred = true;
+                    if (!first_action and batch_comp != node and !isHeld(list, node)) deferred = true;
                 }
                 if (deferred) break;
-                for (fresh) |f| batch_fresh = f orelse continue;
+                if (comp[0]) |node| batch_comp = node;
                 const resumed = m == 0 and (at.row > 0 or at.skip > 0);
                 // A line of a few rows is always formatted in the batch,
                 // whatever the budget; a longer one that cannot fit goes row
@@ -1326,16 +1332,68 @@ fn nextStartsFresh(list: *PageList, res: ReadLines) bool {
     return freshNodes(list, row, row)[0] != null;
 }
 
+/// Whether the read scratch holds the decoded `node`, so reading it is free.
+fn isHeld(list: *const PageList, node: *const PageList.List.Node) bool {
+    const held = list.read_scratch.held orelse return false;
+    return held.node == node;
+}
+
 /// The compressed nodes the rows `first` and `last` lie on that the read
 /// scratch does not hold: reading them costs a decode.
 fn freshNodes(list: *PageList, first: u64, last: u64) [2]?*PageList.List.Node {
     var out: [2]?*PageList.List.Node = .{ null, null };
-    const held: ?*const PageList.List.Node = if (list.read_scratch.held) |h| h.node else null;
     const a = (list.rowPin(first) orelse return out).node;
     const b = (list.rowPin(last) orelse return out).node;
-    if (a.storage() == .compressed and a != held) out[0] = a;
-    if (b != a and b.storage() == .compressed and b != held) out[1] = b;
+    if (a.storage() == .compressed and !isHeld(list, a)) out[0] = a;
+    if (b != a and b.storage() == .compressed and !isHeld(list, b)) out[1] = b;
     return out;
+}
+
+/// The first two distinct compressed nodes among rows `first` to `last`,
+/// decoded already or not. A formatter reads the node of the last row first,
+/// then goes down from the first, so a window over two of them decodes more
+/// than twice.
+fn compressedNodes(list: *PageList, first: u64, last: u64) [2]?*PageList.List.Node {
+    var out: [2]?*PageList.List.Node = .{ null, null };
+    var n: ?*PageList.List.Node = (list.rowPin(first) orelse return out).node;
+    const end = (list.rowPin(last) orelse return out).node;
+    var k: usize = 0;
+    while (n) |node| : (n = node.next) {
+        if (node.storage() == .compressed) {
+            out[k] = node;
+            k += 1;
+            if (k == out.len) break;
+        }
+        if (node == end) break;
+    }
+    return out;
+}
+
+/// How many of the `k` rows from list row `first` one call may format in a
+/// window: they stay on one compressed page, and that page is decoded only if
+/// this call has not decoded one yet (`decoded` records it). Zero when the
+/// first row needs a decode the call may not make; the caller stops there
+/// and the next call goes on.
+fn decodableRows(list: *PageList, first: u64, k: u64, decoded: *bool) u64 {
+    const pin = list.rowPin(first) orelse return k;
+    var n: ?*PageList.List.Node = pin.node;
+    var y: u64 = pin.y;
+    var avail: u64 = 0;
+    var compressed = false;
+    while (n) |node| : (n = node.next) {
+        if (avail >= k) break;
+        if (node.storage() == .compressed) {
+            if (compressed) break;
+            if (!isHeld(list, node)) {
+                if (decoded.*) break;
+                decoded.* = true;
+            }
+            compressed = true;
+        }
+        avail += node.rows() - y;
+        y = 0;
+    }
+    return @min(avail, k);
 }
 
 /// What `readLineRows` wrote and where it stopped.
@@ -1366,6 +1424,7 @@ fn readLineRows(
     var row = at.row;
     var state: PageFormatter.TrailingState = .{ .rows = 0, .cells = at.blanks };
     var written: usize = 0;
+    var decoded = false;
     while (row < n) {
         const left = budget - written;
         const first = list.rowPin(span.start_row + row) orelse return error.WriteFailed;
@@ -1375,6 +1434,13 @@ fn readLineRows(
         var k: u64 = if (skip > 0) 1 else std.math.clamp(left / per_row, 1, read_window_rows);
         k = @min(k, n - row);
         if (written > 0 and left < per_row) break;
+        // A call decodes one compressed page: the piece ends before a second.
+        k = decodableRows(list, span.start_row + row, k, &decoded);
+        if (k == 0) return .{
+            .written = written,
+            .done = false,
+            .cont = .{ .row = row, .blanks = state.cells, .skip = skip },
+        };
 
         while (true) {
             const last = list.rowPin(span.start_row + row + k - 1) orelse return error.WriteFailed;
@@ -1462,6 +1528,9 @@ pub const LocateResult = extern struct {
 /// rows were formatted; tab holes and wraps are exact because the state of
 /// the rows above is carried. A line already pruned answers `row_pruned`
 /// for every byte. Offsets past the end of the text are left unlocated.
+///
+/// A call decodes at most one compressed page, so it may stop short of
+/// `max_rows`; `complete` is then false and `next` says where to go on.
 pub fn locateBytes(
     list: *PageList,
     line: u64,
@@ -1485,8 +1554,11 @@ pub fn locateBytes(
     var located: usize = 0;
     var rows_done: u64 = 0;
     var window: u64 = 8;
+    var decoded = false;
     while (located < byte_offsets.len and row < total and rows_done < max_rows) {
-        const k = @min(window, total - row, max_rows - rows_done);
+        // A call decodes one compressed page: the rest waits for the next.
+        const k = decodableRows(list, span.start_row + row, @min(window, total - row, max_rows - rows_done), &decoded);
+        if (k == 0) break;
         const tl = list.rowPin(span.start_row + row) orelse return error.LineNotFound;
         const br = list.rowPin(span.start_row + row + k - 1) orelse return error.LineNotFound;
 
@@ -9006,7 +9078,9 @@ test "readLines decodes at most one compressed page per call and stops at the bo
     var got: std.Io.Writer.Allocating = .init(alloc);
     defer got.deinit();
     while (calls < 10_000) : (calls += 1) {
+        const decodes = list.read_scratch.decodes;
         const r = try readLines(list, line, pos, 3_000, 1 << 24, &got.writer);
+        try testing.expect(list.read_scratch.decodes - decodes <= 1);
         line = r.next_line;
         pos = r.next;
         if (r.reached_end) break;
@@ -9024,6 +9098,115 @@ test "readLines decodes at most one compressed page per call and stops at the bo
     defer again.deinit();
     _ = try readLines(list, first, .{}, std.math.maxInt(usize), 1 << 28, &again.writer);
     try testing.expectEqualStrings(again.writer.buffered(), got.writer.buffered());
+}
+
+/// A terminal whose first history line is 3,000 rows long and wrapped, over
+/// several compressed pages, followed by short lines; returns the text of
+/// that line's first and last row for checks.
+fn longLineTerminalForTest(alloc: Allocator) !Terminal {
+    var t = try lineTerminalForTest(alloc, 80, 24);
+    errdefer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    const list = &t.screens.active.pages;
+    var bulk: PageList.BulkGrowth = .init(list);
+    var row: [80]u8 = undefined;
+    for (0..3000) |i| {
+        for (&row, 0..) |*c, j| c.* = 'a' + @as(u8, @intCast((i * 7 + j) % 26));
+        s.nextSlice(&row);
+        if (i % 10 == 9) bulk.refresh();
+    }
+    s.nextSlice("\r\n");
+    for (0..60) |i| {
+        var buf: [16]u8 = undefined;
+        s.nextSlice(std.fmt.bufPrint(&buf, "tail {d}\r\n", .{i}) catch unreachable);
+    }
+    bulk.finish();
+    _ = list.compress(.full);
+    try readyIndexForTest(list);
+    return t;
+}
+
+/// Restore every page, so later reads decode nothing.
+fn restoreAllForTest(list: *PageList) void {
+    var node = list.pages.first;
+    while (node) |n| : (node = n.next) _ = n.page();
+}
+
+test "LineIndex readLines decodes at most one page per call over a line on many compressed pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try longLineTerminalForTest(alloc);
+    defer t.deinit(alloc);
+    const list = &t.screens.active.pages;
+    try testing.expect(list.memoryStats().compressed_pages >= 4);
+    const first = list.firstLine();
+
+    // Whole budget and a small one that goes row by row.
+    var texts: [2]std.Io.Writer.Allocating = .{ .init(alloc), .init(alloc) };
+    defer for (&texts) |*w| w.deinit();
+    for ([_]usize{ 1 << 24, 5_000 }, 0..) |budget, k| {
+        var pos: ReadResume = .{};
+        var line = first;
+        var calls: usize = 0;
+        while (calls < 10_000) : (calls += 1) {
+            const decodes = list.read_scratch.decodes;
+            const r = try readLines(list, line, pos, 3_000, budget, &texts[k].writer);
+            try testing.expect(list.read_scratch.decodes - decodes <= 1);
+            line = r.next_line;
+            pos = r.next;
+            if (r.reached_end) break;
+            // Every call goes on: it wrote something or moved on.
+            try testing.expect(r.bytes > 0 or r.rows_formatted > 0);
+        }
+        try testing.expect(calls >= 4);
+    }
+    try testing.expectEqualStrings(texts[0].writer.buffered(), texts[1].writer.buffered());
+
+    restoreAllForTest(list);
+    var again: std.Io.Writer.Allocating = .init(alloc);
+    defer again.deinit();
+    _ = try readLines(list, first, .{}, std.math.maxInt(usize), 1 << 28, &again.writer);
+    try testing.expectEqualStrings(again.writer.buffered(), texts[0].writer.buffered());
+    try testing.expect(std.mem.startsWith(u8, again.writer.buffered(), "abcdefghij"));
+}
+
+test "LineIndex locateBytes decodes at most one page per call over a line on many compressed pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try longLineTerminalForTest(alloc);
+    defer t.deinit(alloc);
+    const list = &t.screens.active.pages;
+    try testing.expect(list.memoryStats().compressed_pages >= 4);
+    const line = list.firstLine();
+
+    const offsets = [_]u64{ 0, 79, 80, 30_000, 100_000, 239_999 };
+    var got: [offsets.len]LineCell = undefined;
+    var located: usize = 0;
+    var again_at: LocateResume = .{};
+    var calls: usize = 0;
+    while (calls < 10_000) : (calls += 1) {
+        const decodes = list.read_scratch.decodes;
+        const res = try locateBytes(list, line, offsets[located..], again_at, 1 << 20, got[located..]);
+        try testing.expect(list.read_scratch.decodes - decodes <= 1);
+        located += res.located;
+        again_at = res.next;
+        if (res.complete) break;
+        try testing.expect(res.next.row > 0 or res.located > 0);
+    }
+    try testing.expectEqual(offsets.len, located);
+    try testing.expect(calls >= 3);
+
+    restoreAllForTest(list);
+    var want: [offsets.len]LineCell = undefined;
+    const all = try locateBytes(list, line, &offsets, .{}, 1 << 20, &want);
+    try testing.expect(all.complete);
+    try testing.expectEqual(offsets.len, all.located);
+    for (want, got) |w, g| {
+        try testing.expectEqual(w.screen_row, g.screen_row);
+        try testing.expectEqual(w.col, g.col);
+    }
+    try testing.expectEqual(list.rows_pruned + 2999, want[5].screen_row);
 }
 
 test "LineIndex read_lines gives exactly one newline per line including blank lines" {
@@ -9511,4 +9694,3 @@ test "LineIndex locate_bytes stops at the row of the largest byte and resumes" {
     try testing.expect(c.complete);
     try testing.expectEqual(list.rows_pruned + 9, cells[0].screen_row);
 }
-

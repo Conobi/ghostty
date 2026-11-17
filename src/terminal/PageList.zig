@@ -154,6 +154,8 @@ pub const ReadScratch = struct {
     buf: []align(std.heap.page_size_min) u8 = &.{},
     page: Page = undefined,
     held: ?Held = null,
+    /// Pages decoded so far; tests count what a call costs.
+    decodes: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
 
     const Held = struct {
         node: *const List.Node,
@@ -387,6 +389,7 @@ const Node = struct {
             if (scratch.buf.len > 0) alloc.free(scratch.buf);
             scratch.buf = buf;
         }
+        if (comptime builtin.is_test) scratch.decodes += 1;
         scratch.page = compressed.cloneBuf(scratch.buf) catch |err| {
             // Same boundary as `pagePreservingState`: our codec produced the data.
             log.err("failed to read compressed page err={}", .{err});
