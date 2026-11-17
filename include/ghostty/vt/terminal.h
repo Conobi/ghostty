@@ -3954,7 +3954,8 @@ GHOSTTY_API GhosttyResult ghostty_terminal_reflow_step(
  * Copy the line edits newer than `since_seq`, oldest first.
  *
  * Only the last 16 edits are kept. If more were lost,
- * GhosttyTerminalLineState::edits_overflowed is set.
+ * GhosttyTerminalLineState::edits_overflowed is set. A `since_seq` above the
+ * newest sequence counts as the newest.
  *
  * @param terminal The terminal handle
  * @param since_seq Return edits with a sequence above this

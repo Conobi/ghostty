@@ -606,7 +606,9 @@ pub const EditLog = struct {
 
     /// Copy edits newer than `since_seq`, oldest first, into `out`. When some
     /// were lost, `overflowed` is set and the retained ones are still given.
-    pub fn since(self: *EditLog, since_seq: u64, out: []LineEdit) Since {
+    /// A `since_seq` beyond the newest sequence is read as the newest.
+    pub fn since(self: *EditLog, requested_seq: u64, out: []LineEdit) Since {
+        const since_seq = @min(requested_seq, self.seq);
         self.read_seq = @max(self.read_seq, since_seq);
         const oldest = if (self.seq > edit_ring) self.seq - edit_ring + 1 else 1;
         const start = @max(since_seq + 1, oldest);
@@ -1006,6 +1008,24 @@ test "LineIndex EditLog since reports overflow after 16 unread edits" {
     const some = log.since(log.seq - 3, out[0..2]);
     try testing.expectEqual(@as(usize, 2), some.n);
     try testing.expect(!some.overflowed);
+}
+
+test "LineIndex EditLog since clamps a sequence beyond the newest" {
+    var log: EditLog = .{};
+    var out: [32]LineEdit = undefined;
+
+    // The largest value neither overflows nor reads anything.
+    _ = log.push(1, 1);
+    try testing.expectEqual(@as(usize, 0), log.since(std.math.maxInt(u64), &out).n);
+
+    // A sequence above the newest must not hide the loss of later edits.
+    var other: EditLog = .{};
+    try testing.expectEqual(@as(usize, 0), other.since(1 << 40, &out).n);
+    for (0..40) |i| _ = other.push(i, 1);
+    try testing.expect(other.overflowed());
+    const got = other.since(0, &out);
+    try testing.expect(got.overflowed);
+    try testing.expectEqual(@as(usize, edit_ring), got.n);
 }
 
 test "LineIndex EditLog markLost overflows until read" {
