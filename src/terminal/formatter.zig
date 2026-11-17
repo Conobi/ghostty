@@ -1089,35 +1089,23 @@ pub const ReadResume = extern struct {
 };
 
 /// What `readLines` returned and where to go on.
-pub const ReadLines = struct {
-    /// Id of the first line read: `first_line` raised to the oldest line
-    /// that still starts in a live row, when older ones were pruned.
-    first_line_read: u64,
+pub const ReadLines = extern struct {
     /// Lines written whole.
-    lines: usize,
+    lines: u64,
     /// Bytes written.
-    bytes: usize,
-    /// Where to resume: this line, from `next_row` (see `ReadResume`).
+    bytes: u64,
+    /// Where to resume: this line, from `next` (see `ReadResume`).
     next_line: u64,
-    next_row: u64,
-    next_blanks: usize,
-    next_skip: u64,
     /// Rows formatted by this call, for cost accounting.
     rows_formatted: u64,
+    next: ReadResume,
     /// No line follows `next_line`: the list ends there.
     reached_end: bool,
-    /// The last line written has no `\n`: it has no line end yet.
-    last_unterminated: bool,
     /// The next call starts on a compressed page this one left undecoded and
     /// decodes it as its first action (about a millisecond), so a caller that
     /// watches the time can start that call on a fresh budget. A call that
     /// stopped short for this reason always sets it.
     page_boundary: bool,
-
-    /// The resume point to pass to the next call.
-    pub fn resumePoint(self: ReadLines) ReadResume {
-        return .{ .row = self.next_row, .blanks = self.next_blanks, .skip = self.next_skip };
-    }
 };
 
 /// Lines one batch formats at most, and the rows it spans at most.
@@ -1132,42 +1120,33 @@ const read_window_rows = 4096;
 /// allocate, and may be as large as `usize` allows).
 const read_buffer_cap = 4 << 20;
 
+/// A formatter of the rows from `first` to `last` in full: plain, unwrapped,
+/// trimmed text, with compressed pages decoded into the list's read scratch.
+fn plainRows(list: *PageList, first: PageList.Pin, last: PageList.Pin) PageListFormatter {
+    var f: PageListFormatter = .init(list, .{ .emit = .plain, .unwrap = true, .trim = true });
+    f.top_left = first;
+    f.top_left.?.x = 0;
+    f.bottom_right = last;
+    f.bottom_right.?.x = last.node.cols() - 1;
+    f.scratch = &list.read_scratch;
+    return f;
+}
+
 /// Write lines `first_line`, ... of the list as text: unwrapped, trimmed,
 /// one `\n` after every line, blank lines included. Lines are those of
 /// `PageList.lineSpan`, so the tail up to the last row can be read too; the
-/// line with no end yet is written without `\n` (`last_unterminated`).
+/// line with no end yet is written without `\n`.
 ///
 /// Stops after `max_lines` lines or `max_bytes` bytes. Short lines are
 /// written whole, stopping at a line end. A line too long for the budget
 /// (or one resumed) is written row by row: a piece ends on a row boundary,
-/// and `next_row` and the fields after it say where it goes on, so a line
-/// of any length costs time linear in its rows over all the calls. The text
-/// of a line is the same whatever the width, but the rows are not: resume
-/// with the same list layout. Compressed pages are decoded into scratch,
-/// never restored. Lines beyond what the index reaches are not offered: call
-/// `PageList.lineState` until `index_ready` first.
+/// and `next` says where it goes on, so a line of any length costs time
+/// linear in its rows over all the calls. The text of a line is the same
+/// whatever the width, but the rows are not: resume with the same list
+/// layout. Compressed pages are decoded into scratch, never restored. Lines
+/// beyond what the index reaches are not offered: call `PageList.lineState`
+/// until `index_ready` first.
 pub fn readLines(
-    list: *PageList,
-    first_line: u64,
-    cont: ReadResume,
-    max_lines: usize,
-    max_bytes: usize,
-    writer: *std.Io.Writer,
-) (Allocator.Error || std.Io.Writer.Error)!ReadLines {
-    var res = try readLinesInner(list, first_line, cont, max_lines, max_bytes, writer);
-    if (!res.reached_end and !res.page_boundary) {
-        if (list.lineSpan(res.next_line)) |span| {
-            const row = span.start_row + res.next_row;
-            if (row <= span.end_row) {
-                const fresh = freshNodes(list, .{ .start_row = row, .end_row = row, .unterminated = span.unterminated });
-                res.page_boundary = fresh[0] != null;
-            }
-        }
-    }
-    return res;
-}
-
-fn readLinesInner(
     list: *PageList,
     first_line: u64,
     cont: ReadResume,
@@ -1178,180 +1157,182 @@ fn readLinesInner(
     const alloc = list.pool.alloc;
     const oldest = list.firstLine();
     var line = @max(first_line, oldest);
+    // Bytes lost to pruning cannot be skipped: start the line afresh.
+    var at: ReadResume = if (first_line >= oldest) cont else .{};
     var res: ReadLines = .{
-        .first_line_read = line,
         .lines = 0,
         .bytes = 0,
         .next_line = line,
-        .next_row = 0,
-        .next_blanks = 0,
-        .next_skip = 0,
         .rows_formatted = 0,
+        .next = at,
         .reached_end = false,
-        .last_unterminated = false,
         .page_boundary = false,
     };
-    // Bytes lost to pruning cannot be skipped: start the line afresh.
-    var at: ReadResume = if (first_line >= oldest) cont else .{};
-    res.next_row = at.row;
-    res.next_blanks = at.blanks;
-    res.next_skip = at.skip;
-    if (max_lines == 0 or max_bytes == 0) return res;
+    // The call stopped because the next line needs a page this call may not
+    // decode.
+    var stopped_deferred = false;
 
-    const buf = try alloc.alloc(u8, @min(max_bytes, read_buffer_cap) + 1);
-    defer alloc.free(buf);
+    read: {
+        if (max_lines == 0 or max_bytes == 0) break :read;
+        const buf = try alloc.alloc(u8, @min(max_bytes, read_buffer_cap) + 1);
+        defer alloc.free(buf);
 
-    while (res.lines < max_lines) {
-        const budget = max_bytes - res.bytes;
+        while (res.lines < max_lines) {
+            const used: usize = @intCast(res.bytes);
+            const budget = max_bytes - used;
 
-        // Gather the short lines of this batch.
-        var spans: [read_batch_lines]PageList.LineSpan = undefined;
-        var m: usize = 0;
-        var rows: u64 = 0;
-        var long_first: ?PageList.LineSpan = null;
-        var batch_fresh: ?*PageList.List.Node = null;
-        var deferred = false;
-        while (m < read_batch_lines and res.lines + m < max_lines) {
-            const span = list.lineSpan(line + m) orelse break;
-            const n = span.end_row - span.start_row + 1;
-            const cols = (list.rowPin(span.start_row) orelse return error.WriteFailed).node.cols();
-            // A call decodes one compressed page, as its first action: a
-            // line on another one waits for the next call.
-            const fresh = freshNodes(list, span);
-            const first_action = res.lines == 0 and m == 0;
-            for (fresh) |f| {
-                const node = f orelse continue;
-                if (node == batch_fresh) continue;
-                if (!first_action) deferred = true;
+            // Gather the short lines of this batch.
+            var spans: [read_batch_lines]PageList.LineSpan = undefined;
+            var m: usize = 0;
+            var rows: u64 = 0;
+            var long_first: ?PageList.LineSpan = null;
+            var batch_fresh: ?*PageList.List.Node = null;
+            var deferred = false;
+            while (m < read_batch_lines and res.lines + m < max_lines) {
+                const span = list.lineSpan(line + m) orelse break;
+                const n = span.end_row - span.start_row + 1;
+                const cols = (list.rowPin(span.start_row) orelse return error.WriteFailed).node.cols();
+                // A call decodes one compressed page, as its first action: a
+                // line on another one waits for the next call.
+                const fresh = freshNodes(list, span.start_row, span.end_row);
+                const first_action = res.lines == 0 and m == 0;
+                for (fresh) |f| {
+                    const node = f orelse continue;
+                    if (node == batch_fresh) continue;
+                    if (!first_action) deferred = true;
+                }
+                if (deferred) break;
+                for (fresh) |f| batch_fresh = f orelse continue;
+                const resumed = m == 0 and (at.row > 0 or at.skip > 0);
+                // A line of a few rows is always formatted in the batch,
+                // whatever the budget; a longer one that cannot fit goes row
+                // by row.
+                if (resumed or n > read_batch_rows or (n > 8 and n * cols > budget)) {
+                    if (m == 0) long_first = span;
+                    break;
+                }
+                if (m > 0 and rows + n > read_batch_rows) break;
+                spans[m] = span;
+                m += 1;
+                rows += n;
+                if (span.unterminated) break;
             }
-            if (deferred) break;
-            for (fresh) |f| batch_fresh = f orelse continue;
-            const resumed = m == 0 and (at.row > 0 or at.skip > 0);
-            // A line of a few rows is always formatted in the batch, whatever
-            // the budget; a longer one that cannot fit goes row by row.
-            if (resumed or n > read_batch_rows or (n > 8 and n * cols > budget)) {
-                if (m == 0) long_first = span;
+
+            if (long_first) |span| {
+                // Only a call's first line is written in pieces: otherwise
+                // stop here, and the next call starts on it.
+                if (res.lines > 0) break;
+                if (!try readPiece(list, &res, line, span, at, budget, writer)) break :read;
+                line += 1;
+                at = .{};
+                res.next_line = line;
+                res.next = .{};
+                continue;
+            }
+            if (m == 0) {
+                if (deferred) stopped_deferred = true else res.reached_end = true;
                 break;
             }
-            if (m > 0 and rows + n > read_batch_rows) break;
-            spans[m] = span;
-            m += 1;
-            rows += n;
-            if (span.unterminated) break;
-        }
 
-        if (long_first) |span| {
-            // Only a call's first line is written in pieces: otherwise stop
-            // here, and the next call starts on it.
-            if (res.lines > 0) break;
-            const piece = try readLineRows(list, span, at, budget, &res.rows_formatted, writer);
-            res.bytes += piece.written;
-            if (!piece.done) {
-                res.next_line = line;
-                res.next_row = piece.cont.row;
-                res.next_blanks = piece.cont.blanks;
-                res.next_skip = piece.cont.skip;
-                return res;
+            // Format the rows of the whole batch.
+            const tl = list.rowPin(spans[0].start_row) orelse return error.WriteFailed;
+            const br = list.rowPin(spans[m - 1].end_row) orelse return error.WriteFailed;
+            var fixed: std.Io.Writer = .fixed(buf[0 .. @min(budget, read_buffer_cap) + 1]);
+            var truncated = false;
+            plainRows(list, tl, br).format(&fixed) catch |err| switch (err) {
+                error.WriteFailed => truncated = true,
+            };
+            res.rows_formatted += rows;
+            const text_all = fixed.buffered();
+
+            // Emit its lines while the budget lasts.
+            var pos: usize = 0;
+            var consumed: usize = 0;
+            while (consumed < m) : (consumed += 1) {
+                const rest = text_all[pos..];
+                var complete = true;
+                var text = rest;
+                var next_pos = text_all.len;
+                if (std.mem.indexOfScalar(u8, rest, '\n')) |k| {
+                    text = rest[0..k];
+                    next_pos = pos + k + 1;
+                } else if (truncated) {
+                    complete = false;
+                }
+                // Trailing blank lines left no text at all: they are empty.
+
+                const unterminated = spans[consumed].unterminated;
+                const need = text.len + @intFromBool(!unterminated);
+                if (!complete or res.bytes +| need > max_bytes) {
+                    // The rest does not fit: it starts the next call, or, when
+                    // this is the first line, goes out in pieces.
+                    if (consumed == 0 and res.lines == 0) {
+                        if (!try readPiece(list, &res, line, spans[0], .{}, max_bytes, writer)) break :read;
+                        pos = next_pos;
+                        continue;
+                    }
+                    break;
+                }
+                try writer.writeAll(text);
+                if (!unterminated) try writer.writeByte('\n');
+                res.bytes += need;
+                res.lines += 1;
+                pos = next_pos;
             }
-            res.lines += 1;
-            res.last_unterminated = span.unterminated;
-            line += 1;
+            line += consumed;
             at = .{};
             res.next_line = line;
-            res.next_row = 0;
-            res.next_blanks = 0;
-            res.next_skip = 0;
-            continue;
-        }
-        if (m == 0) {
-            if (deferred) res.page_boundary = true else res.reached_end = true;
-            break;
-        }
-
-        // Format the rows of the whole batch.
-        var tl = list.rowPin(spans[0].start_row) orelse return error.WriteFailed;
-        tl.x = 0;
-        var br = list.rowPin(spans[m - 1].end_row) orelse return error.WriteFailed;
-        br.x = br.node.cols() - 1;
-        var formatter: PageListFormatter = .init(list, .{ .emit = .plain, .unwrap = true, .trim = true });
-        formatter.top_left = tl;
-        formatter.scratch = &list.read_scratch;
-        formatter.bottom_right = br;
-        var fixed: std.Io.Writer = .fixed(buf[0 .. @min(budget, read_buffer_cap) + 1]);
-        var truncated = false;
-        formatter.format(&fixed) catch |err| switch (err) {
-            error.WriteFailed => truncated = true,
-        };
-        res.rows_formatted += rows;
-        const text_all = fixed.buffered();
-
-        // Emit its lines while the budget lasts.
-        var pos: usize = 0;
-        var consumed: usize = 0;
-        while (consumed < m) : (consumed += 1) {
-            const rest = text_all[pos..];
-            var complete = true;
-            var text = rest;
-            var next_pos = text_all.len;
-            if (std.mem.indexOfScalar(u8, rest, '\n')) |k| {
-                text = rest[0..k];
-                next_pos = pos + k + 1;
-            } else if (truncated) {
-                complete = false;
-            }
-            // Trailing blank lines left no text at all: they are empty.
-
-            const unterminated = spans[consumed].unterminated;
-            const need = text.len + @intFromBool(!unterminated);
-            if (!complete or res.bytes +| need > max_bytes) {
-                // The rest does not fit: it starts the next call, or, when
-                // this is the first line, goes out in pieces.
-                if (consumed == 0 and res.lines == 0) {
-                    const piece = try readLineRows(list, spans[0], .{}, max_bytes, &res.rows_formatted, writer);
-                    res.bytes += piece.written;
-                    if (!piece.done) {
-                        res.next_line = line;
-                        res.next_row = piece.cont.row;
-                        res.next_blanks = piece.cont.blanks;
-                        res.next_skip = piece.cont.skip;
-                        return res;
-                    }
-                    res.lines += 1;
-                    res.last_unterminated = unterminated;
-                    pos = next_pos;
-                    continue;
-                }
+            res.next = .{};
+            if (consumed < m) break;
+            if (deferred) {
+                stopped_deferred = true;
                 break;
             }
-            try writer.writeAll(text);
-            if (!unterminated) try writer.writeByte('\n');
-            res.bytes += need;
-            res.lines += 1;
-            res.last_unterminated = unterminated;
-            pos = next_pos;
-        }
-        line += consumed;
-        at = .{};
-        res.next_line = line;
-        res.next_row = 0;
-        res.next_blanks = 0;
-        res.next_skip = 0;
-        if (consumed < m) break;
-        if (deferred) {
-            res.page_boundary = true;
-            break;
         }
     }
+
+    res.page_boundary = stopped_deferred or (!res.reached_end and nextStartsFresh(list, res));
     return res;
 }
 
-/// The compressed nodes the first and last rows of `span` lie on that the
-/// read scratch does not hold: reading them costs a decode.
-fn freshNodes(list: *PageList, span: PageList.LineSpan) [2]?*PageList.List.Node {
+/// Write the first line of a call in pieces from `at`. False when it stopped
+/// short: `res` then says where to go on. Otherwise the line is counted.
+fn readPiece(
+    list: *PageList,
+    res: *ReadLines,
+    line: u64,
+    span: PageList.LineSpan,
+    at: ReadResume,
+    budget: usize,
+    writer: *std.Io.Writer,
+) (Allocator.Error || std.Io.Writer.Error)!bool {
+    const piece = try readLineRows(list, span, at, budget, &res.rows_formatted, writer);
+    res.bytes += piece.written;
+    if (!piece.done) {
+        res.next_line = line;
+        res.next = piece.cont;
+        return false;
+    }
+    res.lines += 1;
+    return true;
+}
+
+/// Whether the call that goes on from `res` starts on a compressed page the
+/// read scratch does not hold.
+fn nextStartsFresh(list: *PageList, res: ReadLines) bool {
+    const span = list.lineSpan(res.next_line) orelse return false;
+    const row = span.start_row + res.next.row;
+    if (row > span.end_row) return false;
+    return freshNodes(list, row, row)[0] != null;
+}
+
+/// The compressed nodes the rows `first` and `last` lie on that the read
+/// scratch does not hold: reading them costs a decode.
+fn freshNodes(list: *PageList, first: u64, last: u64) [2]?*PageList.List.Node {
     var out: [2]?*PageList.List.Node = .{ null, null };
     const held: ?*const PageList.List.Node = if (list.read_scratch.held) |h| h.node else null;
-    const a = (list.rowPin(span.start_row) orelse return out).node;
-    const b = (list.rowPin(span.end_row) orelse return out).node;
+    const a = (list.rowPin(first) orelse return out).node;
+    const b = (list.rowPin(last) orelse return out).node;
     if (a.storage() == .compressed and a != held) out[0] = a;
     if (b != a and b.storage() == .compressed and b != held) out[1] = b;
     return out;
@@ -1396,14 +1377,8 @@ fn readLineRows(
         if (written > 0 and left < per_row) break;
 
         while (true) {
-            var tl = first;
-            tl.x = 0;
-            var br = list.rowPin(span.start_row + row + k - 1) orelse return error.WriteFailed;
-            br.x = br.node.cols() - 1;
-            var formatter: PageListFormatter = .init(list, .{ .emit = .plain, .unwrap = true, .trim = true });
-            formatter.top_left = tl;
-            formatter.scratch = &list.read_scratch;
-            formatter.bottom_right = br;
+            const last = list.rowPin(span.start_row + row + k - 1) orelse return error.WriteFailed;
+            var formatter = plainRows(list, first, last);
             formatter.initial_state = state;
             var next_state: ?PageFormatter.TrailingState = null;
             formatter.final_state = &next_state;
@@ -1473,10 +1448,6 @@ pub const LocateResume = extern struct {
 pub const LocateResult = extern struct {
     /// Leading offsets that have a cell (or are `row_pruned`).
     located: usize,
-    /// The row after the last one formatted that was needed: the row of the
-    /// largest byte plus one when all were located, else where the budget
-    /// or the line ended.
-    rows_read: u64,
     /// Every offset is answered, or lies beyond the text of the whole line.
     /// When false the row budget stopped short: call again with `next` and
     /// the offsets not yet located.
@@ -1502,7 +1473,7 @@ pub fn locateBytes(
     assert(out.len >= byte_offsets.len);
     if (line < list.firstLine()) {
         for (out[0..byte_offsets.len]) |*o| o.* = .{ .screen_row = row_pruned, .col = 0 };
-        return .{ .located = byte_offsets.len, .rows_read = 0, .complete = true, .next = .{} };
+        return .{ .located = byte_offsets.len, .complete = true, .next = .{} };
     }
     const span = list.lineSpan(line) orelse return error.LineNotFound;
     const total = span.end_row - span.start_row + 1;
@@ -1512,24 +1483,18 @@ pub fn locateBytes(
     var base = cont.byte_base;
     var state: PageFormatter.TrailingState = .{ .rows = 0, .cells = cont.blanks };
     var located: usize = 0;
-    var needed_rows = row;
     var rows_done: u64 = 0;
     var window: u64 = 8;
     while (located < byte_offsets.len and row < total and rows_done < max_rows) {
         const k = @min(window, total - row, max_rows - rows_done);
-        var tl = list.rowPin(span.start_row + row) orelse return error.LineNotFound;
-        tl.x = 0;
-        var br = list.rowPin(span.start_row + row + k - 1) orelse return error.LineNotFound;
-        br.x = br.node.cols() - 1;
+        const tl = list.rowPin(span.start_row + row) orelse return error.LineNotFound;
+        const br = list.rowPin(span.start_row + row + k - 1) orelse return error.LineNotFound;
 
         var map: PinMap.Map = .empty;
         defer map.deinit(alloc);
         var discard: std.Io.Writer.Allocating = .init(alloc);
         defer discard.deinit();
-        var formatter: PageListFormatter = .init(list, .{ .emit = .plain, .unwrap = true, .trim = true });
-        formatter.top_left = tl;
-        formatter.scratch = &list.read_scratch;
-        formatter.bottom_right = br;
+        var formatter = plainRows(list, tl, br);
         formatter.pin_map = .{ .alloc = alloc, .map = &map };
         formatter.initial_state = state;
         var next_state: ?PageFormatter.TrailingState = null;
@@ -1547,7 +1512,6 @@ pub fn locateBytes(
             while (n != pin.node) : (n = n.next orelse return error.LineNotFound) node_at += n.rows();
             const in_list = node_at + pin.y;
             out[located] = .{ .screen_row = list.rows_pruned + in_list, .col = pin.x };
-            needed_rows = @max(needed_rows, in_list - span.start_row + 1);
             located += 1;
         }
         base += map.count();
@@ -1560,7 +1524,6 @@ pub fn locateBytes(
     const answered = located == byte_offsets.len;
     return .{
         .located = located,
-        .rows_read = if (answered) needed_rows else row,
         // Out of text or out of budget: only the latter leaves work to do.
         .complete = answered or row >= total,
         .next = .{ .row = row, .byte_base = base, .blanks = state.cells },
@@ -9045,7 +9008,7 @@ test "readLines decodes at most one compressed page per call and stops at the bo
     while (calls < 10_000) : (calls += 1) {
         const r = try readLines(list, line, pos, 3_000, 1 << 24, &got.writer);
         line = r.next_line;
-        pos = r.resumePoint();
+        pos = r.next;
         if (r.reached_end) break;
         // Short of the 3,000 lines asked, with budget to spare, only for a page.
         try testing.expect(r.page_boundary);
@@ -9098,7 +9061,6 @@ test "LineIndex read_lines gives exactly one newline per line including blank li
         try testing.expectEqual(@as(usize, 40), r.lines);
         try testing.expectEqual(expected.writer.buffered().len, r.bytes);
         try testing.expectEqual(first + 40, r.next_line);
-        try testing.expect(!r.last_unterminated);
     }
 
     // Reading on to the end gives the blank rows of the screen as lines.
@@ -9220,7 +9182,7 @@ test "LineIndex read_lines splits a line longer than max_bytes and resumes by ro
         const r = try readLines(list, line, at, 3 - lines, 64, &got.writer);
         lines += r.lines;
         line = r.next_line;
-        at = r.resumePoint();
+        at = r.next;
         try testing.expect(r.bytes <= 64);
         try testing.expect(r.bytes > 0);
     }
@@ -9268,8 +9230,8 @@ test "LineIndex read_lines resumes a 2000-row line at a row and keeps the work b
         try testing.expect(r.bytes <= 70);
         if (r.lines == 1) break;
         try testing.expectEqual(first + 1, r.next_line);
-        try testing.expect(r.next_row > at.row or r.next_skip > at.skip);
-        at = r.resumePoint();
+        try testing.expect(r.next.row > at.row or r.next.skip > at.skip);
+        at = r.next;
     }
     try testing.expectEqualStrings(whole.writer.buffered(), got.writer.buffered());
     try testing.expectEqualStrings(
@@ -9299,7 +9261,6 @@ test "LineIndex read_lines reads the active area and flags an unterminated last 
         const r = try readAllForTest(list, list.firstLine(), 100, &out);
         try testing.expectEqualStrings("one\ntwo\nthree\nfour\n", out.writer.buffered());
         try testing.expect(r.reached_end);
-        try testing.expect(!r.last_unterminated);
     }
 
     // A last row that wraps has no line end yet.
@@ -9311,7 +9272,6 @@ test "LineIndex read_lines reads the active area and flags an unterminated last 
     const r = try readAllForTest(list, list.firstLine(), 100, &out);
     try testing.expectEqualStrings("one\ntwo\nthree\nfour", out.writer.buffered());
     try testing.expectEqual(@as(usize, 4), r.lines);
-    try testing.expect(r.last_unterminated);
     try testing.expect(r.reached_end);
 }
 
@@ -9480,7 +9440,6 @@ test "LineIndex locate_bytes row budget returns partial progress" {
     var cells: [4]LineCell = undefined;
     const res = try locateBytes(list, line, &.{ 0, 25, 95, 100 }, .{}, 3, &cells);
     try testing.expectEqual(@as(usize, 2), res.located);
-    try testing.expectEqual(@as(u64, 3), res.rows_read);
     try testing.expect(!res.complete);
     try testing.expectEqual(list.rows_pruned, cells[0].screen_row);
     try testing.expectEqual(list.rows_pruned + 2, cells[1].screen_row);
@@ -9538,7 +9497,6 @@ test "LineIndex locate_bytes stops at the row of the largest byte and resumes" {
     var cells: [3]LineCell = undefined;
     const a = try locateBytes(list, line, &.{ 0, 12, 35 }, .{}, 1000, &cells);
     try testing.expectEqual(@as(usize, 3), a.located);
-    try testing.expectEqual(@as(u64, 4), a.rows_read);
     try testing.expect(a.complete);
     try testing.expectEqual(list.rows_pruned + 3, cells[2].screen_row);
 
@@ -9546,13 +9504,11 @@ test "LineIndex locate_bytes stops at the row of the largest byte and resumes" {
     const b = try locateBytes(list, line, &.{ 5, 95 }, .{}, 3, &cells);
     try testing.expectEqual(@as(usize, 1), b.located);
     try testing.expect(!b.complete);
-    try testing.expectEqual(@as(u64, 3), b.rows_read);
     try testing.expectEqual(@as(u64, 3), b.next.row);
     try testing.expectEqual(@as(u64, 30), b.next.byte_base);
     const c = try locateBytes(list, line, &.{95}, b.next, 1000, &cells);
     try testing.expectEqual(@as(usize, 1), c.located);
     try testing.expect(c.complete);
-    try testing.expectEqual(@as(u64, 10), c.rows_read);
     try testing.expectEqual(list.rows_pruned + 9, cells[0].screen_row);
 }
 

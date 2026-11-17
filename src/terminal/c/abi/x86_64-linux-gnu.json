@@ -1288,51 +1288,41 @@
     },
     "GhosttyLineRead": {
       "kind": "struct",
-      "size": 72,
+      "size": 64,
       "align": 8,
       "fields": {
-        "first_line_read": {
+        "lines": {
           "offset": 0,
           "size": 8,
           "type": "u64"
         },
-        "lines": {
+        "bytes": {
           "offset": 8,
           "size": 8,
           "type": "u64"
         },
-        "bytes": {
+        "next_line": {
           "offset": 16,
           "size": 8,
           "type": "u64"
         },
-        "next_line": {
+        "rows_formatted": {
           "offset": 24,
           "size": 8,
           "type": "u64"
         },
-        "rows_formatted": {
-          "offset": 32,
-          "size": 8,
-          "type": "u64"
-        },
         "next": {
-          "offset": 40,
+          "offset": 32,
           "size": 24,
           "type": "GhosttyLineResume"
         },
         "reached_end": {
-          "offset": 64,
-          "size": 1,
-          "type": "bool"
-        },
-        "last_unterminated": {
-          "offset": 65,
+          "offset": 56,
           "size": 1,
           "type": "bool"
         },
         "page_boundary": {
-          "offset": 66,
+          "offset": 57,
           "size": 1,
           "type": "bool"
         }
@@ -1362,7 +1352,7 @@
     },
     "GhosttyLocateResult": {
       "kind": "struct",
-      "size": 48,
+      "size": 40,
       "align": 8,
       "fields": {
         "located": {
@@ -1370,18 +1360,13 @@
           "size": 8,
           "type": "u64"
         },
-        "rows_read": {
-          "offset": 8,
-          "size": 8,
-          "type": "u64"
-        },
         "complete": {
-          "offset": 16,
+          "offset": 8,
           "size": 1,
           "type": "bool"
         },
         "next": {
-          "offset": 24,
+          "offset": 16,
           "size": 24,
           "type": "GhosttyLocateResume"
         }

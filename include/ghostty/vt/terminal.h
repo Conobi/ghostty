@@ -759,12 +759,6 @@ typedef struct {
  * @ingroup terminal
  */
 typedef struct {
-  /**
-   * Id of the first line read: the requested one, or the oldest line that
-   * starts in a live row when it was pruned.
-   */
-  uint64_t first_line_read;
-
   /** Lines written whole. */
   uint64_t lines;
 
@@ -782,9 +776,6 @@ typedef struct {
 
   /** No line follows `next_line`. */
   bool reached_end;
-
-  /** The last line written has no line end, so no newline either. */
-  bool last_unterminated;
 
   /**
    * The next call starts on a compressed page this one left undecoded, and
@@ -836,13 +827,6 @@ typedef struct {
 typedef struct {
   /** Leading offsets that have a cell (or are GHOSTTY_ROW_PRUNED). */
   size_t located;
-
-  /**
-   * One past the last row formatted that was needed: the row of the largest
-   * byte plus one when all were located, else where the budget or the line
-   * ended. Counted from the start of the line.
-   */
-  uint64_t rows_read;
 
   /**
    * Every offset is answered, or lies beyond the text of the whole line.

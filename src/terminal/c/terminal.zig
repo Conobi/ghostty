@@ -1558,17 +1558,7 @@ pub fn read_lines(
     };
     adapter.writer().flush() catch return .io_error;
 
-    out.* = .{
-        .first_line_read = read.first_line_read,
-        .lines = read.lines,
-        .bytes = read.bytes,
-        .next_line = read.next_line,
-        .rows_formatted = read.rows_formatted,
-        .next = read.resumePoint(),
-        .reached_end = read.reached_end,
-        .last_unterminated = read.last_unterminated,
-        .page_boundary = read.page_boundary,
-    };
+    out.* = read;
     return .success;
 }
 
@@ -2223,15 +2213,11 @@ pub const TerminalLineState = extern struct {
     /// bounded number of pages.
     fn init(t: *ZigTerminal) TerminalLineState {
         const st = t.screens.get(.primary).?.pages.lineState();
-        return .{
-            .first_line = st.first_line,
-            .end_line = st.end_line,
-            .rows_pruned = st.rows_pruned,
-            .history_rows = st.history_rows,
-            .edit_seq = st.edit_seq,
-            .edits_overflowed = st.edits_overflowed,
-            .index_ready = st.index_ready,
-        };
+        var out: TerminalLineState = .{};
+        inline for (@typeInfo(PageList.LineState).@"struct".field_names) |name| {
+            @field(out, name) = @field(st, name);
+        }
+        return out;
     }
 };
 
@@ -2239,17 +2225,7 @@ pub const TerminalLineState = extern struct {
 pub const LineResume = formatter_core.ReadResume;
 
 /// C: GhosttyLineRead
-pub const LineRead = extern struct {
-    first_line_read: u64,
-    lines: u64,
-    bytes: u64,
-    next_line: u64,
-    rows_formatted: u64,
-    next: LineResume,
-    reached_end: bool,
-    last_unterminated: bool,
-    page_boundary: bool,
-};
+pub const LineRead = formatter_core.ReadLines;
 
 /// C: GhosttyLineCell
 pub const LineCell = formatter_core.LineCell;
@@ -9008,7 +8984,6 @@ test "read_lines via the C API with a GhosttyWriter" {
     try testing.expectEqual(@as(u64, 35), read.bytes);
     try testing.expectEqual(state.first_line + 5, read.next_line);
     try testing.expect(!read.reached_end);
-    try testing.expectEqual(state.first_line, read.first_line_read);
 
     // A budget stops at a line end; the next call goes on from there.
     sink = .{};
@@ -9049,7 +9024,6 @@ test "locate_bytes via the C API" {
     var result: LocateResult = undefined;
     try testing.expectEqual(Result.success, locate_bytes(t, state.first_line + 1, &offsets, 3, null, 100, &cells, &result));
     try testing.expectEqual(@as(usize, 3), result.located);
-    try testing.expectEqual(@as(u64, 4), result.rows_read);
     try testing.expect(result.complete);
     try testing.expectEqual(state.rows_pruned + 1, cells[0].screen_row);
     try testing.expectEqual(@as(u32, 0), cells[0].col);
