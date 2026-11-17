@@ -8892,18 +8892,17 @@ test "line_edits copies edits and reports overflow" {
     try testing.expectEqual(@as(usize, 0), n);
 
     // Edits come from reflow and prompt redraws; stand in for them.
-    _ = pages.edit_log.push(100, 3, 4);
-    _ = pages.edit_log.push(200, 2, 2);
+    _ = pages.edit_log.push(100, 3);
+    _ = pages.edit_log.push(200, 2);
     try testing.expectEqual(Result.success, line_edits(t, 0, &out, out.len, &n));
     try testing.expectEqual(@as(usize, 2), n);
     try testing.expectEqual(@as(u64, 1), out[0].seq);
     try testing.expectEqual(@as(u64, 100), out[0].first_line);
-    try testing.expectEqual(@as(u64, 3), out[0].old_lines);
-    try testing.expectEqual(@as(u64, 4), out[0].new_lines);
+    try testing.expectEqual(@as(u64, 3), out[0].lines);
     try testing.expectEqual(@as(u64, 200), out[1].first_line);
 
     // Past the ring: the oldest are gone and the state says so.
-    for (0..20) |_| _ = pages.edit_log.push(1, 1, 2);
+    for (0..20) |_| _ = pages.edit_log.push(1, 1);
     var state = try lineStateReady(t);
     try testing.expect(state.edits_overflowed);
     try testing.expectEqual(Result.success, line_edits(t, 0, &out, out.len, &n));

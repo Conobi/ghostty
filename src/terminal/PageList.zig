@@ -6108,7 +6108,7 @@ pub fn lineRewritten(self: *PageList, start: Pin) void {
     };
     const end = self.lineBase() + self.completeLines();
     if (first >= end) return;
-    _ = self.edit_log.push(first, end - first, end - first);
+    _ = self.edit_log.push(first, end - first);
 }
 
 /// Fails unless the index is exactly the first nodes of the list, with their
@@ -27428,8 +27428,7 @@ test "LineIndex prompt redraw logs a rewrite edit for history lines" {
     const got = s.edit_log.since(0, &out);
     try testing.expectEqual(@as(usize, 1), got.n);
     try testing.expectEqual(st.first_line + 40, out[0].first_line);
-    try testing.expectEqual(st.end_line - out[0].first_line, out[0].old_lines);
-    try testing.expectEqual(out[0].old_lines, out[0].new_lines);
+    try testing.expectEqual(st.end_line - out[0].first_line, out[0].lines);
 
     // From the active area: history is untouched, nothing is logged.
     s.lineRewritten(s.pin(.{ .active = .{ .y = 3 } }).?);

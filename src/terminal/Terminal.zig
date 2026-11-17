@@ -19986,7 +19986,7 @@ test "Terminal LineIndex prompt redraw through the stream logs a rewrite edit" {
     const got = pages.edit_log.since(before.edit_seq, &out);
     try testing_.expectEqual(@as(usize, 1), got.n);
     try testing_.expectEqual(p1_line, out[0].first_line);
-    try testing_.expect(out[0].old_lines >= 1);
+    try testing_.expect(out[0].lines >= 1);
 }
 
 test "Terminal LineIndex prompt redraw with history on several pages marks the edit log lost without walking" {

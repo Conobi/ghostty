@@ -662,15 +662,11 @@ typedef struct {
   /** Id of the first line affected. */
   uint64_t first_line;
 
-  /** Lines in the affected region before the edit. */
-  uint64_t old_lines;
-
   /**
-   * Lines in the affected region after the edit. Equal to `old_lines` when
-   * the lines kept their ids and their text was cleared and may be redrawn;
-   * otherwise the ids after the region shifted.
+   * Lines from `first_line` that kept their ids but whose text was cleared
+   * and may be redrawn. Zero for a marker that stands for lost edits.
    */
-  uint64_t new_lines;
+  uint64_t lines;
 } GhosttyLineEdit;
 
 /**

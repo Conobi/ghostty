@@ -561,14 +561,12 @@ pub fn NodeIndex(comptime Ptr: type) type {
     };
 }
 
-/// One entry of the edit log: `old_lines` lines from `first_line` became
-/// `new_lines`. Equal counts mean the lines kept their ids and their text was
-/// rewritten; unequal counts shift the ids after them.
+/// One entry of the edit log: `lines` lines from `first_line` kept their ids
+/// but their text was rewritten. A lost marker has no lines.
 pub const LineEdit = extern struct {
     seq: u64,
     first_line: u64,
-    old_lines: u64,
-    new_lines: u64,
+    lines: u64,
 };
 
 /// Edits kept in the ring.
@@ -591,7 +589,7 @@ pub const EditLog = struct {
     pub const Since = struct { n: usize, overflowed: bool };
 
     /// Record an edit and return its sequence.
-    pub fn push(self: *EditLog, first_line: u64, old_lines: u64, new_lines: u64) u64 {
+    pub fn push(self: *EditLog, first_line: u64, lines: u64) u64 {
         if (self.seq >= edit_ring) {
             // The slot being reused holds the oldest retained edit.
             const dying = self.seq - edit_ring + 1;
@@ -601,8 +599,7 @@ pub const EditLog = struct {
         self.ring[@intCast((self.seq - 1) % edit_ring)] = .{
             .seq = self.seq,
             .first_line = first_line,
-            .old_lines = old_lines,
-            .new_lines = new_lines,
+            .lines = lines,
         };
         return self.seq;
     }
@@ -630,8 +627,7 @@ pub const EditLog = struct {
         self.ring[@intCast((self.seq - 1) % edit_ring)] = .{
             .seq = self.seq,
             .first_line = 0,
-            .old_lines = 0,
-            .new_lines = 0,
+            .lines = 0,
         };
     }
 
@@ -974,7 +970,7 @@ test "LineIndex EditLog since reports overflow after 16 unread edits" {
     try testing.expectEqual(@as(usize, 0), log.since(0, &out).n);
     try testing.expect(!log.overflowed());
 
-    for (1..17) |i| try testing.expectEqual(@as(u64, i), log.push(i * 10, 2, 3));
+    for (1..17) |i| try testing.expectEqual(@as(u64, i), log.push(i * 10, 2));
     const full = log.since(0, &out);
     try testing.expectEqual(@as(usize, 16), full.n);
     try testing.expect(!full.overflowed);
@@ -983,7 +979,7 @@ test "LineIndex EditLog since reports overflow after 16 unread edits" {
     try testing.expectEqual(@as(u64, 20), out[1].first_line);
 
     // The 17th unread edit pushes the first one out.
-    _ = log.push(99, 4, 4);
+    _ = log.push(99, 4);
     try testing.expect(log.overflowed());
     const lost = log.since(0, &out);
     try testing.expect(lost.overflowed);
@@ -1000,13 +996,13 @@ test "LineIndex EditLog since reports overflow after 16 unread edits" {
 
     // A reader that keeps up never overflows, however many edits pass.
     for (0..50) |_| {
-        _ = log.push(1, 1, 2);
+        _ = log.push(1, 1);
         try testing.expectEqual(@as(usize, 1), log.since(log.seq - 1, &out).n);
     }
     try testing.expect(!log.overflowed());
 
     // A small output buffer returns the oldest edits first and no overflow.
-    for (0..3) |_| _ = log.push(1, 1, 2);
+    for (0..3) |_| _ = log.push(1, 1);
     const some = log.since(log.seq - 3, out[0..2]);
     try testing.expectEqual(@as(usize, 2), some.n);
     try testing.expect(!some.overflowed);
@@ -1015,7 +1011,7 @@ test "LineIndex EditLog since reports overflow after 16 unread edits" {
 test "LineIndex EditLog markLost overflows until read" {
     var log: EditLog = .{};
     var out: [4]LineEdit = undefined;
-    _ = log.push(5, 1, 1);
+    _ = log.push(5, 1);
     log.markLost();
     try testing.expect(log.overflowed());
     try testing.expect(log.since(1, &out).overflowed);

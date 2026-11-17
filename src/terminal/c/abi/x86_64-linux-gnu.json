@@ -1261,7 +1261,7 @@
     },
     "GhosttyLineEdit": {
       "kind": "struct",
-      "size": 32,
+      "size": 24,
       "align": 8,
       "fields": {
         "seq": {
@@ -1274,13 +1274,8 @@
           "size": 8,
           "type": "u64"
         },
-        "old_lines": {
+        "lines": {
           "offset": 16,
-          "size": 8,
-          "type": "u64"
-        },
-        "new_lines": {
-          "offset": 24,
           "size": 8,
           "type": "u64"
         }
