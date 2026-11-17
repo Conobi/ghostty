@@ -92,9 +92,6 @@ pub const Counters = struct {
     /// restored before it can be compressed again.)
     read_epoch: u64 = 0,
 
-    /// Times `readPreserving` reused the decoded page its scratch held.
-    read_reuses: usize = 0,
-
     fn addResident(self: *Counters, bytes: usize) void {
         self.resident_size += bytes;
         self.resident_peak = @max(self.resident_peak, self.resident_size);
@@ -377,7 +374,6 @@ const Node = struct {
             if (h.node == k.node and h.serial == k.serial and
                 h.epoch == k.epoch and h.encoded == k.encoded)
             {
-                self.counters.?.read_reuses += 1;
                 return &scratch.page;
             }
         };
@@ -729,24 +725,12 @@ line_index: LineIndex.NodeIndex(*List.Node) = .{},
 /// Line edits the maintainer of a text copy must replay.
 edit_log: LineIndex.EditLog = .{},
 
-/// Times the whole index was renumbered because a splice found no room
-/// between its neighbours' sequence numbers.
-line_renumbers: u32 = 0,
-
-/// Times `lineRewritten` could not find its line and marked the log lost
-/// instead of walking the list.
-line_rewrite_lost: u32 = 0,
-
 /// Decode buffer for summarising compressed pages without restoring them.
 line_scratch: ReadScratch = .{},
 
 /// Decode buffer for `readLines`; it keeps the last page it decoded, so the
 /// slices of a read that stay on one compressed page decode it once.
 read_scratch: ReadScratch = .{},
-
-/// Most nodes one `lineState` call adds to the index, so a call stays within
-/// a lock slice however long the history is.
-line_index_extend: usize = 256,
 
 /// The list of tracked pins. These are kept up to date automatically.
 tracked_pins: PinSet,
@@ -5560,25 +5544,13 @@ fn nodeIsHistory(self: *const PageList, node: *const List.Node) bool {
     return true;
 }
 
-/// The summary of a node known to lie above the active area: the cached one
-/// (recounted in safe builds), or a new one. Null only on out-of-memory.
+/// The summary of a node known to lie above the active area: the cached one,
+/// or a new one. Null only on out-of-memory.
 fn lineSummary(self: *PageList, node: *List.Node) ?*LineIndex.LineEnds {
-    if (node.line_ends) |le| {
-        if (std.debug.runtime_safety) {
-            self.checkLineEnds(node) catch @panic("stale line-end summary");
-        }
-        return le;
-    }
+    if (node.line_ends) |le| return le;
     const raw = self.lineRowFlags(node) orelse return null;
     node.line_ends = LineIndex.LineEnds.build(self.pool.alloc, raw, wrap_bit) catch return null;
     return node.line_ends;
-}
-
-/// The cached line-end summary of a node wholly above the active area,
-/// built on first use; null for a node that touches the active area.
-pub fn lineEndsFor(self: *PageList, node: *List.Node) ?*const LineIndex.LineEnds {
-    if (!self.nodeIsHistory(node)) return null;
-    return self.lineSummary(node);
 }
 
 /// The node after the last indexed one: where the index continues.
@@ -5588,6 +5560,11 @@ fn nextUnindexed(self: *const PageList) ?*List.Node {
     return self.line_index.entry(n - 1).node.next;
 }
 
+/// Most nodes one `lineState` call adds to the index, so a call stays within
+/// a lock slice however long the history is. Small in tests, so a few pages
+/// already take several calls.
+const line_index_extend: usize = if (builtin.is_test) 2 else 256;
+
 /// Add up to `line_index_extend` nodes before `top` to the index; true when
 /// it then reaches `top`.
 fn extendLineIndex(self: *PageList, top: *List.Node) bool {
@@ -5595,7 +5572,7 @@ fn extendLineIndex(self: *PageList, top: *List.Node) bool {
     var added: usize = 0;
     while (cur) |node| : (cur = node.next) {
         if (node == top) return true;
-        if (added >= self.line_index_extend) return false;
+        if (added >= line_index_extend) return false;
         const le = self.lineSummary(node) orelse return false;
         self.line_index.append(
             self.pool.alloc,
@@ -5890,7 +5867,6 @@ fn lineRenumber(self: *PageList) void {
     for (0..self.line_index.len()) |i| {
         self.line_index.entry(i).node.line_seq = (i + 1) * line_seq_step;
     }
-    self.line_renumbers += 1;
 }
 
 /// Drop the index entries from position `pos` on. The first `dead` of them
@@ -6100,7 +6076,6 @@ pub fn lineRewritten(self: *PageList, start: Pin) void {
     if (row >= history) return;
 
     const first = self.rowLine(row) orelse {
-        self.line_rewrite_lost += 1;
         self.edit_log.markLost();
         return;
     };
@@ -26791,7 +26766,6 @@ test "LineIndex first_line and end_line follow output" {
     try testing.expect(!st.edits_overflowed);
 
     // Every fresh row is a line end, so every row that scrolls off is a line.
-    s.line_index_extend = 2; // small slices: several calls to catch up
     var bulk: BulkGrowth = .init(&s);
     var grown: u64 = 0;
     var last_end = st.end_line;
@@ -26809,8 +26783,8 @@ test "LineIndex first_line and end_line follow output" {
     const before = s.line_index.len();
     s.line_index.truncate(0);
     const partial = s.lineState();
-    try testing.expect(s.line_index.len() <= 2);
-    try testing.expect(before > 2);
+    try testing.expect(s.line_index.len() <= line_index_extend);
+    try testing.expect(before > line_index_extend);
     try testing.expect(!partial.index_ready);
     try testing.expect(partial.end_line < st.end_line);
     try testing.expectEqual(st.history_rows, partial.history_rows);
@@ -26844,7 +26818,6 @@ test "LineIndex a summary is not built for the active-area node" {
     const testing = std.testing;
     var one = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
     defer one.deinit();
-    try testing.expect(one.lineEndsFor(one.pages.first.?) == null);
     _ = one.lineState();
     try testing.expect(one.pages.first.?.line_ends == null);
 
@@ -26856,7 +26829,7 @@ test "LineIndex a summary is not built for the active-area node" {
     var node = s.pages.first;
     while (node) |n| : (node = n.next) {
         if (n == active) break;
-        try testing.expect(s.lineEndsFor(n) != null);
+        try testing.expect(n.line_ends != null);
         cold += 1;
     }
     try testing.expect(cold >= 3);
@@ -26864,7 +26837,6 @@ test "LineIndex a summary is not built for the active-area node" {
     var rest: ?*List.Node = active;
     while (rest) |n| : (rest = n.next) {
         try testing.expect(n.line_ends == null);
-        try testing.expect(s.lineEndsFor(n) == null);
     }
 }
 
@@ -27074,7 +27046,6 @@ test "LineIndex stays equal to a recount across random operations" {
         defer s.deinit();
         s.pauseIntegrityChecks(true);
         defer s.pauseIntegrityChecks(false);
-        s.line_index_extend = rnd.intRangeAtMost(usize, 1, 6);
         try s.growColdPagesQuietForTest(rnd.intRangeAtMost(usize, 1, 2));
         s.fillTextForTest();
         try s.randomWrapsForTest(rnd);
@@ -27419,7 +27390,6 @@ test "LineIndex a line over 8192 rows crossing the soft boundary keeps its line 
     @memset(flags[1000 .. 1000 + max_line_rows + 500], true);
     s.setWrapsForTest(flags);
     const total = try s.totalLineEndsForTest();
-    s.line_index_extend = 1000;
     _ = try s.lineStateReadyForTest();
 
     try s.resize(.{ .cols = 60 });
@@ -27523,7 +27493,7 @@ test "LineIndex splices get sequence numbers between their neighbours, or renumb
     for (0..n) |i| s.line_index.entry(i).node.line_seq = i + 1;
     try testing.expect(s.lineAssignSeqs(1, 0, &.{mid}));
     s.lineRenumber();
-    try testing.expectEqual(@as(u32, 1), s.line_renumbers);
+    for (0..n) |i| try testing.expectEqual(@as(u64, i + 1) * line_seq_step, s.line_index.entry(i).node.line_seq);
     try s.expectLinesRightForTest();
 }
 

@@ -20025,6 +20025,5 @@ test "Terminal LineIndex prompt redraw with history on several pages marks the e
 
     // The resize reflowed first and cut the index, so the line cannot be
     // found cheaply: the log is lost, and no walk over the nodes ran.
-    try testing_.expectEqual(@as(u32, 1), pages.line_rewrite_lost);
     try testing_.expect(pages.edit_log.since(before.edit_seq, &out).overflowed);
 }

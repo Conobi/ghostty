@@ -8987,12 +8987,13 @@ test "readLines reuses one decoded page and never serves a stale one" {
     const head = try alloc.dupe(u8, a.writer.buffered()[0..12]);
     defer alloc.free(head);
     try testing.expect(std.mem.startsWith(u8, head, "line "));
-    const reuses = list.counters.read_reuses;
+    // The scratch holds the decoded page, so a scribble on it shows in the
+    // second read: that read decoded nothing.
+    list.read_scratch.page.getRowAndCell(5, 0).cell.* = .init('Q');
     var b: std.Io.Writer.Allocating = .init(alloc);
     defer b.deinit();
     _ = try readAllForTest(list, first, 3, &b);
-    try testing.expect(list.counters.read_reuses > reuses);
-    try testing.expectEqualStrings(a.writer.buffered(), b.writer.buffered());
+    try testing.expect(std.mem.startsWith(u8, b.writer.buffered(), "line Q"));
 
     // Rewrite the page (restored, written, compressed again): the next read
     // must show the new text, not the page the scratch still holds.
