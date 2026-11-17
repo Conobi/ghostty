@@ -1493,21 +1493,8 @@ pub fn line_edits(
     const out_n = out_n_ orelse return .invalid_value;
     if (cap > 0 and out_ == null) return .invalid_value;
 
-    var tmp: [LineIndex.edit_ring]LineIndex.LineEdit = undefined;
-    const got = primaryPages(t).edit_log.since(since_seq, tmp[0..@min(cap, tmp.len)]);
-    if (out_) |out| for (tmp[0..got.n], 0..) |e, i| {
-        out[i] = .{
-            .seq = e.seq,
-            .kind = switch (e.kind) {
-                .recount => .recount,
-                .rewrite => .rewrite,
-            },
-            .first_line = e.first_line,
-            .old_lines = e.old_lines,
-            .new_lines = e.new_lines,
-        };
-    };
-    out_n.* = got.n;
+    const out: []LineEdit = if (out_) |o| o[0..cap] else &.{};
+    out_n.* = primaryPages(t).edit_log.since(since_seq, out).n;
     return .success;
 }
 
@@ -2214,22 +2201,8 @@ pub const TerminalReflowState = extern struct {
     }
 };
 
-/// What a line edit changed.
-///
-/// The declaration order is part of the libghostty-vt C ABI.
-pub const LineEditKind = lib.Enum(lib.target, &.{
-    "recount",
-    "rewrite",
-});
-
 /// C: GhosttyLineEdit
-pub const LineEdit = extern struct {
-    seq: u64,
-    kind: LineEditKind,
-    first_line: u64,
-    old_lines: u64,
-    new_lines: u64,
-};
+pub const LineEdit = LineIndex.LineEdit;
 
 /// C: GhosttyTerminalLineState
 ///
@@ -8932,7 +8905,7 @@ test "line_state tracks output" {
     try testing.expectEqual(@as(u64, 0), after.history_rows);
 }
 
-test "line_edits maps kinds and reports overflow" {
+test "line_edits copies edits and reports overflow" {
     const t = try lineTestTerminal(10);
     defer free(t);
     const pages = &t.?.terminal.screens.get(.primary).?.pages;
@@ -8943,19 +8916,18 @@ test "line_edits maps kinds and reports overflow" {
     try testing.expectEqual(@as(usize, 0), n);
 
     // Edits come from reflow and prompt redraws; stand in for them.
-    _ = pages.edit_log.push(.recount, 100, 3, 4);
-    _ = pages.edit_log.push(.rewrite, 200, 2, 2);
+    _ = pages.edit_log.push(100, 3, 4);
+    _ = pages.edit_log.push(200, 2, 2);
     try testing.expectEqual(Result.success, line_edits(t, 0, &out, out.len, &n));
     try testing.expectEqual(@as(usize, 2), n);
     try testing.expectEqual(@as(u64, 1), out[0].seq);
-    try testing.expectEqual(LineEditKind.recount, out[0].kind);
     try testing.expectEqual(@as(u64, 100), out[0].first_line);
     try testing.expectEqual(@as(u64, 3), out[0].old_lines);
     try testing.expectEqual(@as(u64, 4), out[0].new_lines);
-    try testing.expectEqual(LineEditKind.rewrite, out[1].kind);
+    try testing.expectEqual(@as(u64, 200), out[1].first_line);
 
     // Past the ring: the oldest are gone and the state says so.
-    for (0..20) |_| _ = pages.edit_log.push(.recount, 1, 1, 2);
+    for (0..20) |_| _ = pages.edit_log.push(1, 1, 2);
     var state = try lineStateReady(t);
     try testing.expect(state.edits_overflowed);
     try testing.expectEqual(Result.success, line_edits(t, 0, &out, out.len, &n));

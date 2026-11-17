@@ -13494,7 +13494,6 @@ test "Screen LineIndex prompt redraw logs a rewrite edit for history lines" {
     var out: [4]LineIndex.LineEdit = undefined;
     const got = s.pages.edit_log.since(before.edit_seq, &out);
     try testing.expectEqual(@as(usize, 1), got.n);
-    try testing.expectEqual(LineIndex.EditKind.rewrite, out[0].kind);
     try testing.expectEqual(before.first_line + 2, out[0].first_line);
     try testing.expectEqual(@as(u64, 1), out[0].old_lines);
     try testing.expectEqual(@as(u64, 1), out[0].new_lines);

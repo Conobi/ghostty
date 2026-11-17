@@ -1261,7 +1261,7 @@
     },
     "GhosttyLineEdit": {
       "kind": "struct",
-      "size": 40,
+      "size": 32,
       "align": 8,
       "fields": {
         "seq": {
@@ -1269,23 +1269,18 @@
           "size": 8,
           "type": "u64"
         },
-        "kind": {
-          "offset": 8,
-          "size": 4,
-          "type": "GhosttyLineEditKind"
-        },
         "first_line": {
-          "offset": 16,
+          "offset": 8,
           "size": 8,
           "type": "u64"
         },
         "old_lines": {
-          "offset": 24,
+          "offset": 16,
           "size": 8,
           "type": "u64"
         },
         "new_lines": {
-          "offset": 32,
+          "offset": 24,
           "size": 8,
           "type": "u64"
         }
@@ -2910,18 +2905,6 @@
           "direction": "in",
           "type": "bool"
         }
-      }
-    },
-    "GhosttyLineEditKind": {
-      "kind": "enum",
-      "size": 4,
-      "align": 4,
-      "underlying": "i32",
-      "prefix": "GHOSTTY_LINE_EDIT_",
-      "values": {
-        "RECOUNT": 0,
-        "REWRITE": 1,
-        "MAX_VALUE": 2147483647
       }
     },
     "GhosttyKittyGraphicsData": {

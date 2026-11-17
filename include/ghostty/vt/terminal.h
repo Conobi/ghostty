@@ -650,20 +650,6 @@ typedef struct {
 } GhosttyTerminalReflowState;
 
 /**
- * What a line edit changed. See ghostty_terminal_line_edits().
- *
- * @ingroup terminal
- */
-typedef enum GHOSTTY_ENUM_TYPED {
-  /** The number of lines in a region changed: later line ids shifted. */
-  GHOSTTY_LINE_EDIT_RECOUNT = 0,
-
-  /** Lines kept their ids but their text was cleared and may be redrawn. */
-  GHOSTTY_LINE_EDIT_REWRITE = 1,
-  GHOSTTY_LINE_EDIT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
-} GhosttyLineEditKind;
-
-/**
  * One change to the lines of the history, from
  * ghostty_terminal_line_edits().
  *
@@ -673,9 +659,6 @@ typedef struct {
   /** Sequence number of the edit, from 1 and rising. */
   uint64_t seq;
 
-  /** What changed. */
-  GhosttyLineEditKind kind;
-
   /** Id of the first line affected. */
   uint64_t first_line;
 
@@ -683,8 +666,9 @@ typedef struct {
   uint64_t old_lines;
 
   /**
-   * Lines in the affected region after the edit. Equal to `old_lines` for
-   * `GHOSTTY_LINE_EDIT_REWRITE`.
+   * Lines in the affected region after the edit. Equal to `old_lines` when
+   * the lines kept their ids and their text was cleared and may be redrawn;
+   * otherwise the ids after the region shifted.
    */
   uint64_t new_lines;
 } GhosttyLineEdit;

@@ -6016,7 +6016,7 @@ fn lineRegionEnd(self: *PageList, region: ?LineRegion, from: ?*List.Node) void {
         self.edit_log.markLost();
         return;
     };
-    if (new != r.old_lines) _ = self.edit_log.push(.recount, r.first_line, r.old_lines, new);
+    if (new != r.old_lines) _ = self.edit_log.push(r.first_line, r.old_lines, new);
 }
 
 /// A reflow step replaced `src_count` nodes, which started `rows_before`
@@ -6072,13 +6072,13 @@ fn lineChunkReplaced(
         for (entries) |e| e.node.line_indexed = true;
         if (renumber) self.lineRenumber();
         if (old_lines != new_lines) {
-            _ = self.edit_log.push(.recount, self.lineBase() + at.lines_before, old_lines, new_lines);
+            _ = self.edit_log.push(self.lineBase() + at.lines_before, old_lines, new_lines);
         }
         return;
     }
     self.lineIndexTruncate(at.index, src_count);
     if (old_lines != new_lines) {
-        _ = self.edit_log.push(.recount, self.lineBase() + at.lines_before, old_lines, new_lines);
+        _ = self.edit_log.push(self.lineBase() + at.lines_before, old_lines, new_lines);
     }
 }
 
@@ -6106,7 +6106,7 @@ pub fn lineRewritten(self: *PageList, start: Pin) void {
     };
     const end = self.lineBase() + self.completeLines();
     if (first >= end) return;
-    _ = self.edit_log.push(.rewrite, first, end - first, end - first);
+    _ = self.edit_log.push(first, end - first, end - first);
 }
 
 /// Fails unless the index is exactly the first nodes of the list, with their
@@ -27338,7 +27338,6 @@ test "LineIndex a recount edit is logged when a reflow changes a region's line c
     var out: [2]LineIndex.LineEdit = undefined;
     const got = s.edit_log.since(0, &out);
     try testing.expectEqual(@as(usize, 1), got.n);
-    try testing.expectEqual(LineIndex.EditKind.recount, out[0].kind);
     try testing.expectEqual(out[0].old_lines, out[0].new_lines + 1);
     // It names the line ending at the first line end of the replaced rows.
     const flags = try s.wrapFlagsForTest(testing.allocator);
@@ -27361,7 +27360,6 @@ test "LineIndex prompt redraw logs a rewrite edit for history lines" {
     var out: [2]LineIndex.LineEdit = undefined;
     const got = s.edit_log.since(0, &out);
     try testing.expectEqual(@as(usize, 1), got.n);
-    try testing.expectEqual(LineIndex.EditKind.rewrite, out[0].kind);
     try testing.expectEqual(st.first_line + 40, out[0].first_line);
     try testing.expectEqual(st.end_line - out[0].first_line, out[0].old_lines);
     try testing.expectEqual(out[0].old_lines, out[0].new_lines);

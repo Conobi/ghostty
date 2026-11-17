@@ -19985,7 +19985,6 @@ test "Terminal LineIndex prompt redraw through the stream logs a rewrite edit" {
     var out: [4]LineIndex.LineEdit = undefined;
     const got = pages.edit_log.since(before.edit_seq, &out);
     try testing_.expectEqual(@as(usize, 1), got.n);
-    try testing_.expectEqual(LineIndex.EditKind.rewrite, out[0].kind);
     try testing_.expectEqual(p1_line, out[0].first_line);
     try testing_.expect(out[0].old_lines >= 1);
 }
