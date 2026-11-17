@@ -426,7 +426,6 @@ pub const type_decls = [_]TypeDecl{
     .initStruct("GhosttyLineEdit", terminal.LineEdit),
     .initStruct("GhosttyLineRead", terminal.LineRead),
     .initStruct("GhosttyLineResume", terminal.LineResume),
-    .initStruct("GhosttyLineRows", terminal.LineRows),
     .initStruct("GhosttyLocateResult", terminal.LocateResult),
     .initStruct("GhosttyLocateResume", terminal.LocateResume),
     .initStruct("GhosttyString", lib.String),

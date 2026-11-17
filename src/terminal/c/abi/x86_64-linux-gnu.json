@@ -1365,23 +1365,6 @@
         }
       }
     },
-    "GhosttyLineRows": {
-      "kind": "struct",
-      "size": 16,
-      "align": 8,
-      "fields": {
-        "start_row": {
-          "offset": 0,
-          "size": 8,
-          "type": "u64"
-        },
-        "end_row": {
-          "offset": 8,
-          "size": 8,
-          "type": "u64"
-        }
-      }
-    },
     "GhosttyLocateResult": {
       "kind": "struct",
       "size": 48,

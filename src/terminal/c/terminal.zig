@@ -1511,22 +1511,6 @@ pub fn line_edits(
     return .success;
 }
 
-pub fn line_rows(
-    terminal_: Terminal,
-    line: u64,
-    out_: ?*LineRows,
-) callconv(lib.calling_conv) Result {
-    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
-    const out = out_ orelse return .invalid_value;
-    const pages = primaryPages(t);
-    const rows = pages.lineRows(line) orelse return .no_value;
-    out.* = .{
-        .start_row = pages.rows_pruned + rows.start_row,
-        .end_row = pages.rows_pruned + rows.end_row,
-    };
-    return .success;
-}
-
 pub fn row_line(
     terminal_: Terminal,
     row: u64,
@@ -2276,12 +2260,6 @@ pub const TerminalLineState = extern struct {
             .index_ready = st.index_ready,
         };
     }
-};
-
-/// C: GhosttyLineRows
-pub const LineRows = extern struct {
-    start_row: u64,
-    end_row: u64,
 };
 
 /// C: GhosttyLineResume
@@ -8994,32 +8972,30 @@ test "line_edits maps kinds and reports overflow" {
     try testing.expect(!state.edits_overflowed);
 }
 
-test "line_rows row_line lines_rows via the C API" {
+test "row_line and lines_rows via the C API" {
     const t = try lineTestTerminal(40);
     defer free(t);
     const state = try lineStateReady(t);
 
     // Every line is one row here: line L is row L - first_line + rows_pruned.
-    var rows: LineRows = undefined;
-    try testing.expectEqual(Result.success, line_rows(t, state.first_line + 5, &rows));
-    try testing.expectEqual(state.rows_pruned + 5, rows.start_row);
-    try testing.expectEqual(rows.start_row, rows.end_row);
+    var start: [1]u64 = undefined;
+    const fifth = [_]u64{state.first_line + 5};
+    try testing.expectEqual(Result.success, lines_rows(t, &fifth, 1, &start));
+    try testing.expectEqual(state.rows_pruned + 5, start[0]);
     var line: u64 = 0;
-    try testing.expectEqual(Result.success, row_line(t, rows.start_row, &line));
+    try testing.expectEqual(Result.success, row_line(t, start[0], &line));
     try testing.expectEqual(state.first_line + 5, line);
 
-    // Not a history line: no value.
-    try testing.expectEqual(Result.no_value, line_rows(t, state.end_line, &rows));
-    try testing.expectEqual(Result.no_value, line_rows(t, state.first_line - 1, &rows));
-
-    // One sweep over sorted lines, with one that does not exist.
-    const lines = [_]u64{ state.first_line, state.first_line + 3, state.first_line + 30, state.end_line + 9 };
-    var starts: [4]u64 = undefined;
+    // One sweep over sorted lines, with ones that are not history lines.
+    const lines = [_]u64{ state.first_line - 1, state.first_line, state.first_line + 3, state.first_line + 30, state.end_line, state.end_line + 9 };
+    var starts: [6]u64 = undefined;
     try testing.expectEqual(Result.success, lines_rows(t, &lines, lines.len, &starts));
-    try testing.expectEqual(state.rows_pruned, starts[0]);
-    try testing.expectEqual(state.rows_pruned + 3, starts[1]);
-    try testing.expectEqual(state.rows_pruned + 30, starts[2]);
-    try testing.expectEqual(formatter_core.row_pruned, starts[3]);
+    try testing.expectEqual(formatter_core.row_pruned, starts[0]);
+    try testing.expectEqual(state.rows_pruned, starts[1]);
+    try testing.expectEqual(state.rows_pruned + 3, starts[2]);
+    try testing.expectEqual(state.rows_pruned + 30, starts[3]);
+    try testing.expectEqual(formatter_core.row_pruned, starts[4]);
+    try testing.expectEqual(formatter_core.row_pruned, starts[5]);
 }
 
 const LineTestSink = struct {
@@ -9136,9 +9112,6 @@ test "line calls reject null and invalid arguments" {
     try testing.expectEqual(Result.invalid_value, line_edits(t, 0, null, 2, &n));
     try testing.expectEqual(Result.success, line_edits(t, 0, null, 0, &n));
 
-    var rows: LineRows = undefined;
-    try testing.expectEqual(Result.invalid_value, line_rows(null, 0, &rows));
-    try testing.expectEqual(Result.invalid_value, line_rows(t, 0, null));
     var line: u64 = 0;
     try testing.expectEqual(Result.invalid_value, row_line(null, 0, &line));
     try testing.expectEqual(Result.invalid_value, row_line(t, 0, null));

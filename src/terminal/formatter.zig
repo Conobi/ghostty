@@ -9491,7 +9491,7 @@ test "LineIndex locate_bytes row budget returns partial progress" {
     try testing.expectEqual(list.rows_pruned + 9, cells[0].screen_row);
 }
 
-test "LineIndex locate_bytes agrees with row_line and line_rows" {
+test "LineIndex locate_bytes agrees with row_line and lines_rows" {
     const testing = std.testing;
     const alloc = testing.allocator;
     var t = try lineTerminalForTest(alloc, 12, 4);
@@ -9507,13 +9507,14 @@ test "LineIndex locate_bytes agrees with row_line and line_rows" {
     const st = list.lineState();
     var line = st.first_line;
     while (line < st.end_line) : (line += 1) {
-        const rows = list.lineRows(line).?;
+        var start: [1]u64 = undefined;
+        _ = list.linesRows(&.{line}, &start, 0, 1);
         var cells: [1]LineCell = undefined;
         const res = try locateBytes(list, line, &.{0}, .{}, 1000, &cells);
         if (res.located == 0) continue; // a blank line has no byte
         // The first byte is on the first row of the line, and that row
         // belongs to the line.
-        try testing.expectEqual(list.rows_pruned + rows.start_row, cells[0].screen_row);
+        try testing.expectEqual(list.rows_pruned + start[0], cells[0].screen_row);
         try testing.expectEqual(line, list.rowLine(cells[0].screen_row - list.rows_pruned).?);
     }
 }

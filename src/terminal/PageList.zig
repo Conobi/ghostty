@@ -5521,13 +5521,6 @@ pub const LineState = struct {
     index_ready: bool,
 };
 
-/// Where a line lies, in rows from the top of the list.
-pub const LineRows = struct {
-    start_row: u64,
-    /// The row holding the line end.
-    end_row: u64,
-};
-
 /// Answer of `linesRows` for a line that cannot be located.
 pub const line_unknown = std.math.maxInt(u64);
 
@@ -5692,17 +5685,6 @@ fn lineEndRow(
     return self.line_index.totalRows() + within;
 }
 
-/// Rows of history line `line`; null when it is pruned, not complete, or
-/// beyond what the index reaches (see `lineState`).
-pub fn lineRows(self: *PageList, line: u64) ?LineRows {
-    if (line < self.lineFirst()) return null;
-    const k = line - self.lineBase();
-    var hint: ?LineIndex.NodeIndex(*List.Node).Pos = null;
-    const start: u64 = if (k == 0) 0 else (self.lineEndRow(k - 1, &hint) orelse return null) + 1;
-    const end = self.lineEndRow(k, &hint) orelse return null;
-    return .{ .start_row = start, .end_row = end };
-}
-
 /// The id of the line holding row `row` (from the top of the list). Rows of
 /// the tail get ids too: the count of line ends above them. Null past the
 /// end of the list, or below rows the index does not reach yet. Rows of a
@@ -5736,7 +5718,8 @@ pub fn rowLine(self: *PageList, row: u64) ?u64 {
 }
 
 /// Start rows of the ascending `lines[from..]`, written to `out[from..]`;
-/// `line_unknown` where `lineRows` would return null. Stops after `max`
+/// `line_unknown` for a line that is pruned, not a complete history line, or
+/// beyond what the index reaches (see `lineState`). Stops after `max`
 /// lines and returns the index it reached, so a caller can slice the sweep.
 /// Unsorted input still works, only slower.
 pub fn linesRows(
@@ -5817,8 +5800,8 @@ fn lineEndRowAll(
 }
 
 /// The rows of line `line`, in history or in the tail; null when it is
-/// pruned, does not exist, or lies beyond what the index reaches. Unlike
-/// `lineRows` it answers for lines that end in the active area.
+/// pruned, does not exist, or lies beyond what the index reaches. It answers
+/// for lines that end in the active area too.
 pub fn lineSpan(self: *PageList, line: u64) ?LineSpan {
     if (line < self.lineFirst()) return null;
     const k = line - self.lineBase();
@@ -26711,16 +26694,14 @@ fn expectLinesMatchSampledForTest(self: *PageList, stride: usize) !void {
 
     var j: usize = skip;
     while (j < complete) : (j += stride) {
-        const got = self.lineRows(base + j).?;
         const start: usize = if (j == 0) 0 else ends.items[j - 1] + 1;
-        try testing.expectEqual(@as(u64, start), got.start_row);
-        try testing.expectEqual(@as(u64, ends.items[j]), got.end_row);
+        try testing.expectEqual(@as(?u64, start), self.lineStartForTest(base + j));
         // The line's rows all name it, and the next row names the next line.
         try testing.expectEqual(base + j, self.rowLine(start).?);
         try testing.expectEqual(base + j, self.rowLine(ends.items[j]).?);
     }
-    try testing.expectEqual(@as(?LineRows, null), self.lineRows(st.end_line));
-    try testing.expectEqual(@as(?LineRows, null), self.lineRows(st.first_line - 1));
+    try testing.expectEqual(@as(?u64, null), self.lineStartForTest(st.end_line));
+    try testing.expectEqual(@as(?u64, null), self.lineStartForTest(st.first_line - 1));
 
     // Every row, tail included: the line ends above it.
     var above: usize = 0;
@@ -26731,6 +26712,13 @@ fn expectLinesMatchSampledForTest(self: *PageList, stride: usize) !void {
     try testing.expectEqual(@as(?u64, null), self.rowLine(flags.len));
 }
 
+/// The start row of `line` by `linesRows`, null when it answers unknown.
+fn lineStartForTest(self: *PageList, line: u64) ?u64 {
+    var out: [1]u64 = undefined;
+    _ = self.linesRows(&.{line}, &out, 0, 1);
+    return if (out[0] == line_unknown) null else out[0];
+}
+
 /// A list with `cold` whole pages of history above the active area.
 fn linesListForTest(cold: usize) !PageList {
     var s = try init(std.testing.allocator, .{ .cols = 80, .rows = 24 });
@@ -26739,7 +26727,7 @@ fn linesListForTest(cold: usize) !PageList {
     return s;
 }
 
-test "LineIndex line_rows and row_line are inverse over a multi-node list" {
+test "LineIndex lines_rows and row_line are inverse over a multi-node list" {
     const testing = std.testing;
     var s = try linesListForTest(4);
     defer s.deinit();
@@ -26765,9 +26753,10 @@ test "LineIndex line_rows and row_line are inverse over a multi-node list" {
     try s.expectLinesMatchForTest();
     const st = s.lineState();
     // The spanning line is one history line, three nodes long.
-    const spanning = s.lineRows(s.rowLine(n0 + 1).?).?;
-    try testing.expect(spanning.start_row < n0);
-    try testing.expectEqual(@as(u64, n0 + n1 + 5), spanning.end_row);
+    const spanning = s.rowLine(n0 + 1).?;
+    try testing.expect(s.lineStartForTest(spanning).? < n0);
+    try testing.expectEqual(spanning, s.rowLine(n0 + n1 + 5).?);
+    try testing.expectEqual(spanning + 1, s.rowLine(n0 + n1 + 6).?);
     // The wrapped last history row ends nothing: end_line stops before it.
     try testing.expect(s.rowLine(s.total_rows - s.rows - 1).? >= st.end_line);
 }
@@ -26844,7 +26833,7 @@ test "LineIndex the line crossing the active boundary is not a history line" {
         try testing.expectEqual(LineIndex.LINE_ORIGIN + history - wrapped_tail, st.end_line);
         // Its end is in the active area, so it has no history rows.
         if (wrapped_tail > 0) {
-            try testing.expectEqual(@as(?LineRows, null), s.lineRows(st.end_line));
+            try testing.expectEqual(@as(?u64, null), s.lineStartForTest(st.end_line));
             try testing.expectEqual(@as(?u64, st.end_line), s.rowLine(history - 1));
         }
         try s.expectLinesMatchForTest();
@@ -26879,7 +26868,7 @@ test "LineIndex a summary is not built for the active-area node" {
     }
 }
 
-test "LineIndex lines_rows equals line_rows for a sorted batch, and resumes" {
+test "LineIndex lines_rows agrees with row_line for a sorted batch, and resumes" {
     const testing = std.testing;
     var s = try linesListForTest(4);
     defer s.deinit();
@@ -26909,15 +26898,19 @@ test "LineIndex lines_rows equals line_rows for a sorted batch, and resumes" {
     try testing.expectEqual(@as(usize, 43), calls);
 
     for (lines, out) |l, got| {
-        if (s.lineRows(l)) |r| {
-            try testing.expectEqual(r.start_row, got);
-        } else try testing.expectEqual(line_unknown, got);
+        if (l < st.first_line or l >= st.end_line) {
+            try testing.expectEqual(line_unknown, got);
+        } else {
+            // The start row names the line, and the row before names the last.
+            try testing.expectEqual(l, s.rowLine(got).?);
+            if (got > 0) try testing.expectEqual(l - 1, s.rowLine(got - 1).?);
+        }
     }
     try testing.expectEqual(line_unknown, out[0]);
     try testing.expectEqual(line_unknown, out[lines.len - 1]);
 }
 
-test "LineIndex head_bytes_pruned on a line whose first rows were pruned" {
+test "LineIndex head_rows_pruned on a line whose first rows were pruned" {
     const testing = std.testing;
 
     // Pruned by the limits: every page ends in a soft wrap of three rows.
@@ -26950,8 +26943,8 @@ test "LineIndex head_bytes_pruned on a line whose first rows were pruned" {
         // line is the one after it, which starts in a live row.
         const st = s.lineState();
         try testing.expectEqual(LineIndex.LINE_ORIGIN + ends + 1, st.first_line);
-        try testing.expectEqual(@as(?LineRows, null), s.lineRows(LineIndex.LINE_ORIGIN + ends));
-        try testing.expectEqual(@as(u64, 1), s.lineRows(st.first_line).?.start_row);
+        try testing.expectEqual(@as(?u64, null), s.lineStartForTest(LineIndex.LINE_ORIGIN + ends));
+        try testing.expectEqual(@as(?u64, 1), s.lineStartForTest(st.first_line));
         // The pruned head left the index with it.
         try testing.expectEqual(s.pages.first.?, s.line_index.entry(0).node);
         try s.checkLineIndex();

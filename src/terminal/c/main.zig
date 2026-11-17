@@ -204,7 +204,6 @@ pub const terminal_compression_activity = terminal.compression_activity;
 pub const terminal_compress = terminal.compress;
 pub const terminal_reflow_step = terminal.reflow_step;
 pub const terminal_line_edits = terminal.line_edits;
-pub const terminal_line_rows = terminal.line_rows;
 pub const terminal_row_line = terminal.row_line;
 pub const terminal_lines_rows = terminal.lines_rows;
 pub const terminal_read_lines = terminal.read_lines;

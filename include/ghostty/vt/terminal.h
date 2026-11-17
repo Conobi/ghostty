@@ -750,19 +750,6 @@ typedef struct {
 } GhosttyTerminalLineState;
 
 /**
- * The rows of a history line. See ghostty_terminal_line_rows().
- *
- * @ingroup terminal
- */
-typedef struct {
-  /** Absolute row of the first row of the line. */
-  uint64_t start_row;
-
-  /** Absolute row holding the line end. */
-  uint64_t end_row;
-} GhosttyLineRows;
-
-/**
  * Where ghostty_terminal_read_lines() goes on inside a line it did not
  * finish. A zeroed value starts a line at its beginning.
  *
@@ -4021,26 +4008,6 @@ GHOSTTY_API GhosttyResult ghostty_terminal_line_edits(
     GhosttyLineEdit* out,
     size_t cap,
     size_t* out_n);
-
-/**
- * Find the rows of a history line.
- *
- * Only lines the index reaches are found; see
- * GhosttyTerminalLineState::index_ready.
- *
- * @param terminal The terminal handle
- * @param line Line id
- * @param out Receives the rows
- * @return GHOSTTY_SUCCESS, GHOSTTY_NO_VALUE if the line is pruned, not a
- *         complete history line, or not indexed yet, or
- *         GHOSTTY_INVALID_VALUE for a NULL argument
- *
- * @ingroup terminal
- */
-GHOSTTY_API GhosttyResult ghostty_terminal_line_rows(
-    GhosttyTerminal terminal,
-    uint64_t line,
-    GhosttyLineRows* out);
 
 /**
  * Find the line that holds an absolute row. Rows of the tail get ids too:

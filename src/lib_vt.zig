@@ -323,7 +323,6 @@ comptime {
         @export(&c.terminal_compress, .{ .name = "ghostty_terminal_compress" });
         @export(&c.terminal_reflow_step, .{ .name = "ghostty_terminal_reflow_step" });
         @export(&c.terminal_line_edits, .{ .name = "ghostty_terminal_line_edits" });
-        @export(&c.terminal_line_rows, .{ .name = "ghostty_terminal_line_rows" });
         @export(&c.terminal_row_line, .{ .name = "ghostty_terminal_row_line" });
         @export(&c.terminal_lines_rows, .{ .name = "ghostty_terminal_lines_rows" });
         @export(&c.terminal_read_lines, .{ .name = "ghostty_terminal_read_lines" });
