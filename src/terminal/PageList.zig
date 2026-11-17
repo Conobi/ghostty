@@ -27325,6 +27325,49 @@ test "LineIndex a recount edit is logged when a reflow changes a region's line c
     try s.expectLinesRightForTest();
 }
 
+test "LineIndex an eager width change over blank active rows logs one recount" {
+    const testing = std.testing;
+    var s = try linesListForTest(3);
+    defer s.deinit();
+    s.pauseIntegrityChecks(true);
+    defer s.pauseIntegrityChecks(false);
+
+    // Text everywhere but in the last ten rows, which are the blank rows of
+    // a screen that is not full yet.
+    const blank = 10;
+    var row: usize = 0;
+    var node = s.pages.first;
+    while (node) |n| : (node = n.next) {
+        const page = n.page();
+        const rows = page.rows.ptr(page.memory);
+        for (0..n.rows()) |y| {
+            if (row + blank < s.total_rows) {
+                page.getRowAndCell(0, y).cell.* = .init('x');
+                rows[y].blank = false;
+            }
+            row += 1;
+        }
+    }
+    _ = try s.lineStateReadyForTest();
+
+    // The region the reflow rewrote holds fewer line ends afterwards (the
+    // blank rows are not all written back), so the log gets a recount. A
+    // recount covers the rows of the active area too, so a list without
+    // blank rows logs nothing.
+    try s.resize(.{ .cols = 60 });
+    var out: [2]LineIndex.LineEdit = undefined;
+    const got = s.edit_log.since(0, &out);
+    try testing.expectEqual(@as(usize, 1), got.n);
+    try testing.expectEqual(LineIndex.LINE_ORIGIN, out[0].first_line);
+    try testing.expect(out[0].old_lines > out[0].new_lines);
+    try s.expectLinesRightForTest();
+
+    // Further width changes log nothing more.
+    try s.resize(.{ .cols = 50 });
+    try s.resize(.{ .cols = 90 });
+    try testing.expectEqual(@as(u64, 1), s.edit_log.seq);
+}
+
 test "LineIndex prompt redraw logs a rewrite edit for history lines" {
     const testing = std.testing;
     var s = try linesListForTest(3);
