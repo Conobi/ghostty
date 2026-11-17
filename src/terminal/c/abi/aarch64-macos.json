@@ -1242,6 +1242,158 @@
         }
       }
     },
+    "GhosttyLineCell": {
+      "kind": "struct",
+      "size": 16,
+      "align": 8,
+      "fields": {
+        "screen_row": {
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        "col": {
+          "offset": 8,
+          "size": 4,
+          "type": "u32"
+        }
+      }
+    },
+    "GhosttyLineEdit": {
+      "kind": "struct",
+      "size": 32,
+      "align": 8,
+      "fields": {
+        "seq": {
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        "first_line": {
+          "offset": 8,
+          "size": 8,
+          "type": "u64"
+        },
+        "old_lines": {
+          "offset": 16,
+          "size": 8,
+          "type": "u64"
+        },
+        "new_lines": {
+          "offset": 24,
+          "size": 8,
+          "type": "u64"
+        }
+      }
+    },
+    "GhosttyLineRead": {
+      "kind": "struct",
+      "size": 64,
+      "align": 8,
+      "fields": {
+        "lines": {
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        "bytes": {
+          "offset": 8,
+          "size": 8,
+          "type": "u64"
+        },
+        "next_line": {
+          "offset": 16,
+          "size": 8,
+          "type": "u64"
+        },
+        "rows_formatted": {
+          "offset": 24,
+          "size": 8,
+          "type": "u64"
+        },
+        "next": {
+          "offset": 32,
+          "size": 24,
+          "type": "GhosttyLineResume"
+        },
+        "reached_end": {
+          "offset": 56,
+          "size": 1,
+          "type": "bool"
+        },
+        "page_boundary": {
+          "offset": 57,
+          "size": 1,
+          "type": "bool"
+        }
+      }
+    },
+    "GhosttyLineResume": {
+      "kind": "struct",
+      "size": 24,
+      "align": 8,
+      "fields": {
+        "row": {
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        "blanks": {
+          "offset": 8,
+          "size": 8,
+          "type": "u64"
+        },
+        "skip": {
+          "offset": 16,
+          "size": 8,
+          "type": "u64"
+        }
+      }
+    },
+    "GhosttyLocateResult": {
+      "kind": "struct",
+      "size": 40,
+      "align": 8,
+      "fields": {
+        "located": {
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        "complete": {
+          "offset": 8,
+          "size": 1,
+          "type": "bool"
+        },
+        "next": {
+          "offset": 16,
+          "size": 24,
+          "type": "GhosttyLocateResume"
+        }
+      }
+    },
+    "GhosttyLocateResume": {
+      "kind": "struct",
+      "size": 24,
+      "align": 8,
+      "fields": {
+        "row": {
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        "byte_base": {
+          "offset": 8,
+          "size": 8,
+          "type": "u64"
+        },
+        "blanks": {
+          "offset": 16,
+          "size": 8,
+          "type": "u64"
+        }
+      }
+    },
     "GhosttyString": {
       "kind": "struct",
       "size": 16,
@@ -1530,6 +1682,117 @@
           "offset": 64,
           "size": 16,
           "type": "GhosttyString"
+        }
+      }
+    },
+    "GhosttyTerminalLineState": {
+      "kind": "struct",
+      "size": 56,
+      "align": 8,
+      "fields": {
+        "size": {
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        "first_line": {
+          "offset": 8,
+          "size": 8,
+          "type": "u64"
+        },
+        "end_line": {
+          "offset": 16,
+          "size": 8,
+          "type": "u64"
+        },
+        "rows_pruned": {
+          "offset": 24,
+          "size": 8,
+          "type": "u64"
+        },
+        "history_rows": {
+          "offset": 32,
+          "size": 8,
+          "type": "u64"
+        },
+        "edit_seq": {
+          "offset": 40,
+          "size": 8,
+          "type": "u64"
+        },
+        "edits_overflowed": {
+          "offset": 48,
+          "size": 1,
+          "type": "bool"
+        },
+        "index_ready": {
+          "offset": 49,
+          "size": 1,
+          "type": "bool"
+        }
+      }
+    },
+    "GhosttyTerminalReflowResult": {
+      "kind": "struct",
+      "size": 40,
+      "align": 8,
+      "fields": {
+        "size": {
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        "state": {
+          "offset": 8,
+          "size": 4,
+          "type": "GhosttyTerminalReflowStepState"
+        },
+        "rows_reflowed": {
+          "offset": 16,
+          "size": 8,
+          "type": "u64"
+        },
+        "rows_delta": {
+          "offset": 24,
+          "size": 8,
+          "type": "i64"
+        },
+        "viewport_changed": {
+          "offset": 32,
+          "size": 1,
+          "type": "bool"
+        }
+      }
+    },
+    "GhosttyTerminalReflowState": {
+      "kind": "struct",
+      "size": 40,
+      "align": 8,
+      "fields": {
+        "size": {
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        "stale_rows": {
+          "offset": 8,
+          "size": 8,
+          "type": "u64"
+        },
+        "resize_generation": {
+          "offset": 16,
+          "size": 8,
+          "type": "u64"
+        },
+        "layout_generation": {
+          "offset": 24,
+          "size": 8,
+          "type": "u64"
+        },
+        "viewport_stale": {
+          "offset": 32,
+          "size": 1,
+          "type": "bool"
         }
       }
     },
@@ -4319,6 +4582,8 @@
         "MOUSE_SHAPE": 41,
         "MEMORY_USAGE": 42,
         "SCROLLBACK_STORED_BYTES": 43,
+        "REFLOW_STATE": 44,
+        "LINE_STATE": 45,
         "MAX_VALUE": 2147483647
       },
       "keys": {
@@ -4497,6 +4762,14 @@
         "SCROLLBACK_STORED_BYTES": {
           "direction": "out",
           "type": "u64"
+        },
+        "REFLOW_STATE": {
+          "direction": "out",
+          "type": "GhosttyTerminalReflowState"
+        },
+        "LINE_STATE": {
+          "direction": "out",
+          "type": "GhosttyTerminalLineState"
         }
       }
     },
@@ -4558,6 +4831,7 @@
         "RESIZE_WINDOW": 48,
         "SCROLLBACK_BYTES_MODE": 49,
         "SCROLLBACK_RESIDENT_BUDGET": 50,
+        "LAZY_REFLOW": 51,
         "MAX_VALUE": 2147483647
       },
       "keys": {
@@ -4762,6 +5036,10 @@
         "SCROLLBACK_RESIDENT_BUDGET": {
           "direction": "in",
           "type": "u64"
+        },
+        "LAZY_REFLOW": {
+          "direction": "in",
+          "type": "bool"
         }
       }
     },
@@ -4777,6 +5055,18 @@
         "ERROR": 2,
         "INDETERMINATE": 3,
         "PAUSE": 4,
+        "MAX_VALUE": 2147483647
+      }
+    },
+    "GhosttyTerminalReflowStepState": {
+      "kind": "enum",
+      "size": 4,
+      "align": 4,
+      "underlying": "i32",
+      "prefix": "GHOSTTY_TERMINAL_REFLOW_STEP_STATE_",
+      "values": {
+        "PENDING": 0,
+        "IDLE": 1,
         "MAX_VALUE": 2147483647
       }
     },
