@@ -5567,14 +5567,26 @@ fn nextUnindexed(self: *const PageList) ?*List.Node {
 /// already take several calls.
 const line_index_extend: usize = if (builtin.is_test) 2 else 256;
 
-/// Add up to `line_index_extend` nodes before `top` to the index; true when
-/// it then reaches `top`.
+/// Most compressed pages without a summary that one `lineState` call decodes
+/// to build one. Compression leaves a summary behind, so this only bounds the
+/// rare page that lost it (out of memory while compressing): each decode is
+/// about a millisecond under the terminal lock.
+const line_decode_budget: usize = if (builtin.is_test) 1 else 2;
+
+/// Add up to `line_index_extend` nodes before `top` to the index, decoding at
+/// most `line_decode_budget` compressed pages for it; true when the index then
+/// reaches `top`.
 fn extendLineIndex(self: *PageList, top: *List.Node) bool {
     var cur = self.nextUnindexed();
     var added: usize = 0;
+    var decodes: usize = 0;
     while (cur) |node| : (cur = node.next) {
         if (node == top) return true;
         if (added >= line_index_extend) return false;
+        if (node.line_ends == null and node.isCompressed()) {
+            if (decodes >= line_decode_budget) return false;
+            decodes += 1;
+        }
         const le = self.lineSummary(node) orelse return false;
         self.line_index.append(
             self.pool.alloc,
@@ -26962,6 +26974,44 @@ test "LineIndex debug recount catches a corrupted summary" {
     le.count += 1;
     try testing.expectError(error.StaleLineSummary, s.checkLineEnds(node));
     le.count -= 1;
+}
+
+test "LineIndex a call decodes a bounded number of pages that lost their summary" {
+    const testing = std.testing;
+    if (!terminal_mem.canReclaim(.strict)) return error.SkipZigTest;
+    var s = try linesListForTest(10);
+    defer s.deinit();
+    s.fillTextForTest();
+    _ = s.compress(.full);
+
+    // Every compressed page lost its summary, as when memory ran out while
+    // compressing them.
+    var compressed: usize = 0;
+    var node = s.pages.first;
+    while (node) |n| : (node = n.next) {
+        if (!n.isCompressed()) continue;
+        n.dropLineEnds();
+        compressed += 1;
+    }
+    try testing.expect(compressed >= 8);
+
+    // Each call builds at most the budget (a summary is built by one decode),
+    // and the index still gets there.
+    var calls: usize = 0;
+    var summaries: usize = 0;
+    while (true) : (calls += 1) {
+        try testing.expect(calls < 100);
+        const st = s.lineState();
+        var now: usize = 0;
+        node = s.pages.first;
+        while (node) |n| : (node = n.next) now += @intFromBool(n.isCompressed() and n.line_ends != null);
+        try testing.expect(now - summaries <= line_decode_budget);
+        summaries = now;
+        if (st.index_ready) break;
+    }
+    try testing.expectEqual(compressed, summaries);
+    try testing.expect(calls + 1 >= compressed / line_decode_budget);
+    try s.expectLinesMatchForTest();
 }
 
 test "LineIndex summaries build from compressed pages without restoring them" {
