@@ -2382,6 +2382,10 @@ fn chunkStart(self: *PageList, max_rows: usize, max_pages: usize) *List.Node {
 /// Most nodes `alignSeam` moves a cut back to find an aligned one.
 const max_seam_search_nodes: usize = 512;
 
+/// Most compressed pages without a summary that `alignSeam` decodes (about a
+/// millisecond each, under the terminal lock) to find where a line starts.
+const max_seam_decodes: usize = 4;
+
 /// Move a chunk start `j` that cuts a logical line (the row before it has
 /// `wrap` set) back to a node boundary where the cells of the line before it
 /// fill whole rows of `new_cols`, or to the line's first node.
@@ -2393,7 +2397,9 @@ const max_seam_search_nodes: usize = 512;
 /// wraps early (spacer head) makes the count too high, so such a line can
 /// still keep a short row at the cut. `rows` grows by the rows moved over;
 /// nodes before `limit` (when given) are never taken. Returns `j` itself when
-/// no aligned boundary is near or a page cannot be read.
+/// no aligned boundary is near, the walk back over the line would decode more
+/// than `max_seam_decodes` compressed pages that lost their summary, or a
+/// page cannot be read.
 fn alignSeam(
     self: *PageList,
     j: *List.Node,
@@ -2408,12 +2414,19 @@ fn alignSeam(
     var cells: usize = 0;
     var line_start: *List.Node = first;
     var n = first;
+    var decodes: usize = 0;
     while (true) {
         self.visit();
         const count = n.rows();
         var run = count;
         const all_wrapped = if (n.line_ends) |le| le.count == 0 else false;
         if (!all_wrapped) {
+            // A page with a summary is read once, at the line's start; one
+            // without it costs a decode on every step down the line.
+            if (n.line_ends == null and n.isCompressed()) {
+                if (decodes >= max_seam_decodes) return j;
+                decodes += 1;
+            }
             const raw = self.lineRowFlags(n) orelse return j;
             run = 0;
             var i = raw.len;
@@ -6012,6 +6025,10 @@ fn lineRegionBegin(self: *PageList, src: *List.Node) ?LineRegion {
     if (self.line_index.posAt(pos) == null) return null;
     const history = if (self.lineEndsFrom(src)) |old|
         if (self.activeLineEnds()) |active| old - active else null
+    else
+        null;
+    self.line_hist_end = if (history) |h|
+        self.lineBase() + self.line_index.posAt(pos).?.lines_before + h
     else
         null;
     self.lineIndexTruncate(pos, 0);
