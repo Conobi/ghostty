@@ -727,6 +727,12 @@ line_index: LineIndex.NodeIndex(*List.Node) = .{},
 /// Line edits the maintainer of a text copy must replay.
 edit_log: LineIndex.EditLog = .{},
 
+/// Id just past the last history line, taken before a width change cut the
+/// index. Lets `lineRewritten` name the lines of a prompt redrawn after the
+/// reflow without walking the list. Only meaningful between that reflow and
+/// `lineResizeDone`.
+line_hist_end: ?u64 = null,
+
 /// Decode buffer for summarising compressed pages without restoring them.
 line_scratch: ReadScratch = .{},
 
@@ -6092,9 +6098,10 @@ fn lineChunkReplaced(
 /// history lines it touches again.
 ///
 /// A reflow that came first (a resize clears the prompt after reflowing)
-/// has cut the index, so the line cannot be found cheaply. Counting it by
-/// walking the list would cost O(nodes) under the terminal lock, so the log
-/// is marked lost instead and the reader rebuilds in a background turn.
+/// has cut the index, so the line cannot be found cheaply. The history end
+/// the reflow remembered stands in for it, and only the nodes from `start` to
+/// the active area are counted. Without it the log is marked lost instead
+/// and the reader rebuilds in a background turn.
 pub fn lineRewritten(self: *PageList, start: Pin) void {
     var below: usize = 0;
     var it: ?*List.Node = start.node;
@@ -6104,13 +6111,41 @@ pub fn lineRewritten(self: *PageList, start: Pin) void {
     const history = self.total_rows - self.rows;
     if (row >= history) return;
 
-    const first = self.rowLine(row) orelse {
-        self.edit_log.markLost();
-        return;
-    };
-    const end = self.lineBase() + self.completeLines();
+    var first: u64 = undefined;
+    var end: u64 = undefined;
+    if (self.rowLine(row)) |f| {
+        first = f;
+        end = self.lineBase() + self.completeLines();
+    } else {
+        const hist_end = self.line_hist_end orelse return self.edit_log.markLost();
+        const ends = self.lineEndsToActive(start) orelse return self.edit_log.markLost();
+        first = std.math.sub(u64, hist_end, ends) catch return self.edit_log.markLost();
+        end = hist_end;
+    }
     if (first >= end) return;
     _ = self.edit_log.push(first, end - first);
+}
+
+/// A resize is over: forget the history end `lineRegionBegin` took.
+pub fn lineResizeDone(self: *PageList) void {
+    self.line_hist_end = null;
+}
+
+/// Line ends in the rows from `start` to the top of the active area; null
+/// when a node cannot be read.
+fn lineEndsToActive(self: *PageList, start: Pin) ?u64 {
+    const top = self.getTopLeft(.active);
+    var total: u64 = 0;
+    var bits: [line_bitmap_words]u64 = undefined;
+    var it: ?*List.Node = start.node;
+    while (it) |n| : (it = n.next) {
+        const scan = self.scanLineEnds(n, &bits) orelse return null;
+        const lo: usize = if (n == start.node) start.y else 0;
+        const hi: usize = if (n == top.node) top.y else n.rows();
+        total += LineIndex.rankBits(scan.bits, hi) - LineIndex.rankBits(scan.bits, lo);
+        if (n == top.node) return total;
+    }
+    return null;
 }
 
 /// Fails unless the index is exactly the first nodes of the list, with their
@@ -25778,6 +25813,49 @@ test "PageList lazy resize picks a hard line start through the previous row's wr
     try testing.expect(!s.stale_tail.?.endsWrapped());
     try testing.expect(!s.stale_soft);
     s.assertStaleInvariant();
+}
+
+test "LineIndex alignSeam stops decoding pages without a summary down a long line" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    s.pauseIntegrityChecks(true);
+    defer s.pauseIntegrityChecks(false);
+
+    // One logical line of three times the cap, every row wrapped.
+    {
+        var bulk: BulkGrowth = .init(&s);
+        defer bulk.finish();
+        while (s.total_rows < 3 * max_line_rows) _ = try bulk.grow();
+    }
+    {
+        var node = s.pages.first;
+        while (node) |n| : (node = n.next) {
+            const page = n.page();
+            for (0..n.rows()) |y| page.getRowAndCell(0, y).row.wrap = true;
+        }
+    }
+    _ = s.compress(.full);
+    // Compression left summaries; a page that lost its own costs a decode.
+    var compressed: usize = 0;
+    {
+        var node = s.pages.first;
+        while (node) |n| : (node = n.next) {
+            if (!n.isCompressed()) continue;
+            n.dropLineEnds();
+            compressed += 1;
+        }
+    }
+    try testing.expect(compressed > 2 * max_seam_decodes);
+
+    const j = s.pages.last.?;
+    try testing.expect(j.prev != null);
+    const before = s.line_scratch.decodes;
+    var rows: usize = 0;
+    const got = s.alignSeam(j, 61, null, &rows);
+    try testing.expectEqual(j, got);
+    try testing.expectEqual(@as(usize, 0), rows);
+    try testing.expect(s.line_scratch.decodes - before <= max_seam_decodes);
 }
 
 test "PageList lazy resize keeps a soft boundary inside a very long line" {

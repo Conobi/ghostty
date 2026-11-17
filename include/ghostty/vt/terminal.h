@@ -664,7 +664,11 @@ typedef struct {
 
   /**
    * Lines from `first_line` that kept their ids but whose text was cleared
-   * and may be redrawn. Zero for a marker that stands for lost edits.
+   * and may be redrawn: the history lines of a prompt the shell redraws,
+   * also when that follows a width change (the lines then keep their ids
+   * across the reflow). Read them again. When a height change came with it,
+   * the range may reach past `end_line`: ignore the lines beyond. Zero for a
+   * marker that stands for lost edits.
    */
   uint64_t lines;
 } GhosttyLineEdit;

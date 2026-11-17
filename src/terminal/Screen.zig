@@ -2245,6 +2245,7 @@ pub inline fn resize(
 ) Allocator.Error!void {
     const tw = resize_tw;
     defer self.assertIntegrity();
+    defer self.pages.lineResizeDone();
 
     // We need to insert a tracked pin for our saved cursor so we can
     // modify its X/Y for reflow. Do this before changing any state since

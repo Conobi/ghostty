@@ -19989,7 +19989,7 @@ test "Terminal LineIndex prompt redraw through the stream logs a rewrite edit" {
     try testing_.expect(out[0].lines >= 1);
 }
 
-test "Terminal LineIndex prompt redraw with history on several pages marks the edit log lost without walking" {
+test "Terminal LineIndex prompt redraw with history on several pages logs an edit without walking" {
     const testing_ = std.testing;
     const alloc = testing_.allocator;
     const LineIndex = @import("LineIndex.zig");
@@ -20018,12 +20018,60 @@ test "Terminal LineIndex prompt redraw with history on several pages marks the e
     while (!before.index_ready) before = pages.lineState();
     try testing_.expect(pages.line_index.len() >= 2);
     const p1_row = pages.total_rows - 4;
-    _ = pages.rowLine(p1_row).?;
+    const p1_line = pages.rowLine(p1_row).?;
     var out: [8]LineIndex.LineEdit = undefined;
 
     try t.resize(alloc, .{ .cols = 20, .rows = 3 });
 
-    // The resize reflowed first and cut the index, so the line cannot be
-    // found cheaply: the log is lost, and no walk over the nodes ran.
-    try testing_.expect(pages.edit_log.since(before.edit_seq, &out).overflowed);
+    // The resize reflowed first and cut the index, yet the edit still names
+    // the history line of the prompt: one line (p1) ends above the active area.
+    const got = pages.edit_log.since(before.edit_seq, &out);
+    try testing_.expect(!got.overflowed);
+    try testing_.expectEqual(@as(usize, 1), got.n);
+    try testing_.expectEqual(p1_line, out[0].first_line);
+    try testing_.expectEqual(@as(u64, 1), out[0].lines);
+}
+
+test "Terminal LineIndex prompt redraw on consecutive width steps never marks the log lost" {
+    const testing_ = std.testing;
+    const alloc = testing_.allocator;
+    const LineIndex = @import("LineIndex.zig");
+    var t = try init(testing_.io, alloc, .{ .cols = 10, .rows = 2, .max_scrollback_bytes = null });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    {
+        var bulk: PageList.BulkGrowth = .init(&t.screens.active.pages);
+        defer bulk.finish();
+        for (0..30_000) |i| {
+            var buf: [24]u8 = undefined;
+            s.nextSlice(std.fmt.bufPrint(&buf, "line {d}\r\n", .{i}) catch unreachable);
+            if (i % 50 == 49) bulk.refresh();
+        }
+    }
+    // A prompt of four rows, two of them in history.
+    s.nextSlice("\x1b]133;A\x1b\\p1\r\n");
+    s.nextSlice("\x1b]133;P;k=c\x1b\\p2\r\n");
+    s.nextSlice("\x1b]133;P;k=c\x1b\\p3\r\n");
+    s.nextSlice("\x1b]133;P;k=c\x1b\\> \x1b]133;B\x1b\\echo");
+
+    const pages = &t.screens.active.pages;
+    var out: [8]LineIndex.LineEdit = undefined;
+    for ([_]u16{ 20, 30, 40 }) |cols| {
+        // A reader that keeps up has the index rebuilt between steps.
+        var st = pages.lineState();
+        while (!st.index_ready) st = pages.lineState();
+        try testing_.expect(pages.line_index.len() >= 2);
+        const seq = st.edit_seq;
+        const p1_line = pages.rowLine(pages.total_rows - 4).?;
+
+        try t.resize(alloc, .{ .cols = cols, .rows = 2 });
+
+        const got = pages.edit_log.since(seq, &out);
+        try testing_.expect(!got.overflowed);
+        try testing_.expectEqual(@as(usize, 1), got.n);
+        try testing_.expectEqual(p1_line, out[0].first_line);
+        try testing_.expectEqual(@as(u64, 2), out[0].lines);
+    }
 }
