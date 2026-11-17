@@ -710,6 +710,8 @@ total_rows: usize,
 /// erasing history, a full reset. They only grow, so a line's id (its count
 /// of line ends since the start, plus `LineIndex.LINE_ORIGIN`) and a row's
 /// absolute number (this plus its position) never change while it lives.
+/// Restoring older pages above the first one is the exception: it shifts
+/// both and marks the edit log lost.
 rows_pruned: u64 = 0,
 lines_pruned: u64 = 0,
 
@@ -27028,7 +27030,11 @@ test "LineIndex stays equal to a recount across random operations" {
     const testing = std.testing;
     const canCompress = terminal_mem.canReclaim(.strict);
 
-    for (0..200) |seq_i| {
+    // A few dozen sequences are enough for a routine run; the soak variable
+    // restores the full count. The `% 4` and `% 3` mixes below keep their
+    // share either way (encoding pages is what makes a sequence slow).
+    const sequences: usize = if (std.testing.environ.containsConstant("GHOSTTY_LINE_INDEX_SOAK")) 200 else 40;
+    for (0..sequences) |seq_i| {
         const compress_here = canCompress and seq_i % 4 == 0;
         const seed: u64 = 0x1d3a + seq_i;
         var prng = std.Random.DefaultPrng.init(seed);

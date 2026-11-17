@@ -9188,7 +9188,7 @@ test "LineIndex read_lines reads compressed pages without restoring them" {
     try testing.expectEqual(stored, list.counters.stored_size);
 }
 
-test "LineIndex read_lines splits a line longer than max_bytes and resumes at next_offset" {
+test "LineIndex read_lines splits a line longer than max_bytes and resumes by row" {
     const testing = std.testing;
     const alloc = testing.allocator;
     var t = try lineTerminalForTest(alloc, 20, 4);

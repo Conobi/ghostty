@@ -7,8 +7,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// First line id. Ids start high so restoring pages above the first one can
-/// lower the first id without underflow.
+/// First line id. Ids start high so a caller can always name the line before
+/// the first one (a pruned line) without underflow.
 pub const LINE_ORIGIN: u64 = 1 << 48;
 
 /// Number of u64 bitmap words that hold `rows` bits.
