@@ -5670,7 +5670,9 @@ fn lineEndRow(
     if (self.nextUnindexed() != top.node) return null;
     var bits: [line_bitmap_words]u64 = undefined;
     const scan = self.scanLineEnds(top.node, &bits) orelse return null;
-    const k2: u32 = @intCast(k - indexed);
+    const past = k - indexed;
+    if (past > std.math.maxInt(u32)) return null;
+    const k2: u32 = @intCast(past);
     if (k2 >= LineIndex.rankBits(scan.bits, top.y)) return null;
     const within = LineIndex.selectBits(scan.bits, k2) orelse return null;
     return self.line_index.totalRows() + within;
@@ -26761,6 +26763,21 @@ test "LineIndex lines_rows and row_line are inverse over a multi-node list" {
     try testing.expectEqual(spanning + 1, s.rowLine(n0 + n1 + 6).?);
     // The wrapped last history row ends nothing: end_line stops before it.
     try testing.expect(s.rowLine(s.total_rows - s.rows - 1).? >= st.end_line);
+}
+
+test "LineIndex lineSpan answers null for ids far past the index" {
+    const testing = std.testing;
+    var s = try linesListForTest(4);
+    defer s.deinit();
+    try s.expectLinesMatchForTest();
+    const st = s.lineState();
+    try testing.expect(st.index_ready);
+
+    try testing.expect(s.lineSpan(st.end_line - 1) != null);
+    // Past 2^32 lines beyond the index: no panic from a narrowing cast.
+    try testing.expectEqual(@as(?LineSpan, null), s.lineSpan(st.end_line + (1 << 32)));
+    try testing.expectEqual(@as(?LineSpan, null), s.lineSpan(st.end_line + (1 << 32) + 7));
+    try testing.expectEqual(@as(?LineSpan, null), s.lineSpan(std.math.maxInt(u64)));
 }
 
 test "LineIndex a line spanning the whole list has no history line" {
