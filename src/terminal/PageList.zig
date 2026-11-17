@@ -5974,12 +5974,22 @@ fn lineEndsFrom(self: *PageList, from: ?*List.Node) ?u64 {
     return total;
 }
 
-/// A region of the list is about to be rewritten into new nodes.
+/// Line ends in the rows of the active area.
+fn activeLineEnds(self: *PageList) ?u64 {
+    const top = self.getTopLeft(.active);
+    var bits: [line_bitmap_words]u64 = undefined;
+    const scan = self.scanLineEnds(top.node, &bits) orelse return null;
+    var total: u64 = scan.count - LineIndex.rankBits(scan.bits, top.y);
+    var it = top.node.next;
+    while (it) |n| : (it = n.next) total += self.nodeLineEnds(n) orelse return null;
+    return total;
+}
+
+/// How many line ends of a region, from the start of a rewritten part of the
+/// list to its end, lie in rows above the active area: the lines a reader may
+/// have seen.
 const LineRegion = struct {
-    /// Id of the line ending at the region's first line end.
-    first_line: u64,
-    /// Line ends in the region, to the end of the list.
-    old_lines: u64,
+    history: u64,
 };
 
 /// The nodes from `src` to the end are about to be replaced: cut the index
@@ -5988,25 +5998,30 @@ const LineRegion = struct {
 fn lineRegionBegin(self: *PageList, src: *List.Node) ?LineRegion {
     if (!src.line_indexed) return null;
     const pos = self.lineNodePos(src);
-    const at = self.line_index.posAt(pos) orelse return null;
-    const old = self.lineEndsFrom(src) orelse {
-        self.edit_log.markLost();
-        self.lineIndexTruncate(pos, 0);
-        return null;
-    };
+    if (self.line_index.posAt(pos) == null) return null;
+    const history = if (self.lineEndsFrom(src)) |old|
+        if (self.activeLineEnds()) |active| old - active else null
+    else
+        null;
     self.lineIndexTruncate(pos, 0);
-    return .{ .first_line = self.lineBase() + at.lines_before, .old_lines = old };
+    return .{ .history = history orelse {
+        self.edit_log.markLost();
+        return null;
+    } };
 }
 
-/// The region begun by `lineRegionBegin` now starts at node `from`. Lines a
-/// reader has seen only move when the count differs: log it.
+/// The region begun by `lineRegionBegin` now starts at node `from`. A reflow
+/// keeps the line ends of every row it writes; it only drops or adds blank
+/// rows at the end of the list. That concerns a reader only when it takes
+/// away lines above the active area, which is when the count falls below
+/// what lay above it: then the log is lost.
 fn lineRegionEnd(self: *PageList, region: ?LineRegion, from: ?*List.Node) void {
     const r = region orelse return;
     const new = self.lineEndsFrom(from) orelse {
         self.edit_log.markLost();
         return;
     };
-    if (new != r.old_lines) _ = self.edit_log.push(r.first_line, r.old_lines, new);
+    if (new < r.history) self.edit_log.markLost();
 }
 
 /// A reflow step replaced `src_count` nodes, which started `rows_before`
@@ -6043,6 +6058,10 @@ fn lineChunkReplaced(
         out_count += 1;
     }
 
+    // A step writes every row of its sources, so the count cannot change; if it
+    // did, the ids after it moved and readers must rebuild.
+    if (old_lines != new_lines) self.edit_log.markLost();
+
     const covered = at.rows_before == rows_before and
         at.index + src_count <= self.line_index.len();
     spliced: {
@@ -6061,15 +6080,9 @@ fn lineChunkReplaced(
         self.line_index.splice(alloc, at.index, src_count, entries) catch break :spliced;
         for (entries) |e| e.node.line_indexed = true;
         if (renumber) self.lineRenumber();
-        if (old_lines != new_lines) {
-            _ = self.edit_log.push(self.lineBase() + at.lines_before, old_lines, new_lines);
-        }
         return;
     }
     self.lineIndexTruncate(at.index, src_count);
-    if (old_lines != new_lines) {
-        _ = self.edit_log.push(self.lineBase() + at.lines_before, old_lines, new_lines);
-    }
 }
 
 /// The rows from `start` down are about to be cleared (a prompt the shell
@@ -27331,7 +27344,7 @@ test "LineIndex ED3 and RIS keep ids monotonic" {
     try testing.expectEqual(@as(usize, 0), s.line_index.len());
 }
 
-test "LineIndex a recount edit is logged when a reflow changes a region's line count" {
+test "LineIndex a reflow step that changes the line count marks the log lost" {
     const testing = std.testing;
     var s = try init(testing.allocator, .{ .cols = 80, .rows = 24, .lazy_reflow = true });
     defer s.deinit();
@@ -27361,21 +27374,12 @@ test "LineIndex a recount edit is logged when a reflow changes a region's line c
     try testing.expect(tail.line_indexed);
     tail.line_ends.?.count += 1;
     _ = try s.reflowStep(300, 2);
-    try testing.expectEqual(@as(u64, 1), s.edit_log.seq);
-    var out: [2]LineIndex.LineEdit = undefined;
-    const got = s.edit_log.since(0, &out);
-    try testing.expectEqual(@as(usize, 1), got.n);
-    try testing.expectEqual(out[0].old_lines, out[0].new_lines + 1);
-    // It names the line ending at the first line end of the replaced rows.
-    const flags = try s.wrapFlagsForTest(testing.allocator);
-    defer testing.allocator.free(flags);
-    var ends: u64 = 0;
-    for (flags[0..s.stale_rows]) |w| ends += @intFromBool(!w);
-    try testing.expectEqual(LineIndex.LINE_ORIGIN + ends, out[0].first_line);
+    // The log is lost: readers rebuild.
+    try testing.expect(s.lineState().edits_overflowed);
     try s.expectLinesRightForTest();
 }
 
-test "LineIndex an eager width change over blank active rows logs one recount" {
+test "LineIndex an eager width change over blank active rows logs no edit" {
     const testing = std.testing;
     var s = try linesListForTest(3);
     defer s.deinit();
@@ -27400,22 +27404,15 @@ test "LineIndex an eager width change over blank active rows logs one recount" {
     }
     _ = try s.lineStateReadyForTest();
 
-    // The region the reflow rewrote holds fewer line ends afterwards (the
-    // blank rows are not all written back), so the log gets a recount. A
-    // recount covers the rows of the active area too, so a list without
-    // blank rows logs nothing.
-    try s.resize(.{ .cols = 60 });
-    var out: [2]LineIndex.LineEdit = undefined;
-    const got = s.edit_log.since(0, &out);
-    try testing.expectEqual(@as(usize, 1), got.n);
-    try testing.expectEqual(LineIndex.LINE_ORIGIN, out[0].first_line);
-    try testing.expect(out[0].old_lines > out[0].new_lines);
-    try s.expectLinesRightForTest();
-
-    // Further width changes log nothing more.
-    try s.resize(.{ .cols = 50 });
-    try s.resize(.{ .cols = 90 });
-    try testing.expectEqual(@as(u64, 1), s.edit_log.seq);
+    // The reflow leaves fewer line ends in the rewritten region (the blank
+    // rows are not all written back), but only active-area lines went: no
+    // reader has seen them, so nothing is logged.
+    for ([_]u16{ 60, 50, 90, 30 }) |w| {
+        try s.resize(.{ .cols = w });
+        try testing.expectEqual(@as(u64, 0), s.edit_log.seq);
+        try s.expectLinesRightForTest();
+    }
+    try s.expectLinesMatchSampledForTest(7);
 }
 
 test "LineIndex prompt redraw logs a rewrite edit for history lines" {
