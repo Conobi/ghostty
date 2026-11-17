@@ -706,6 +706,12 @@ typedef struct {
    * One past the last complete history line, as far as the index reaches
    * (see `index_ready`). Lines from here on, up to the last row, are the
    * tail.
+   *
+   * It can move backwards: a taller window pulls history rows back into the
+   * active area. Lines at or after a smaller `end_line` are no longer
+   * history, and the program may overwrite them: drop what you hold for
+   * them. They get the same ids when they return to history, with no edit
+   * to say so; read them again then.
    */
   uint64_t end_line;
 
@@ -4060,7 +4066,8 @@ GHOSTTY_API GhosttyResult ghostty_terminal_read_lines(
  * row holding the largest offset is done or `max_rows` rows were formatted,
  * so the cost follows the position of the match, not the length of the line.
  * Offsets must ascend. A line already pruned answers GHOSTTY_ROW_PRUNED for
- * every byte.
+ * every byte. A call decodes at most one compressed page, so it can stop
+ * short of `max_rows`: it is then incomplete, and `next` says where to go on.
  *
  * @param terminal The terminal handle
  * @param line Line id
