@@ -2013,6 +2013,14 @@ pub const Handler = struct {
             return;
         }
 
+        // DEC mode 12 has no "back to the default" form, and terminfo's cnorm
+        // (\E[?12l\E[?25h in xterm's entry and Ghostty's) sends ?12l whenever
+        // a program such as nano or less restores the cursor on exit. Honouring
+        // it would leave a configured blinking cursor steady for good, so, as
+        // the Ghostty app does, a configured default blink ignores mode 12;
+        // DECSCUSR still sets the blink, and CSI 0 SP q restores the default.
+        if (mode == .cursor_blinking and self.terminal.cursor.default_blink != null) return;
+
         // Set the mode on the terminal
         self.terminal.modes.set(mode, enabled);
 
@@ -2912,6 +2920,45 @@ test "modes" {
     try testing.expect(!t.modes.get(.wraparound));
     s.nextSlice("\x1B[?7h"); // Enable wraparound
     try testing.expect(t.modes.get(.wraparound));
+}
+
+test "mode 12 is ignored when a default blink is configured" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .default_cursor_blink = true,
+    });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    defer s.deinit();
+
+    try testing.expect(t.modes.get(.cursor_blinking));
+    s.nextSlice("\x1B[?12l\x1B[?25h"); // cnorm, as nano sends on exit
+    try testing.expect(t.modes.get(.cursor_blinking));
+    s.nextSlice("\x1B[2 q"); // DECSCUSR steady block still applies
+    try testing.expect(!t.modes.get(.cursor_blinking));
+    s.nextSlice("\x1B[?12h");
+    try testing.expect(!t.modes.get(.cursor_blinking));
+    s.nextSlice("\x1B[0 q"); // back to the configured default
+    try testing.expect(t.modes.get(.cursor_blinking));
+}
+
+test "mode 12 applies when the default blink is the emulator's" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 24,
+        .default_cursor_blink = null,
+    });
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    defer s.deinit();
+
+    s.nextSlice("\x1B[?12l");
+    try testing.expect(!t.modes.get(.cursor_blinking));
+    s.nextSlice("\x1B[?12h");
+    try testing.expect(t.modes.get(.cursor_blinking));
 }
 
 test "scrolling regions" {
